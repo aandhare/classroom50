@@ -171,6 +171,26 @@ const EDIT_MANAGED_ASSIGNMENT_KEYS = new Set<string>(
     .map(([key]) => key),
 )
 
+// Replace an entry in place so the row keeps its position, matching the CLI's
+// UpsertAssignment ("Position preserved on replace"). Drop-and-append would
+// reorder `gh teacher assignment list` and turn a one-field edit into a
+// whole-row diff in the config repo.
+//
+// First match only, also like UpsertAssignment: callers build `entry` from
+// `find`, so replacing every duplicate-slug row would clobber the second one.
+// Callers throw on a missing slug before reaching this, so a miss is a no-op.
+function replaceAssignmentEntry(
+  entries: Assignment[],
+  slug: string,
+  entry: Assignment,
+): Assignment[] {
+  const index = entries.findIndex((a) => a.slug === slug)
+  if (index === -1) return entries
+  const next = [...entries]
+  next[index] = entry
+  return next
+}
+
 // Copy forward entry-level keys the edit form doesn't manage (e.g.
 // `migrated_from`, unknown future keys) onto the rebuilt edit, without
 // overwriting managed keys. Mirrors the CLI's AssignmentEntry.Extra round-trip.
@@ -266,10 +286,11 @@ export async function editAssignment(
 
   const nextAssignments = {
     ...currentAssignments,
-    assignments: [
-      ...currentAssignments.assignments.filter((a) => a.slug !== slug),
+    assignments: replaceAssignmentEntry(
+      currentAssignments.assignments,
+      slug,
       preservedEntry,
-    ],
+    ),
   }
 
   const tree = await createGitTree(client, {
@@ -1401,10 +1422,11 @@ export async function setAssignmentLock(
 
     const nextAssignments: AssignmentsFile = {
       ...currentAssignments,
-      assignments: [
-        ...currentAssignments.assignments.filter((a) => a.slug !== slug),
+      assignments: replaceAssignmentEntry(
+        currentAssignments.assignments,
+        slug,
         updatedEntry,
-      ],
+      ),
     }
 
     const tree = await createGitTree(client, {
@@ -1542,10 +1564,11 @@ export async function setAssignmentClosed(
 
     const nextAssignments: AssignmentsFile = {
       ...currentAssignments,
-      assignments: [
-        ...currentAssignments.assignments.filter((a) => a.slug !== slug),
+      assignments: replaceAssignmentEntry(
+        currentAssignments.assignments,
+        slug,
         updatedEntry,
-      ],
+      ),
     }
 
     const tree = await createGitTree(client, {
