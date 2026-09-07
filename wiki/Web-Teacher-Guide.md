@@ -1070,7 +1070,9 @@ spreadsheet or external tool. The column-by-column reference is in
   plus **Manage assignment**, a dialog gathering every per-assignment action in
   one place: the quick four, **Template access** (review which teams can read
   the template, and re-grant the classroom teams' read), **Reuse in another
-  classroom**, and **Delete assignment**.
+  classroom**, and **Delete assignment**. To lock, reuse, or delete more than
+  one assignment in a single step, see
+  [Act on several assignments at once](#act-on-several-assignments-at-once).
 - **Delete an assignment.** **Delete assignment** asks you to type the slug to
   confirm; student repositories are kept. The submissions page's **Actions**
   menu carries the same **Delete assignment**.
@@ -1120,6 +1122,66 @@ so a mistyped domain can't lock students out of a working site.
 > If your staff also uses the `gh teacher` CLI, upgrade it everywhere before
 > setting a custom domain: releases older than 1.35.0 don't know the field
 > and can strip it from student discovery on their next sync.
+
+### Act on several assignments at once
+
+Select the checkbox on any row of the **Assignments** page and the toolbar shows
+how many are selected, an **Actions** menu, and a **Clear selection** button,
+the same cluster the roster and organization members pages use.
+
+Click one checkbox, then shift-click another to select everything in between.
+Selecting the box in the header selects every assignment the current search and
+filters show. A selection survives searching and filtering: a row the search is
+hiding stays selected and is still acted on, so the count tells you how many
+assignments the next action really covers. **Clear selection** (the X) empties it.
+
+The **Actions** menu offers:
+
+- **Lock** / **Unlock.** Lock every selected assignment so students can't
+  access or accept it, or unlock them again. Where a private template is used,
+  locking removes the student team's read on it and unlocking restores it. The
+  read is kept while another unlocked assignment in the classroom uses the same
+  template, so that assignment keeps working. If the access change fails for
+  some assignments, a warning names them; run the same action on those again. Each verb is disabled when it has nothing to do,
+  so a selection that is already fully locked offers only **Unlock**.
+- **Reuse.** Copy the selection into another classroom in the same
+  organization, including back into its own.
+- **Delete.** Remove the selected assignments from the classroom. Student
+  repositories are **not** deleted; they stay in the organization and can still
+  be reached by name.
+
+Every action writes the whole selection in a **single commit**: lock, unlock,
+and delete to the classroom's `assignments.json`, reuse to the target
+classroom's. The classroom's history gets one entry per action. For lock,
+unlock, and delete a half-applied selection is impossible: either every
+selected assignment changes or none does. Reuse can leave a copy out (see
+below), but the copies it makes all land together. Deleting asks you to type
+`delete` first, since it is the one action here with no undo in the app.
+
+An assignment that vanished between selecting it and confirming (deleted in
+another tab, say) is reported as skipped rather than failing the whole action.
+
+#### Reusing several assignments
+
+**Reuse** works like the single-assignment **Reuse in another classroom**, once
+per selected assignment. Pick the target classroom, and a slug field appears for
+each copy, pre-filled with the slug it would take. Where that slug is already
+used in the target, a numbered suffix is filled in: copying `hw1` into a
+classroom that already has one gives you `hw1-2`. You can overwrite any of them
+before starting.
+
+The field turns red, and the copy can't start, while a slug:
+
+- is already used in the target classroom,
+- is reserved by a renamed assignment there,
+- exceeds the classroom's repository-name budget, or
+- collides with another copy in the same run.
+
+All the copies land in one commit to the target classroom. A copy that can't
+be made (its template is no longer visible, or its slug was taken since the
+form loaded) is left out and reported; the others still land. Where a private
+template is used, the target classroom's student team is then granted read on
+it; keep the tab open until the dialog reports the result.
 
 ### Updating an over-budget assignment slug
 

@@ -800,3 +800,63 @@ describe("AssignmentsTable copy accept link", () => {
     expect(screen.queryByLabelText("assignments.table.deleteAria")).toBeNull()
   })
 })
+
+describe("AssignmentsTable selection column", () => {
+  const rows = [assignment(), assignment({ slug: "hw2", name: "HW 2" })]
+  const selectionProps = (selected: string[]) => ({
+    selectedSlugs: new Set(selected),
+    onToggleRow: () => {},
+    onToggleSelectAll: () => {},
+  })
+
+  it("renders a select-all box and one box per row when wired", () => {
+    wrap(
+      <AssignmentsTable
+        org="acme"
+        classroom="cs50"
+        assignments={rows}
+        canAuthor
+        {...selectionProps(["hw1"])}
+      />,
+    )
+
+    expect(screen.getByLabelText("assignments.bulk.selectAll")).toBeTruthy()
+    const boxes = screen.getAllByRole("checkbox")
+    expect(boxes).toHaveLength(3)
+    // The column titles stay put; the selection cluster lives in the toolbar.
+    expect(screen.getByText("assignments.table.colType")).toBeTruthy()
+  })
+
+  // A selection hidden by the search still needs the column, but there is
+  // nothing in view for select-all to act on.
+  it("disables select-all when the view holds no rows to select", () => {
+    wrap(
+      <AssignmentsTable
+        org="acme"
+        classroom="cs50"
+        assignments={[]}
+        allAssignments={rows}
+        canAuthor
+        {...selectionProps(["hw1"])}
+      />,
+    )
+
+    expect(screen.getByLabelText("assignments.bulk.selectAll")).toHaveProperty(
+      "disabled",
+      true,
+    )
+  })
+
+  it("renders no checkbox column at all without selection wiring", () => {
+    wrap(
+      <AssignmentsTable
+        org="acme"
+        classroom="cs50"
+        assignments={rows}
+        canAuthor
+      />,
+    )
+
+    expect(screen.queryByLabelText("assignments.bulk.selectAll")).toBeNull()
+  })
+})

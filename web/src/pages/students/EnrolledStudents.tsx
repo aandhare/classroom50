@@ -67,8 +67,8 @@ import {
   selectAllState,
   shouldWarnNoneSelectable,
   toggleSelectAll,
-} from "@/pages/orgMembers/selection"
-import { useRangeSelection } from "@/pages/orgMembers/useRangeSelection"
+} from "@/util/rowSelection"
+import { useRangeSelection } from "@/hooks/useRangeSelection"
 import RosterMemberModal from "@/pages/students/RosterMemberModal"
 import AddStudentButtons from "@/pages/students/AddStudentButtons"
 import RosterEditMode from "@/pages/students/RosterEditMode"
@@ -396,7 +396,7 @@ const EnrolledStudents = ({
   )
 
   const selectedRows = useMemo(
-    () => resolveSelectedRows(rows, selectedKeys, isSelectable),
+    () => resolveSelectedRows(rows, selectedKeys, isSelectable, (r) => r.key),
     // isSelectable depends on viewer; recompute when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [rows, selectedKeys, viewer],
@@ -409,6 +409,7 @@ const EnrolledStudents = ({
   const { allSelected, someSelected } = selectAllState(
     selectableFiltered,
     selectedKeys,
+    (r) => r.key,
   )
   const handleToggleSelectAll = () => {
     // Select-all only ever targets selectable (student-only) rows. When the
@@ -420,7 +421,9 @@ const EnrolledStudents = ({
     }
     setNoneSelectableNotice(false)
     if (selectableFiltered.length === 0) return
-    setSelectedKeys((prev) => toggleSelectAll(selectableFiltered, prev))
+    setSelectedKeys((prev) =>
+      toggleSelectAll(selectableFiltered, prev, (r) => r.key),
+    )
   }
 
   // Grouping reorders rows into buckets, so a shift-range must span that
@@ -436,6 +439,7 @@ const EnrolledStudents = ({
     renderedOrder,
     isSelectable,
     setSelectedKeys,
+    (r) => r.key,
   )
 
   // Status-filter options; hide "Pending" when invites are owner-only and this

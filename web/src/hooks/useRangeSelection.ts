@@ -1,12 +1,10 @@
 import { useRef } from "react"
 
-import { selectRange, toggleRow } from "@/pages/orgMembers/selection"
+import { selectRange, toggleRow, type KeyOf } from "@/util/rowSelection"
 
-type Keyed = { key: string }
-
-// Checkbox multi-select wiring shared by OrgMembersPage and EnrolledStudents.
-// Owns the shift-click bookkeeping so the two tables (and the regression test)
-// exercise one implementation instead of hand-copied handlers that can drift.
+// Checkbox multi-select wiring shared by OrgMembersPage, EnrolledStudents and
+// the assignments table. Owns the shift-click bookkeeping so the tables can't
+// drift apart.
 //
 // The subtle bit: a shift-click's onClick fills the range, but the checkbox's
 // onChange still fires and would toggle the just-selected endpoint back off
@@ -23,12 +21,13 @@ export interface RangeSelection {
   ) => void
 }
 
-export function useRangeSelection<T extends Keyed>(
+export function useRangeSelection<T>(
   // The ACTUAL rendered order, so a shift-range spans what the user sees (e.g.
   // a group-by-section view, not the flat filtered list).
   order: T[],
   selectable: (row: T) => boolean,
   setSelectedKeys: (updater: (prev: Set<string>) => Set<string>) => void,
+  keyOf: KeyOf<T>,
 ): RangeSelection {
   // Last plain-clicked checkbox; a shift-click fills the range from here.
   const rangeAnchorKey = useRef<string | null>(null)
@@ -44,7 +43,7 @@ export function useRangeSelection<T extends Keyed>(
     // bulk bar can't act on still enters the set, so its checkbox renders checked
     // while resolveSelectedRows filters it back out — a ticked box that does
     // nothing, and a selection count that disagrees with the toolbar.
-    const row = order.find((r) => r.key === key)
+    const row = order.find((r) => keyOf(r) === key)
     if (row && !selectable(row)) return
     setSelectedKeys((prev) => toggleRow(prev, key))
     rangeAnchorKey.current = key
@@ -55,13 +54,19 @@ export function useRangeSelection<T extends Keyed>(
     key: string,
   ) => {
     const anchor = rangeAnchorKey.current
-    if (e.shiftKey && anchor && anchor !== key) {
-      rangeHandledRef.current = true
-      setSelectedKeys((prev) =>
-        selectRange(order, anchor, key, prev, selectable),
-      )
+    if (!e.shiftKey || !anchor || anchor === key) return
+    // An anchor the filter removed makes selectRange a no-op; swallowing the
+    // onChange too would turn the click into nothing at all.
+    const anchorPresent = order.some((row) => keyOf(row) === anchor)
+    if (!anchorPresent) {
       rangeAnchorKey.current = key
+      return
     }
+    rangeHandledRef.current = true
+    setSelectedKeys((prev) =>
+      selectRange(order, anchor, key, prev, selectable, keyOf),
+    )
+    rangeAnchorKey.current = key
   }
 
   return { handleToggleRow, handleRowCheckboxClick }

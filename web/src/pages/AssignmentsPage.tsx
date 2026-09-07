@@ -1,10 +1,13 @@
 import { Link, useParams } from "@tanstack/react-router"
 import { TriangleDownIcon, CopyIcon, PlusIcon } from "@/components/ui/icons"
-import { useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { Trans, useTranslation } from "react-i18next"
 
 import AssignmentsTable from "@/pages/assignments/AssignmentsTable"
 import AssignmentsToolbar from "@/pages/assignments/AssignmentsToolbar"
+import AssignmentsBulkBar from "@/pages/assignments/AssignmentsBulkBar"
+import { resolveSelectedRows, toggleSelectAll } from "@/util/rowSelection"
+import { useRangeSelection } from "@/hooks/useRangeSelection"
 import { GitHubAPIError } from "@/github-core/errors"
 import { ClassroomCollectButton } from "@/pages/assignments/ClassroomCollectButton"
 import {
@@ -45,7 +48,7 @@ import useEmptyRosterWarning from "@/hooks/useEmptyRosterWarning"
 import { useClassroomRoleContext } from "@/context/classroomRole/ClassroomRoleProvider"
 import { useStaffCapabilities } from "@/hooks/useStaffCapabilities"
 import { roleLabelKey, can } from "@/authz"
-import { isClassroomArchived } from "@/types/classroom"
+import { isClassroomArchived, type Assignment } from "@/types/classroom"
 import StudentAssignmentList from "@/components/org/StudentAssignmentList"
 
 // Split button: primary "Assignment" creates; the caret reveals "Reuse
@@ -206,6 +209,47 @@ export const TeacherAssignmentsView = ({
   )
 
   const hasAssignments = (sourceAssignments?.length ?? 0) > 0
+
+  // Bulk selection lives here because the actions need the selected Assignment
+  // records, not just their slugs.
+  const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(new Set())
+  const canBulk = canAuthor && !archived && hasAssignments
+  const slugKey = useCallback((a: Assignment) => a.slug, [])
+  // Every assignment is selectable, so the predicate is constant.
+  const { handleToggleRow, handleRowCheckboxClick } = useRangeSelection(
+    visible,
+    () => true,
+    setSelectedSlugs,
+    slugKey,
+  )
+  const toggleSelectAllRows = () =>
+    setSelectedSlugs((prev) => toggleSelectAll(visible, prev, slugKey))
+  const clearSelection = () => setSelectedSlugs(new Set())
+  // Resolved against the full list (a row the search hides stays acted on) and
+  // deduped: a hand-edited assignments.json can repeat a slug.
+  const selectedAssignments = useMemo(() => {
+    const seen = new Set<string>()
+    return resolveSelectedRows(
+      sourceAssignments ?? [],
+      selectedSlugs,
+      () => true,
+      slugKey,
+    ).filter((a) => {
+      const key = slugKey(a)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }, [sourceAssignments, selectedSlugs, slugKey])
+  // Prune slugs that left the list, during render like useLingeringOpen.
+  // Filtering only for display would bring a recreated slug back pre-ticked.
+  // `liveSlugs` is a subset of `selectedSlugs`, so sizes suffice.
+  const liveSlugs = useMemo(
+    () => new Set(selectedAssignments.map(slugKey)),
+    [selectedAssignments, slugKey],
+  )
+  if (liveSlugs.size !== selectedSlugs.size) setSelectedSlugs(liveSlugs)
+
   // The toolbar renders only once assignments exist: on a first-use empty
   // list the table's blankslate carries the New-assignment action instead
   // (Primer: the empty state owns its resolving action, and a view gets one
@@ -254,6 +298,22 @@ export const TeacherAssignmentsView = ({
     ) : (
       collectAction
     )
+  // The leading cluster yields its spot to the selection cluster while rows
+  // are selected (one left-side context at a time, as on the roster). The bar
+  // stays mounted either way: it owns the confirm dialogs.
+  const leading = (
+    <>
+      {selectedAssignments.length === 0 ? leadingActions : null}
+      {canBulk ? (
+        <AssignmentsBulkBar
+          org={org}
+          classroom={classroom}
+          selected={selectedAssignments}
+          onClearSelection={clearSelection}
+        />
+      ) : null}
+    </>
+  )
 
   return (
     <div className="flex flex-col gap-6">
@@ -321,7 +381,7 @@ export const TeacherAssignmentsView = ({
           onFiltersChange={setFilters}
           sort={sort}
           onSortChange={setSort}
-          leading={leadingActions}
+          leading={leading}
           trailing={primaryAction}
         />
       )}
@@ -367,6 +427,10 @@ export const TeacherAssignmentsView = ({
           // Replay the row entrance on filter/sort/toggle changes; search is
           // excluded so typing doesn't remount the rows on every keystroke.
           viewSignature={`${JSON.stringify(filters)}|${sort}|${includeStaff}`}
+          selectedSlugs={canBulk ? selectedSlugs : undefined}
+          onToggleRow={canBulk ? handleToggleRow : undefined}
+          onRowCheckboxClick={canBulk ? handleRowCheckboxClick : undefined}
+          onToggleSelectAll={canBulk ? toggleSelectAllRows : undefined}
         />
       )}
     </div>

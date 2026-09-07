@@ -42,10 +42,11 @@ export const BulkResultSection = ({
       <tbody>
         {rows.map((row) => (
           <tr key={row.key}>
-            <td>
+            {/* align-top keeps a one-line label level with a wrapped detail. */}
+            <td className="align-top">
               <code>{row.label}</code>
             </td>
-            <td className="opacity-70">{row.detail}</td>
+            <td className="align-top opacity-70">{row.detail}</td>
           </tr>
         ))}
       </tbody>

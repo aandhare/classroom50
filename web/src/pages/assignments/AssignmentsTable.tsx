@@ -1,3 +1,5 @@
+import { useMemo, useState, type ReactNode } from "react"
+import { selectAllState } from "@/util/rowSelection"
 import { useNavigate } from "@tanstack/react-router"
 import { EmptyState } from "@/components/list"
 import { useTranslation } from "react-i18next"
@@ -20,8 +22,6 @@ import {
 import { formatDueDate, formatDueDateTime, isPastDue } from "@/util/formatDate"
 import { composedRepoNameFits } from "@/util/repoNameBudget"
 import { Link } from "@tanstack/react-router"
-import { useMemo, useState } from "react"
-import type { ReactNode } from "react"
 import { githubKeys } from "@/github-core/queries"
 import { CONFIG_REPO } from "@/util/configRepo"
 import { useQueryClient } from "@tanstack/react-query"
@@ -44,9 +44,11 @@ import {
 import {
   Badge,
   Button,
+  Checkbox,
   MetricCount,
   MetricBar,
   RouterButton,
+  SelectAllCheckbox,
   SkeletonRows,
   SortableTh,
   TableShell,
@@ -103,6 +105,9 @@ const SKELETON_BARS = [
   "ms-auto h-8 w-16",
 ]
 
+// Data columns excluding the selection checkbox, shared by every colSpan.
+const DATA_COLUMNS = 7
+
 const AssignmentsTable = ({
   org,
   classroom,
@@ -119,6 +124,10 @@ const AssignmentsTable = ({
   archived = false,
   canAuthor = false,
   acceptanceComplete = true,
+  selectedSlugs,
+  onToggleRow,
+  onToggleSelectAll,
+  onRowCheckboxClick,
   sort,
   onSortChange,
   viewSignature = "",
@@ -170,6 +179,16 @@ const AssignmentsTable = ({
   // shape as the archived case. GitHub also 403s a TA's config-repo write, so
   // this is the UX guard, not the enforcer.
   canAuthor?: boolean
+  // Bulk selection, owned by the page. Absent turns the whole column off.
+  selectedSlugs?: ReadonlySet<string>
+  onToggleRow?: (slug: string) => void
+  // Shift-click range fill; see useRangeSelection for why it's a separate
+  // onClick.
+  onRowCheckboxClick?: (
+    event: React.MouseEvent<HTMLInputElement>,
+    slug: string,
+  ) => void
+  onToggleSelectAll?: () => void
   // Column-header sorting (Assignment toggles name asc/desc, Due date toggles
   // due asc/desc), sharing the toolbar select's sort state. Omitted, headers
   // render as static text.
@@ -246,6 +265,13 @@ const AssignmentsTable = ({
   const navigate = useNavigate()
   // Mutating row actions require both an unarchived classroom and author rights.
   const canMutate = !archived && canAuthor
+  const selectable = Boolean(selectedSlugs && onToggleRow && onToggleSelectAll)
+  // The header box describes the view: "is everything I can see ticked".
+  const { allSelected, someSelected } = selectAllState(
+    selectable ? (assignments ?? []) : [],
+    selectedSlugs ?? new Set<string>(),
+    (a) => a.slug,
+  )
   // The row whose assignment hub (ManageAssignmentModal) is open. Stored as a
   // slug and re-resolved against the live list on every render, so the hub
   // reflects a lock flip after assignments.json refetches and unmounts itself
@@ -272,6 +298,19 @@ const AssignmentsTable = ({
         <caption className="sr-only">{t("assignments.table.caption")}</caption>
         <thead>
           <tr>
+            {selectable && (
+              // w-0 for the same reason as the actions column.
+              <th scope="col" className="w-0">
+                <SelectAllCheckbox
+                  className="align-middle"
+                  ariaLabel={t("assignments.bulk.selectAll")}
+                  disabled={!assignments?.length}
+                  allSelected={allSelected}
+                  someSelected={someSelected}
+                  onToggle={() => onToggleSelectAll?.()}
+                />
+              </th>
+            )}
             <SortableTh
               label={t("assignments.table.colAssignment")}
               sort={sort}
@@ -293,9 +332,9 @@ const AssignmentsTable = ({
             <th scope="col">{t("assignments.table.colAccepted")}</th>
             <th scope="col">{t("assignments.table.colSubmitted")}</th>
             {/* w-0: auto table layout hands surplus width to every column,
-              which stretched this fixed-width button strip. Zero width makes
-              the browser fall back to min-content here and give the slack to
-              the text columns instead. */}
+                which stretched this fixed-width button strip. Zero width
+                makes the browser fall back to min-content here and give
+                the slack to the text columns instead. */}
             <th scope="col" className="w-0">
               <span className="sr-only">
                 {t("assignments.table.colActions")}
@@ -315,7 +354,10 @@ const AssignmentsTable = ({
           {loading && <SkeletonRows bars={SKELETON_BARS} />}
           {!loading && loadError && (
             <tr>
-              <td colSpan={7} className="px-6 py-10 text-center">
+              <td
+                colSpan={selectable ? DATA_COLUMNS + 1 : DATA_COLUMNS}
+                className="px-6 py-10 text-center"
+              >
                 <span
                   role="alert"
                   className="inline-flex items-center gap-2 text-sm text-error"
@@ -333,7 +375,7 @@ const AssignmentsTable = ({
           )}
           {!loading && !loadError && !assignments?.length && (
             <tr>
-              <td colSpan={7}>
+              <td colSpan={selectable ? DATA_COLUMNS + 1 : DATA_COLUMNS}>
                 {emptyAction ? (
                   // First-use blankslate (Primer): the resolving action lives
                   // here, and the page hides its toolbar so the view carries
@@ -362,6 +404,25 @@ const AssignmentsTable = ({
             !loadError &&
             assignments?.map((assignment) => (
               <ClickableTr key={assignment.slug} className="hover:bg-base-200">
+                {selectable && (
+                  <td
+                    className="w-0"
+                    // The row navigates on click; ticking a box must not.
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Checkbox
+                      className="size-6 align-middle"
+                      aria-label={t("assignments.bulk.selectRow", {
+                        assignment: name(assignment),
+                      })}
+                      checked={selectedSlugs?.has(assignment.slug) ?? false}
+                      onClick={(event) =>
+                        onRowCheckboxClick?.(event, assignment.slug)
+                      }
+                      onChange={() => onToggleRow?.(assignment.slug)}
+                    />
+                  </td>
+                )}
                 <td
                   onClick={() =>
                     navigate({

@@ -2,6 +2,9 @@ import { useMemo, useRef, useState } from "react"
 import { Trans, useTranslation } from "react-i18next"
 
 import useGetClasses from "@/hooks/useGetClasses"
+import useClassroomSummaries, {
+  classroomOptionLabels,
+} from "@/hooks/useClassroomSummaries"
 import useGetClassroomAssignments from "@/hooks/useGetClassAssignments"
 import type { Assignment } from "@/types/classroom"
 import { renamedFromSlugs } from "@/types/classroom"
@@ -30,12 +33,18 @@ export const ReuseAssignmentModal = ({
   onClose: () => void
 }) => {
   const { classes } = useGetClasses(org)
+  const summaries = useClassroomSummaries(org, classes)
+  const optionLabels = classroomOptionLabels(summaries)
   const dialogRef = useRef<HTMLDialogElement | null>(null)
   const { t } = useTranslation()
 
-  // Any classroom in the org, including this assignment's own — reusing into
-  // the same classroom is a valid way to duplicate an assignment.
-  const targets = useMemo(() => classes, [classes])
+  // Any unarchived classroom in the org, including this assignment's own:
+  // reusing into the same classroom is a valid way to duplicate an assignment.
+  // An archived one refuses new assignments, so it is not offered.
+  const archived = new Set(
+    summaries.filter((s) => s.archived).map((s) => s.path),
+  )
+  const targets = classes.filter((c) => !archived.has(c.path))
 
   const [targetClassroom, setTargetClassroom] = useState("")
 
@@ -120,10 +129,10 @@ export const ReuseAssignmentModal = ({
                       ? t(
                           "components.modals.reuseAssignment.thisClassroomOption",
                           {
-                            classroom: c.name,
+                            classroom: optionLabels.get(c.path) ?? c.name,
                           },
                         )
-                      : c.name}
+                      : (optionLabels.get(c.path) ?? c.name)}
                   </option>
                 ))}
               </Select>
@@ -144,7 +153,8 @@ export const ReuseAssignmentModal = ({
                   slugTouched: reuse.slugTouched,
                   normalizedSlug: reuse.normalizedSlug,
                   displayedSlug: reuse.displayedSlug,
-                  classroomLabel: targetClassroom,
+                  classroomLabel:
+                    optionLabels.get(targetClassroom) ?? targetClassroom,
                   uniqueHint: t("components.modals.reuseAssignment.uniqueHint"),
                 })
             return (

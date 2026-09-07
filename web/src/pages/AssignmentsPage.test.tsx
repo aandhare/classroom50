@@ -62,6 +62,8 @@ vi.mock("@/hooks/useEmptyRosterWarning", () => ({
   default: () => ({ show: false, hasRosterRows: false }),
 }))
 const orgRepoCreationWarning = vi.fn()
+// What the page last handed the (mocked) bulk bar.
+let barSelected: { slug: string }[] = []
 vi.mock("@/hooks/useOrgRepoCreationWarning", () => ({
   default: () => orgRepoCreationWarning(),
 }))
@@ -84,21 +86,41 @@ vi.mock("@/context/classroomRole/ClassroomRoleProvider", () => ({
 // Stub the heavy children so the test targets only the page's own wiring. The
 // toolbar mock exposes its slots so the collect-action gating is observable;
 // the collect button itself is covered in ClassroomCollectButton.test.tsx.
-// The table mock echoes the funnel props so the toggle's effect is observable.
+// The table mock echoes the funnel props and renders a toggle per row so a
+// test can drive the page's selection.
 vi.mock("@/pages/assignments/AssignmentsTable", () => ({
-  default: ({
-    roster,
-    includeStaff,
-  }: {
+  default: (props: {
+    assignments?: { slug: string }[]
     roster?: { counted: ReadonlySet<string> }
     includeStaff?: boolean
+    onToggleRow?: (slug: string) => void
   }) => (
-    <div
-      data-testid="table"
-      data-counted={roster ? [...roster.counted].sort().join(",") : ""}
-      data-include-staff={String(Boolean(includeStaff))}
-    />
+    <>
+      <div
+        data-testid="table"
+        data-counted={
+          props.roster ? [...props.roster.counted].sort().join(",") : ""
+        }
+        data-include-staff={String(Boolean(props.includeStaff))}
+      />
+      {(props.assignments ?? []).map((a, i) => (
+        <button
+          key={i}
+          data-testid={`toggle-${i}`}
+          onClick={() => props.onToggleRow?.(a.slug)}
+        >
+          toggle
+        </button>
+      ))}
+    </>
   ),
+}))
+// The bar reaches for the toast context, which this test does not mount.
+vi.mock("@/pages/assignments/AssignmentsBulkBar", () => ({
+  default: (props: { selected: { slug: string }[] }) => {
+    barSelected = props.selected
+    return null
+  },
 }))
 vi.mock("@/pages/assignments/AssignmentsToolbar", () => ({
   default: ({
@@ -165,7 +187,10 @@ beforeEach(() => {
   })
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  barSelected = []
+})
 
 describe("Assignments header student count", () => {
   it("renders the role-aware count, not the total roster row count", () => {
@@ -327,5 +352,61 @@ describe("Classroom-wide collect visibility", () => {
     })
     renderView()
     expect(screen.queryByTestId("collect-all")).toBeNull()
+  })
+})
+
+// A hand-edited assignments.json can hold two rows for one slug.
+describe("TeacherAssignmentsView selection", () => {
+  it("resolves one row per selected slug even when the file repeats one", () => {
+    getAssignments.mockReturnValue({
+      data: {
+        assignments: [
+          { slug: "hw1", name: "Homework 1" },
+          { slug: "hw1", name: "Homework 1 (duplicate row)" },
+          { slug: "hw2", name: "Homework 2" },
+        ],
+      },
+      isLoading: false,
+    })
+    funnelRoster.mockReturnValue(resolvedRoster(["alice"]))
+    render(<TeacherAssignmentsView org="acme" classroom="cs101" />)
+
+    fireEvent.click(screen.getByTestId("toggle-0"))
+
+    expect(barSelected.map((a) => a.slug)).toEqual(["hw1"])
+  })
+
+  // The prune runs during render, not as a display filter: a slug that left
+  // the file leaves the selection, so recreating it does not bring it back
+  // pre-ticked.
+  it("drops a selected slug once it leaves the list and does not restore it", () => {
+    const withHw1 = {
+      data: {
+        assignments: [
+          { slug: "hw1", name: "Homework 1" },
+          { slug: "hw2", name: "Homework 2" },
+        ],
+      },
+      isLoading: false,
+    }
+    getAssignments.mockReturnValue(withHw1)
+    funnelRoster.mockReturnValue(resolvedRoster(["alice"]))
+    // A fresh element each time: React skips a rerender of the same instance.
+    const view = () => <TeacherAssignmentsView org="acme" classroom="cs101" />
+    const { rerender } = render(view())
+
+    fireEvent.click(screen.getByTestId("toggle-0"))
+    expect(barSelected.map((a) => a.slug)).toEqual(["hw1"])
+
+    getAssignments.mockReturnValue({
+      data: { assignments: [{ slug: "hw2", name: "Homework 2" }] },
+      isLoading: false,
+    })
+    rerender(view())
+    expect(barSelected).toEqual([])
+
+    getAssignments.mockReturnValue(withHw1)
+    rerender(view())
+    expect(barSelected).toEqual([])
   })
 })
