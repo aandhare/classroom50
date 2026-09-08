@@ -8,7 +8,7 @@ vi.mock("@/github-core/configRepoReads", () => ({
   getCommit: vi.fn(async () => ({ tree: { sha: "BASETREE" } })),
 }))
 const assertClassroomNotArchived = vi.fn(async () => undefined)
-vi.mock("./classrooms", () => ({
+vi.mock("./classrooms/archiveGuard", () => ({
   assertClassroomNotArchived: (...args: unknown[]) =>
     assertClassroomNotArchived(...(args as [])),
 }))

@@ -7,8 +7,10 @@ vi.mock("@/github-core/configRepoReads", () => ({
   getBranchRef: vi.fn(async () => ({ object: { sha: "REF" } })),
   getCommit: vi.fn(async () => ({ tree: { sha: "BASETREE" } })),
 }))
-vi.mock("../classrooms", () => ({
+vi.mock("../classrooms/archiveGuard", () => ({
   assertClassroomNotArchived: vi.fn(async () => undefined),
+}))
+vi.mock("../classrooms", () => ({
   withGitConflictRetry: <T>(run: () => Promise<T>) => run(),
 }))
 
