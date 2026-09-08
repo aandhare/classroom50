@@ -1,50 +1,25 @@
-import type { GitHubClient } from "../client"
+import type { GitHubClient } from "@/github-core/client"
 import {
-  getBranchRef,
   getClassroomJson,
-  getCommit,
   getConfigRepoBranch,
-} from "../configRepoReads"
-import { isClassroomArchived } from "@/types/classroom"
-import { prefixCommit } from "@/util/commit"
-import { classroomFilePath } from "@/util/configRepoPaths"
-import { logger } from "@/lib/logger"
-import {
-  createBlob,
-  createGitCommit,
-  createGitTree,
-  updateRef,
-} from "./gitObjects"
+} from "@/github-core/configRepoReads"
 import {
   projectTeamDescriptionFromRecord,
   type TeamDescriptionReconcileResult,
   type TeamDescriptionSource,
-} from "./teamDescription"
+} from "@/github-core/mutations"
+import { isClassroomArchived } from "@/types/classroom"
+import { classroomFilePath } from "@/util/configRepoPaths"
+import { logger } from "@/lib/logger"
+
+import {
+  commitConfigRepoFiles,
+  jsonFileEntry,
+  readConfigRepoHeadAt,
+} from "../configRepoWrite"
 
 const log = logger.scope("mutations:classroomEdit")
 
-export type UpdateClassroomMetadataInput = {
-  org: string
-  slug: string
-  name: string
-  term: string
-}
-
-export type Classroom = {
-  name: string
-  short_name: string
-  slug: string
-  schema: string
-  term: string
-}
-export type UpdateClassroomMetadataResult = {
-  previousCommitSha: string
-  baseTreeSha: string
-  newTreeSha: string
-  newCommitSha: string
-  updatedRef: unknown
-  classroom: Classroom
-}
 export type EditClassroomInput = {
   org: string
   slug: string
@@ -95,6 +70,8 @@ export function buildClassroomUpdate(
   return next
 }
 
+// Deliberately not behind assertClassroomNotArchived: an unarchive must get
+// through, so this writer runs its own settings-only gate below.
 export async function editClassroom(
   client: GitHubClient,
   input: EditClassroomInput,
@@ -104,15 +81,12 @@ export async function editClassroom(
   // Org policy can seed the config repo on a non-`main` branch, so both the ref
   // read and the write must target the real branch.
   const configBranch = await getConfigRepoBranch(client, org)
-
-  const ref = await getBranchRef(client, org, configBranch)
-
-  const commit = await getCommit(client, org, ref.object.sha)
+  const head = await readConfigRepoHeadAt(client, org, configBranch)
 
   const current = await getClassroomJson(client, {
     org,
     classroom: slug,
-    ref: ref.object.sha,
+    ref: head.headSha,
   })
 
   if (current.short_name !== slug) {
@@ -142,32 +116,13 @@ export async function editClassroom(
     pages_base_url,
   })
 
-  const blob = await createBlob(client, {
+  const written = await commitConfigRepoFiles(
+    client,
     org,
-    content: JSON.stringify(next, null, 2) + "\n",
-  })
-
-  const tree = await createGitTree(client, {
-    org,
-    base_tree: commit.tree.sha,
-    tree: [
-      {
-        path: classroomFilePath(slug),
-        mode: "100644",
-        type: "blob",
-        sha: blob.sha,
-      },
-    ],
-  })
-
-  const newCommit = await createGitCommit(client, {
-    org,
-    message: prefixCommit(`Update classroom ${slug}`),
-    tree_sha: tree.sha,
-    parents: [ref.object.sha],
-  })
-
-  const updatedRef = await updateRef(client, org, newCommit.sha, configBranch)
+    head,
+    [jsonFileEntry(classroomFilePath(slug), next)],
+    `Update classroom ${slug}`,
+  )
 
   // Students never read classroom.json — they render the classroom50/team/v1
   // record projected onto the student team's description (GET /user/teams). So
@@ -193,11 +148,9 @@ export async function editClassroom(
   }
 
   return {
-    previousCommitSha: ref.object.sha,
-    baseTreeSha: commit.tree.sha,
-    newTreeSha: tree.sha,
-    newCommitSha: newCommit.sha,
-    updatedRef,
+    previousCommitSha: head.headSha,
+    baseTreeSha: head.baseTreeSha,
+    ...written,
     classroom: next,
     teamDescription,
   }

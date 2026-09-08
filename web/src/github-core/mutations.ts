@@ -2,12 +2,11 @@
 // into ./mutations/* sub-modules; this file preserves the public
 // `@/github-core/mutations` surface so importers are unchanged. Shared git-data
 // primitives + classroom-seed helpers live in the leaf ./mutations/gitObjects,
-// which the provisioning + classroomEdit modules import downward. New mutations
-// go in the matching sub-module, not here.
+// which the provisioning module imports downward. New mutations go in the
+// matching sub-module, not here.
 export {
-  createTree,
+  classroomSeedTree,
   createTreeForAssignment,
-  createCommit,
   updateRef,
   createGitTree,
   createGitCommit,
@@ -127,15 +126,6 @@ export {
   ensureRepoLabel,
   addIssueLabels,
 } from "./mutations/pullRequests"
-export {
-  buildClassroomUpdate,
-  editClassroom,
-  type UpdateClassroomMetadataInput,
-  type Classroom,
-  type UpdateClassroomMetadataResult,
-  type EditClassroomInput,
-  type EditClassroomResult,
-} from "./mutations/classroomEdit"
 export {
   reconcileStudentTeamDescription,
   projectTeamDescriptionFromRecord,

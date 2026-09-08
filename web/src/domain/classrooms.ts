@@ -3,36 +3,47 @@ import { GitHubAPIError } from "@/github-core/errors"
 import { CONFIG_REPO, DEFAULT_BRANCH } from "@/util/configRepo"
 import type { GitHubMoveBranch } from "@/github-core/types"
 import {
-  getBranchRef,
   getClassroomJson,
-  getCommit,
   getConfigRepoBranch,
 } from "@/github-core/configRepoReads"
 import { withRetry } from "@/github-core/queries"
-import { isClassroomArchived } from "@/types/classroom"
 import {
-  createCommit,
-  createTree,
+  classroomSeedTree,
   deleteClassroomTeam,
-  editClassroom,
   ensureClassroomTeam,
   ensureStaffTeams,
+  getRepoTreeRecursive,
   grantStaffTeamsConfigRepoAccess,
   addUserToTeam,
   removeUserFromTeam,
   isDeletableClassroomTeamRef,
   isNonFastForward,
   purgeClassroomInviteTeams,
-  updateRef,
   type ClassroomTeamRef,
-  type EditClassroomInput,
   type GitTreeEntry,
   type GitTreeFileMode,
   type StaffTeamRefs,
 } from "@/github-core/mutations"
 import type { StaffRole } from "@/types/classroom"
-import { prefixCommit } from "@/util/commit"
 import { logger } from "@/lib/logger"
+
+import { editClassroom, type EditClassroomInput } from "./classrooms/edit"
+import {
+  commitConfigRepoFiles,
+  readConfigRepoHeadAt,
+  type ConfigRepoCommitResult,
+  type ConfigRepoHead,
+} from "./configRepoWrite"
+
+export {
+  buildClassroomUpdate,
+  editClassroom,
+  type EditClassroomInput,
+  type EditClassroomResult,
+} from "./classrooms/edit"
+// The guard is a leaf so configRepoWrite (which this module imports) can run
+// it without a cycle; re-exported here so writers keep one import path.
+export { assertClassroomNotArchived } from "./classrooms/archiveGuard"
 
 const log = logger.scope("mutations:classrooms")
 
@@ -142,24 +153,17 @@ export async function createClassroomFiles(
   // ADOPTED team. A 409 (concurrent commit) is re-thrown untouched so
   // withGitConflictRetry can re-run, whose ensure* calls then adopt the
   // just-created teams rather than deleting them out from under the retry.
-  let ref, commit, tree, newCommit, updatedRef
+  let head: ConfigRepoHead, written: ConfigRepoCommitResult
   try {
     const configBranch = await getConfigRepoBranch(client, input.org)
-    ref = await getBranchRef(client, input.org, configBranch)
-    commit = await getCommit(client, input.org, ref.object.sha)
-    tree = await createTree(client, {
-      ...input,
-      base_tree: commit.tree.sha,
-      term: input.term,
-      team,
-      teams,
-    })
-    newCommit = await createCommit(client, {
-      ...input,
-      tree_sha: tree.sha,
-      parents: [ref.object.sha],
-    })
-    updatedRef = await updateRef(client, input.org, newCommit.sha, configBranch)
+    head = await readConfigRepoHeadAt(client, input.org, configBranch)
+    written = await commitConfigRepoFiles(
+      client,
+      input.org,
+      head,
+      classroomSeedTree({ ...input, team, teams }),
+      `Create init files for new classroom: ${input.classroom}`,
+    )
   } catch (err) {
     if (!(err instanceof GitHubAPIError && err.status === 409)) {
       log.warn("create classroom: scaffolding failed, rolling back teams", {
@@ -182,11 +186,9 @@ export async function createClassroomFiles(
   })
 
   return {
-    previousCommitSha: ref.object.sha,
-    baseTreeSha: commit.tree.sha,
-    newTreeSha: tree.sha,
-    newCommitSha: newCommit.sha,
-    updatedRef,
+    previousCommitSha: head.headSha,
+    baseTreeSha: head.baseTreeSha,
+    ...written,
   }
 }
 
@@ -264,65 +266,6 @@ export async function createClassroomFilesWithConflictRetry(
   return withGitConflictRetry(() => createClassroomFiles(client, input))
 }
 
-// Refuse a write into an archived classroom (active: false). The UI hides the
-// affordances, but the write path is the authoritative guard (stale tab, direct
-// API call, CLI/agent). Reads classroom.json fresh and fails closed before any
-// commit; a missing/legacy classroom.json reads as active. Shared by the
-// assignment and roster mutations.
-export async function assertClassroomNotArchived(
-  client: GitHubClient,
-  org: string,
-  classroom: string,
-) {
-  let classroomJson
-  try {
-    classroomJson = await readClassroomJsonForGuard(client, org, classroom)
-  } catch (err) {
-    // A missing/legacy classroom.json reads as active — never block.
-    if (err instanceof GitHubAPIError && err.isNotFound) return
-    // A transient read failure (rate-limit / 5xx / network) can't prove the
-    // classroom's state. Stay fail-closed, but surface an actionable message
-    // instead of bubbling the raw GitHub error as if the write itself failed.
-    if (isTransientReadError(err)) {
-      throw new Error(
-        `Couldn't verify whether classroom "${classroom}" is archived (a temporary problem reading its settings). Please try again.`,
-        { cause: err },
-      )
-    }
-    throw err
-  }
-  if (isClassroomArchived(classroomJson)) {
-    throw new Error(
-      `Classroom "${classroom}" is archived — changes are disabled. Unarchive it in Classroom settings first.`,
-    )
-  }
-}
-
-// A transient read can't determine archive state and shouldn't fail-closed on
-// the first blip; retry once before giving up so a single rate-limit/5xx/network
-// hiccup doesn't block an otherwise-valid mutation.
-function readClassroomJsonForGuard(
-  client: GitHubClient,
-  org: string,
-  classroom: string,
-) {
-  return withRetry(() => getClassroomJson(client, { org, classroom }), {
-    attempts: 2,
-    shouldRetry: isTransientReadError,
-    waitMs: () => 300,
-  })
-}
-
-// Errors that don't prove the classroom's state: rate limiting, 5xx, and
-// non-HTTP (network) failures. A 404 is determinate (handled by the caller as
-// legacy/active) and is therefore NOT transient.
-function isTransientReadError(err: unknown): boolean {
-  if (err instanceof GitHubAPIError) return err.isTransient
-  // A thrown non-GitHubAPIError here is a network/parse failure, not a
-  // determinate API answer — treat as transient.
-  return err instanceof Error
-}
-
 export async function editClassroomWithConflictRetry(
   client: GitHubClient,
   input: EditClassroomInput,
@@ -398,18 +341,14 @@ export async function deleteClassroom(
     staffTeams = {}
   }
 
-  const ref = await getBranchRef(client, org, branch)
-  const commit = await getCommit(client, org, ref.object.sha)
+  const head = await readConfigRepoHeadAt(client, org, branch)
 
-  const currentTree = await client.request<{
-    tree: Array<{
-      path: string
-      mode: string
-      type: "blob" | "tree" | "commit"
-      sha: string
-    }>
-    truncated: boolean
-  }>(`/repos/${org}/${CONFIG_REPO}/git/trees/${commit.tree.sha}?recursive=1`)
+  const currentTree = await getRepoTreeRecursive({
+    client,
+    owner: org,
+    repo: CONFIG_REPO,
+    treeSha: head.baseTreeSha,
+  })
 
   if (currentTree.truncated) {
     throw new Error(
@@ -436,36 +375,12 @@ export async function deleteClassroom(
     }
   }
 
-  const newTree = await client.request<{
-    sha: string
-  }>(`/repos/${org}/${CONFIG_REPO}/git/trees`, {
-    method: "POST",
-    body: {
-      base_tree: commit.tree.sha,
-      tree: entriesToDelete,
-    },
-  })
-
-  const newCommit = await client.request<{
-    sha: string
-  }>(`/repos/${org}/${CONFIG_REPO}/git/commits`, {
-    method: "POST",
-    body: {
-      message: prefixCommit(`Delete classroom ${classroom}`),
-      tree: newTree.sha,
-      parents: [commit.sha],
-    },
-  })
-
-  await client.request(
-    `/repos/${org}/${CONFIG_REPO}/git/refs/heads/${branch}`,
-    {
-      method: "PATCH",
-      body: {
-        sha: newCommit.sha,
-        force: false,
-      },
-    },
+  const written = await commitConfigRepoFiles(
+    client,
+    org,
+    head,
+    entriesToDelete,
+    `Delete classroom ${classroom}`,
   )
 
   // Delete the per-classroom teams (idempotent; 404 = already gone): students
@@ -540,9 +455,9 @@ export async function deleteClassroom(
     deleted: true,
     classroom,
     deletedPaths: entriesToDelete.map((entry) => entry.path),
-    previousCommitSha: commit.sha,
-    newTreeSha: newTree.sha,
-    newCommitSha: newCommit.sha,
+    previousCommitSha: head.headSha,
+    newTreeSha: written.newTreeSha,
+    newCommitSha: written.newCommitSha,
     teamDeleteWarning,
   }
 }

@@ -1,9 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query"
-import { editClassroomWithConflictRetry } from "@/domain/classrooms"
 import {
+  editClassroomWithConflictRetry,
   type EditClassroomInput,
   type EditClassroomResult,
-} from "@/github-core/mutations"
+} from "@/domain/classrooms"
 import { githubKeys } from "@/github-core/queries"
 import { GitHubAPIError } from "@/github-core/errors"
 import { useGitHubClient } from "@/context/github/GitHubProvider"

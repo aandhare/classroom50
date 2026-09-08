@@ -13,7 +13,7 @@ import {
 import type { GitHubMoveBranch } from "@/github-core/types"
 import { prefixCommit } from "@/util/commit"
 
-import { assertClassroomNotArchived } from "./classrooms"
+import { assertClassroomNotArchived } from "./classrooms/archiveGuard"
 
 // The config repo's head, read once per write attempt.
 export type ConfigRepoHead = {

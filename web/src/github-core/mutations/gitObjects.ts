@@ -5,7 +5,6 @@ import {
   type GitHubMoveBranch,
   type GitHubBlob,
 } from "../types"
-import type { CreateClassroomInput } from "@/domain/classrooms"
 import { STUDENT_CSV_FIELDS } from "@/util/rosterCsv"
 import { CONFIG_REPO, DEFAULT_BRANCH } from "@/util/configRepo"
 import {
@@ -14,7 +13,6 @@ import {
   rosterPath,
   scoresFilePath,
 } from "@/util/configRepoPaths"
-import { prefixCommit } from "@/util/commit"
 import type { ClassroomTeamRef, StaffTeamRefs } from "./teams"
 
 // The branch a config repo's default is renamed TO when normalizing it.
@@ -57,67 +55,66 @@ export const createClassroomMetadata = (
 // source of truth (STUDENT_CSV_FIELDS) so it can't drift. The parser is
 // header-based, so an older roster still parses.
 export const STUDENTS_CSV_HEADER = STUDENT_CSV_FIELDS.join(",") + "\n"
-export const createClassroomBody = (
-  base_tree: string,
-  org: string,
-  classroom: string,
-  name: string | undefined,
-  term: string,
-  team?: ClassroomTeamRef,
-  secret?: string,
-  teams?: StaffTeamRefs,
-) => {
+// The files a new classroom starts with: empty assignments, roster header,
+// empty scores, and its classroom.json record.
+export function classroomSeedTree(input: {
+  org: string
+  classroom: string
+  name?: string
+  term: string
+  team?: ClassroomTeamRef
+  secret?: string
+  teams?: StaffTeamRefs
+}): GitTreeEntry[] {
+  const { org, classroom, name, term, team, secret, teams } = input
   const mode = "100644"
   const type = "blob"
 
-  return {
-    base_tree,
-    tree: [
-      {
-        path: assignmentsFilePath(classroom),
-        mode,
-        type,
-        content: JSON.stringify(ASSIGNMENTS_TEMPLATE, null, 2),
-      },
-      {
-        path: rosterPath(classroom),
-        mode,
-        type,
-        content: STUDENTS_CSV_HEADER,
-      },
-      {
-        path: scoresFilePath(classroom),
-        mode,
-        type,
-        content: JSON.stringify(
-          {
-            schema: "classroom50/scores/v1",
-            assignments: {},
-          },
-          null,
-          2,
+  return [
+    {
+      path: assignmentsFilePath(classroom),
+      mode,
+      type,
+      content: JSON.stringify(ASSIGNMENTS_TEMPLATE, null, 2),
+    },
+    {
+      path: rosterPath(classroom),
+      mode,
+      type,
+      content: STUDENTS_CSV_HEADER,
+    },
+    {
+      path: scoresFilePath(classroom),
+      mode,
+      type,
+      content: JSON.stringify(
+        {
+          schema: "classroom50/scores/v1",
+          assignments: {},
+        },
+        null,
+        2,
+      ),
+    },
+    {
+      path: classroomFilePath(classroom),
+      mode,
+      type,
+      content: JSON.stringify(
+        createClassroomMetadata(
+          org,
+          classroom,
+          name,
+          term,
+          team,
+          secret,
+          teams,
         ),
-      },
-      {
-        path: classroomFilePath(classroom),
-        mode,
-        type,
-        content: JSON.stringify(
-          createClassroomMetadata(
-            org,
-            classroom,
-            name,
-            term,
-            team,
-            secret,
-            teams,
-          ),
-          null,
-          2,
-        ),
-      },
-    ],
-  }
+        null,
+        2,
+      ),
+    },
+  ]
 }
 
 // One entry in a git tree write. GitHub accepts either inline `content` or a
@@ -236,58 +233,6 @@ export function updateRef(
     repo: CONFIG_REPO,
     branch,
     commitSha: sha,
-  })
-}
-
-// The classroom-seed tree: the four files a new classroom starts with.
-export function createTree(
-  client: GitHubClient,
-  input: CreateClassroomInput & {
-    base_tree: string
-    term: string
-    team?: ClassroomTeamRef
-    teams?: StaffTeamRefs
-  },
-) {
-  const { base_tree, org, classroom, name, term, team, teams } = input
-  const body = createClassroomBody(
-    base_tree,
-    org,
-    classroom,
-    name,
-    term,
-    team,
-    input.secret,
-    teams,
-  )
-  return createRepoTree(client, {
-    owner: org,
-    repo: CONFIG_REPO,
-    baseTreeSha: base_tree,
-    tree: body.tree as GitTreeEntry[],
-  })
-}
-
-// The classroom-seed commit; the message defaults to the seed subject.
-export function createCommit(
-  client: GitHubClient,
-  input: {
-    org: string
-    classroom: string
-    parents: [string]
-    tree_sha: string
-    message?: string
-  },
-) {
-  const { classroom, tree_sha, org, parents, message } = input
-  return createRepoCommit(client, {
-    owner: org,
-    repo: CONFIG_REPO,
-    message:
-      message ||
-      prefixCommit(`Create init files for new classroom: ${classroom}`),
-    treeSha: tree_sha,
-    parentSha: parents[0],
   })
 }
 
