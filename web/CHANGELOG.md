@@ -17,6 +17,13 @@ classroom50.org (see `.github/workflows/web-release-please.yaml`). You no longer
 edit this file or tag by hand; write Conventional Commit messages and
 release-please compiles the notes.
 
+## [1.47.1](https://github.com/foundation50/classroom50/compare/web-v1.47.0...web-v1.47.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **web:** restore two visuals and eight tests the dedup PRs changed ([#923](https://github.com/foundation50/classroom50/issues/923)) ([8a66ab0](https://github.com/foundation50/classroom50/commit/8a66ab0b37ec9928c243cc302ca99ffb33ceb8e3))
+
 ## [1.47.0](https://github.com/foundation50/classroom50/compare/web-v1.46.1...web-v1.47.0) (2026-09-08)
 
 
