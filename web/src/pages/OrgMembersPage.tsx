@@ -1,8 +1,7 @@
-import { useMemo, useRef, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { EmptyState } from "@/components/list"
 import { Trans, useTranslation } from "react-i18next"
 import { useParams } from "@tanstack/react-router"
-import { useQueryClient } from "@tanstack/react-query"
 import {
   AlertIcon,
   ChevronRightIcon,
@@ -32,9 +31,6 @@ import Avatar from "@/components/avatar"
 import { useGitHubClient } from "@/context/github/GitHubProvider"
 import { useToast } from "@/context/notifications/NotificationProvider"
 import { useGitHubViewer } from "@/hooks/useGitHubResources"
-import { githubKeys, invalidateInviteQueries } from "@/github-core/queries"
-import { CONFIG_REPO } from "@/util/configRepo"
-import { classroomTeamSlug } from "@/util/teamSlug"
 import useOrgMembersOverview from "@/hooks/useOrgMembersOverview"
 import {
   filterOrgMemberRows,
@@ -45,8 +41,6 @@ import {
   type OrgMembersStatusFilter,
 } from "@/util/orgMembers"
 import { githubOrgPeopleUrl } from "@/util/orgUrl"
-import type { StudentCsvRow } from "@/domain/students"
-import type { GitHubUser } from "@/github-core/types"
 import { isSameGitHubUser } from "@/util/students"
 import { motion } from "motion/react"
 import { blockEnter } from "@/lib/motion"
@@ -55,13 +49,8 @@ import BulkActionsBar, {
   type BulkDoneInput,
 } from "@/pages/orgMembers/BulkActionsBar"
 import MemberDetailModal from "@/pages/orgMembers/MemberDetailModal"
-import {
-  resolveSelectedRows,
-  selectableRows,
-  selectAllState,
-  toggleSelectAll,
-} from "@/util/rowSelection"
-import { useRangeSelection } from "@/hooks/useRangeSelection"
+import { useRowSelection } from "@/hooks/useRowSelection"
+import { useOrgMembersCacheSync } from "@/hooks/useOrgMembersCacheSync"
 import {
   GitHubIdentity,
   MemberStatusBadge,
@@ -70,12 +59,6 @@ import {
   runInviteMember,
 } from "@/pages/orgMembers/memberPresentation"
 import useGetClasses from "@/hooks/useGetClasses"
-import { rosterPath } from "@/util/rosterPath"
-
-// Delay before reconciling an optimistically-updated roster.csv cache with
-// the authoritative GitHub read: the contents API lags a fresh commit, so an
-// immediate refetch reads the pre-commit file and reverts the optimistic change.
-const CSV_RECONCILE_DELAY_MS = 4000
 
 // Sentinel classroom-filter value for "members on no roster". A real classroom
 // path can't collide (paths don't contain a leading colon).
@@ -95,14 +78,7 @@ const SKELETON_BARS = [
 
 const MEMBERS_COL_COUNT = SKELETON_BARS.length
 
-// Trimmed-id + lowercased-login sets for matching rows against cached GitHub
-// identities — the one matching recipe every optimistic cache drop uses.
-const identitySets = (rows: OrgMemberRow[]) => ({
-  ids: new Set(rows.map((r) => r.github_id?.trim()).filter(Boolean)),
-  logins: new Set(
-    rows.map((r) => r.username?.trim().toLowerCase()).filter(Boolean),
-  ),
-})
+const rowKey = (row: OrgMemberRow) => row.key
 
 // One value per (column, direction) pair for the table-header sort controls.
 type MembersTableSortValue =
@@ -114,7 +90,6 @@ const OrgMembersPage = () => {
   const { org } = useParams({ strict: false })
   const client = useGitHubClient()
   const { notify } = useToast()
-  const queryClient = useQueryClient()
   const { data: viewer } = useGitHubViewer()
   const {
     rows,
@@ -142,270 +117,25 @@ const OrgMembersPage = () => {
   const [tableSort, setTableSort] = useState<MembersTableSortValue | null>(null)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [invitingKey, setInvitingKey] = useState<string | null>(null)
-  // Multi-select for bulk classroom actions. Selection is by row key and
-  // persists across search filtering (a hidden-but-selected row is still acted
-  // on); "select all" targets the currently-filtered rows.
-  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
-  // True while a delayed members reconcile is scheduled — the window where an
-  // eager orgMembersAll refetch would resurrect an optimistically-removed row.
-  const membersReconcilePending = useRef(false)
+  const cacheSync = useOrgMembersCacheSync(org, teamSlugByClassroom)
 
-  // After an org-level removal. The members-list read lags the membership
-  // DELETE, so (like the CSV/team caches) drop the row optimistically and
-  // reconcile on a delay; `removed` false = the DELETE failed, so only
-  // re-read. `unenrolledClassrooms` is what the run REPORTED unenrolling —
-  // never row.classrooms, which includes archived or failed unenrolls whose
-  // rosters really do still hold the student.
+  // After an org-level removal: the hook seeds/reconciles the caches; the page
+  // drops the stale selection key, or the vanished row keeps the toolbar stuck
+  // at "N selected" with no visible checkbox to clear.
   const refresh = (
     affected: OrgMemberRow,
     removed: boolean,
     unenrolledClassrooms: string[],
   ) => {
-    if (!org) return
-    if (removed) {
-      optimisticRemoveFromMembers([affected])
-      scheduleMembersReconcile()
-      // Drop the stale selection key, or the vanished row keeps the toolbar
-      // stuck at "N selected" with no visible checkbox to clear.
-      setSelectedKeys((prev) => {
-        if (!prev.has(affected.key)) return prev
-        const next = new Set(prev)
-        next.delete(affected.key)
-        return next
-      })
-    } else {
-      invalidateMembers()
-    }
-    invalidateInviteQueries(queryClient, org)
-    for (const classroom of unenrolledClassrooms) {
-      optimisticRemove(classroom, [affected])
-      invalidateClassroom(classroom, { skipCsv: true })
-      scheduleClassroomReconcile(classroom)
-    }
+    cacheSync.afterMemberRemoval(affected, removed, unenrolledClassrooms)
+    if (removed) deselectRow(affected.key)
   }
 
-  // Refresh after an org invite (only org-invite state changed). Just re-read
-  // the members + invite lists.
-  const refreshInvite = () => {
-    if (!org) return
-    invalidateMembers()
-    invalidateInviteQueries(queryClient, org)
-  }
+  const refreshInvite = cacheSync.afterInvite
 
-  // Resolved GitHub team slug for a classroom (classroom.json.team.slug, else
-  // the derived classroomTeamSlug). Must match the key
-  // useOrgMembersOverview reads the team cache under, or optimistic writes below
-  // target a cache nobody reads (a name-collision classroom's real slug differs
-  // from the heuristic) and reintroduce the false "unprovisioned" flash.
-  const teamSlugFor = (classroom: string) =>
-    teamSlugByClassroom.get(classroom) ?? classroomTeamSlug(classroom)
-
-  // Invalidate the non-racy caches a roster write touches: classroom.json and,
-  // unless suppressed, the CSV. The team-members query is deliberately NOT
-  // invalidated here — it's handled by the optimistic seed + delayed reconcile,
-  // because invalidating CSV and team at different beats lets aggregateOrgMembers
-  // compare a fresh team against a stale CSV and flash a false "unprovisioned"
-  // state. `skipCsv` is set after we've optimistically seeded the CSV
-  // (invalidating it would refetch the pre-commit file and revert the seed).
-  const invalidateClassroom = (
-    classroom: string,
-    opts?: { skipCsv?: boolean },
-  ) => {
-    if (!org) return
-    if (!opts?.skipCsv) {
-      queryClient.invalidateQueries({
-        queryKey: githubKeys.csvFile(org, CONFIG_REPO, rosterPath(classroom)),
-      })
-    }
-    queryClient.invalidateQueries({
-      queryKey: githubKeys.jsonFile(
-        org,
-        CONFIG_REPO,
-        `${classroom}/classroom.json`,
-      ),
-    })
-  }
-
-  // Optimistically drop removed accounts from the orgMembersAll cache the row
-  // list derives from. Invalidating instead would refetch a list that lags the
-  // DELETE and resurrect the row (a roster-less member has no other cache to
-  // disappear from at all).
-  const optimisticRemoveFromMembers = (removed: OrgMemberRow[]) => {
-    if (!org || removed.length === 0) return
-    const { ids, logins } = identitySets(removed)
-    queryClient.setQueryData<GitHubUser[]>(
-      githubKeys.orgMembersAll(org),
-      (current) =>
-        current?.filter(
-          (m) => !ids.has(String(m.id)) && !logins.has(m.login.toLowerCase()),
-        ) ?? current,
-    )
-  }
-
-  // Immediate members-list invalidation, deferred while a members reconcile
-  // is pending — inside that window the lagging list would resurrect the
-  // just-dropped row, and the reconcile refetches soon anyway.
-  const invalidateMembers = () => {
-    if (!org || membersReconcilePending.current) return
-    queryClient.invalidateQueries({ queryKey: githubKeys.orgMembersAll(org) })
-  }
-
-  // Reconcile the members cache once the list API has caught up with the
-  // DELETE (mirroring scheduleClassroomReconcile); defers invalidateMembers
-  // while pending.
-  const scheduleMembersReconcile = () => {
-    if (!org) return
-    membersReconcilePending.current = true
-    window.setTimeout(() => {
-      membersReconcilePending.current = false
-      queryClient.invalidateQueries({ queryKey: githubKeys.orgMembersAll(org) })
-    }, CSV_RECONCILE_DELAY_MS)
-  }
-
-  // Optimistically drop members (by resolved id/login) from BOTH the target
-  // classroom's roster.csv AND its team-members cache, in the same tick, so
-  // the two never disagree (which would flash a false "unprovisioned" state).
-  // teamSlug is the resolved slug, so a collided-name classroom updates right.
-  const optimisticRemove = (classroom: string, removed: OrgMemberRow[]) => {
-    if (!org || removed.length === 0) return
-    const { ids, logins } = identitySets(removed)
-    queryClient.setQueryData<StudentCsvRow[]>(
-      githubKeys.csvFile(org, CONFIG_REPO, rosterPath(classroom)),
-      (current) =>
-        current?.filter(
-          (s) =>
-            !(s.github_id && ids.has(s.github_id.trim())) &&
-            !(s.username && logins.has(s.username.trim().toLowerCase())),
-        ) ?? current,
-    )
-    queryClient.setQueryData<GitHubUser[]>(
-      githubKeys.teamMembers(org, teamSlugFor(classroom)),
-      (current) =>
-        current?.filter(
-          (m) => !ids.has(String(m.id)) && !logins.has(m.login.toLowerCase()),
-        ) ?? current,
-    )
-  }
-
-  // Reconcile a classroom's CSV + team caches with the server once GitHub's
-  // APIs have caught up with the commit (both lag). Done on one delayed tick so
-  // they refetch together and can't flash an inconsistent intermediate state.
-  const scheduleClassroomReconcile = (classroom: string) => {
-    if (!org) return
-    window.setTimeout(() => {
-      queryClient.invalidateQueries({
-        queryKey: githubKeys.csvFile(org, CONFIG_REPO, rosterPath(classroom)),
-      })
-      queryClient.invalidateQueries({
-        queryKey: githubKeys.teamMembers(org, teamSlugFor(classroom)),
-      })
-    }, CSV_RECONCILE_DELAY_MS)
-  }
-
-  // After a bulk add/remove: optimistically reflect the change in the CSV +
-  // team caches the row status derives from (kept consistent, no false
-  // "unprovisioned" flash), then reconcile both with the server on a delay.
-  // An org-wide removal fans the same treatment out to every classroom the
-  // run actually unenrolled.
   const handleBulkDone = (input: BulkDoneInput) => {
-    if (!org) return
-
-    if (input.action === "remove-org") {
-      const rowByKey = new Map(rows.map((r) => [r.key, r]))
-      const removedRows = input.affectedKeys
-        .map((key) => rowByKey.get(key))
-        .filter((r): r is OrgMemberRow => Boolean(r))
-      // Seed/reconcile the classrooms the run REPORTED unenrolling — a failed
-      // org DELETE still changed its rosters. Deriving from row.classrooms
-      // would assert unenrolls that were skipped (archived) or failed.
-      const byClassroom = new Map<string, OrgMemberRow[]>()
-      for (const { key, classrooms } of input.unenrolled) {
-        const row = rowByKey.get(key)
-        if (!row) continue
-        for (const classroom of classrooms) {
-          const list = byClassroom.get(classroom) ?? []
-          list.push(row)
-          byClassroom.set(classroom, list)
-        }
-      }
-      for (const [classroom, unenrolledRows] of byClassroom) {
-        optimisticRemove(classroom, unenrolledRows)
-        invalidateClassroom(classroom, { skipCsv: true })
-        scheduleClassroomReconcile(classroom)
-      }
-      // affectedKeys carry only CONFIRMED-removed rows, so the optimistic
-      // members-cache drop (instead of a lag-prone refetch) is safe.
-      optimisticRemoveFromMembers(removedRows)
-      scheduleMembersReconcile()
-      invalidateInviteQueries(queryClient, org)
-      setSelectedKeys(new Set())
-      return
-    }
-
-    const { classroom, affectedKeys } = input
-
-    if (input.action === "add" && input.addedStudents.length > 0) {
-      const addedStudents = input.addedStudents
-      const csvKey = githubKeys.csvFile(org, CONFIG_REPO, rosterPath(classroom))
-      queryClient.setQueryData<StudentCsvRow[]>(csvKey, (current) => {
-        const list = current ?? []
-        const seen = new Set(
-          list.flatMap((s) => [
-            s.github_id?.trim(),
-            s.username?.trim().toLowerCase(),
-          ]),
-        )
-        const toAppend = addedStudents.filter(
-          (s) =>
-            !(s.github_id && seen.has(s.github_id.trim())) &&
-            !(s.username && seen.has(s.username.trim().toLowerCase())),
-        )
-        return toAppend.length > 0 ? [...list, ...toAppend] : list
-      })
-      // Seed the team cache too, so the member reads as "enrolled" immediately.
-      // buildTeamRoster/aggregate read id+login.
-      queryClient.setQueryData<GitHubUser[]>(
-        githubKeys.teamMembers(org, teamSlugFor(classroom)),
-        (current) => {
-          const list = current ?? []
-          const have = new Set(list.map((m) => String(m.id)))
-          const stubs = addedStudents
-            .filter((s) => s.github_id && !have.has(s.github_id.trim()))
-            .map(
-              (s) =>
-                ({
-                  id: Number(s.github_id),
-                  login: s.username,
-                  avatar_url: "",
-                  html_url: "",
-                  name: null,
-                  email: null,
-                  bio: null,
-                  permissions: {
-                    admin: false,
-                    pull: true,
-                    maintain: false,
-                    push: false,
-                  },
-                }) satisfies GitHubUser,
-            )
-          return stubs.length > 0 ? [...list, ...stubs] : list
-        },
-      )
-    }
-
-    if (input.action === "remove" && affectedKeys.length > 0) {
-      const removedRows = rows.filter((r) => affectedKeys.includes(r.key))
-      optimisticRemove(classroom, removedRows)
-    }
-
-    // Recompute members against the seeded caches, leaving them alone;
-    // reconcile both on a delay.
-    invalidateMembers()
-    invalidateInviteQueries(queryClient, org)
-    invalidateClassroom(classroom, { skipCsv: true })
-    setSelectedKeys(new Set())
-    scheduleClassroomReconcile(classroom)
+    cacheSync.afterBulkRun(input, rows)
+    clearSelection()
   }
 
   // Inline row invite for an on-roster non-member (mirrors the detail-drawer
@@ -433,11 +163,14 @@ const OrgMembersPage = () => {
     }
   }
 
-  const isSelf = (row: OrgMemberRow) =>
-    isSameGitHubUser(viewer ?? null, {
-      github_id: row.github_id,
-      username: row.username,
-    })
+  const isSelf = useCallback(
+    (row: OrgMemberRow) =>
+      isSameGitHubUser(viewer ?? null, {
+        github_id: row.github_id,
+        username: row.username,
+      }),
+    [viewer],
+  )
 
   // An org owner/admin: in the fetched admin-id set, or the signed-in account
   // (always an owner here — page is owner-gated — even if the admin list
@@ -524,42 +257,32 @@ const OrgMembersPage = () => {
   )
 
   // The signed-in owner can't be bulk-added/removed — a row is selectable only
-  // when it isn't self.
-  const isSelectable = (row: OrgMemberRow) => !isSelf(row)
-
-  // Rows backing the current selection, across the full set (a selected row
-  // hidden by search is still acted on), self always excluded.
-  const selectedRows = useMemo(
-    () => resolveSelectedRows(rows, selectedKeys, isSelectable, (r) => r.key),
-    // isSelf/isSelectable depend on viewer; recompute when it changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [rows, selectedKeys, viewer],
+  // when it isn't self. Stable per viewer so the selection memos key on it.
+  const isSelectable = useCallback(
+    (row: OrgMemberRow) => !isSelf(row),
+    [isSelf],
   )
 
-  // Shift-click range selection over the rendered order. OrgMembersPage renders
-  // `filtered` flat (no grouping), so the filtered list IS the rendered order.
-  const { handleToggleRow, handleRowCheckboxClick } = useRangeSelection(
-    filtered,
-    isSelectable,
-    setSelectedKeys,
-    (r) => r.key,
-  )
-
-  // Select-all targets the currently-filtered SELECTABLE rows (self excluded),
-  // without disturbing selected rows outside the current filter.
-  const selectableFiltered = useMemo(
-    () => selectableRows(filtered, isSelectable),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [filtered, viewer],
-  )
+  // Multi-select for bulk classroom actions. Selection is by row key and
+  // persists across search filtering (a hidden-but-selected row is still acted
+  // on); "select all" targets the currently-filtered rows. OrgMembersPage
+  // renders `filtered` flat (no grouping), so it is also the rendered order.
   const {
+    selectedKeys,
+    selectedRows,
     allSelected: allFilteredSelected,
     someSelected: someFilteredSelected,
-  } = selectAllState(selectableFiltered, selectedKeys, (r) => r.key)
-  const handleToggleSelectAll = () =>
-    setSelectedKeys((prev) =>
-      toggleSelectAll(selectableFiltered, prev, (r) => r.key),
-    )
+    toggleSelectAll: handleToggleSelectAll,
+    deselect: deselectRow,
+    clear: clearSelection,
+    handleToggleRow,
+    handleRowCheckboxClick,
+  } = useRowSelection({
+    rows,
+    filtered,
+    isSelectable,
+    keyOf: rowKey,
+  })
 
   // Picker/filter options: the display name from classroom.json when its
   // metadata has loaded, else the directory slug.
@@ -651,7 +374,7 @@ const OrgMembersPage = () => {
                 members={members}
                 classrooms={classroomOptions}
                 isOwner={isOwner}
-                onClearSelection={() => setSelectedKeys(new Set())}
+                onClearSelection={clearSelection}
                 onDone={handleBulkDone}
               />
             ) : null}
