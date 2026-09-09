@@ -1,6 +1,7 @@
 package submitcmd
 
 import (
+	"context"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -67,7 +68,7 @@ func TestPushSubmitTag_PushesCanonicalTag(t *testing.T) {
 		return time.Date(2026, 8, 3, 14, 30, 5, 0, time.UTC)
 	}
 
-	tag, err := pushSubmitTag(local, sha)
+	tag, err := pushSubmitTag(context.Background(), local, sha)
 	if err != nil {
 		t.Fatalf("pushSubmitTag: %v", err)
 	}
@@ -93,7 +94,7 @@ func TestPushSubmitTag_ReusesExistingTagAtSHA(t *testing.T) {
 		t.Fatalf("seed existing tag: %v\n%s", err, out)
 	}
 
-	tag, err := pushSubmitTag(local, sha)
+	tag, err := pushSubmitTag(context.Background(), local, sha)
 	if err != nil {
 		t.Fatalf("pushSubmitTag: %v", err)
 	}
@@ -116,7 +117,7 @@ func TestPushSubmitTag_NonSubmitTagAtSHAIsIgnored(t *testing.T) {
 		t.Fatalf("seed unrelated tag: %v\n%s", err, out)
 	}
 
-	tag, err := pushSubmitTag(local, sha)
+	tag, err := pushSubmitTag(context.Background(), local, sha)
 	if err != nil {
 		t.Fatalf("pushSubmitTag: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestPushSubmitTag_PushFailureSurfacesError(t *testing.T) {
 	).CombinedOutput(); err != nil {
 		t.Fatalf("set-url: %v\n%s", err, out)
 	}
-	if _, err := pushSubmitTag(local, sha); err == nil {
+	if _, err := pushSubmitTag(context.Background(), local, sha); err == nil {
 		t.Fatal("pushSubmitTag against a dead remote must error (submit surfaces the re-run guidance)")
 	}
 }

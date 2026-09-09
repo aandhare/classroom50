@@ -1,6 +1,7 @@
 package submitcmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,7 +111,7 @@ func TestResolveRepoDefaultBranch(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": "master"})
 		})
-		got, err := resolveRepoDefaultBranch(githubtest.NewTestClient(t, server), "o", "repo")
+		got, err := resolveRepoDefaultBranch(context.Background(), githubtest.NewTestClient(t, server), "o", "repo")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -123,7 +124,7 @@ func TestResolveRepoDefaultBranch(t *testing.T) {
 		server := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"default_branch": ""})
 		})
-		got, err := resolveRepoDefaultBranch(githubtest.NewTestClient(t, server), "o", "repo")
+		got, err := resolveRepoDefaultBranch(context.Background(), githubtest.NewTestClient(t, server), "o", "repo")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -136,7 +137,7 @@ func TestResolveRepoDefaultBranch(t *testing.T) {
 		server := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		})
-		_, err := resolveRepoDefaultBranch(githubtest.NewTestClient(t, server), "o", "repo")
+		_, err := resolveRepoDefaultBranch(context.Background(), githubtest.NewTestClient(t, server), "o", "repo")
 		if err == nil {
 			t.Fatal("expected an error on a failed default-branch lookup")
 		}
