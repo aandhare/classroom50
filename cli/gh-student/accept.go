@@ -609,6 +609,10 @@ func acceptAssignment(cmd *cobra.Command, client githubapi.Client, u *ui.UI, out
 		visibilityWord = "public"
 		u.Warn("this assignment creates a PUBLIC repository: your work (code, commits, name) will be visible to anyone on the internet")
 	}
+	if entry.Pages != nil {
+		u.Note("GitHub Pages is enabled for this assignment: your repository can publish a website at %s, and anyone on the internet can view it, even when the repository is private",
+			studentPagesURL(org, reponame.Name(classroom, assignment, ownerSegment)))
+	}
 	createMsg := fmt.Sprintf("Creating %s repository for %s", visibilityWord, assignment)
 	createSp := u.Spinner(createMsg)
 	createSp.Start()
@@ -688,6 +692,7 @@ func acceptAssignment(cmd *cobra.Command, client githubapi.Client, u *ui.UI, out
 		initShim:           entry.InitShim,
 		feedbackPR:         entry.FeedbackPR,
 		feedbackPRTemplate: resolveFeedbackTemplateRef(entry),
+		pages:              entry.Pages,
 		fullName:           fullName,
 		htmlURL:            htmlURL,
 		alreadyExisted:     alreadyExisted,
@@ -737,10 +742,14 @@ type acceptRepoParams struct {
 	// the template repo's pull_request_template.md (feedback_pr_template opt-in).
 	// Nil means the built-in body. The read is best-effort (fail-open).
 	feedbackPRTemplate *feedbackTemplateRef
-	fullName, htmlURL  string
-	alreadyExisted     bool
-	createSp           *ghui.Spinner
-	createMsg          string
+	// pages, when set, configures a GitHub Pages site before the control-files
+	// commit; see enablePagesStep. Fresh create only: acceptIntoRepo clears it
+	// on the heal path.
+	pages             *assignments.Pages
+	fullName, htmlURL string
+	alreadyExisted    bool
+	createSp          *ghui.Spinner
+	createMsg         string
 }
 
 // acceptIntoRepo decides whether a just-created-or-existing repo needs
@@ -798,6 +807,8 @@ func acceptIntoRepo(client githubapi.Client, u *ui.UI, verbose bool, out io.Writ
 		// the repair — the following setup spinner reports that with its own
 		// ✓/✗, so a failed re-provision isn't preceded by a success glyph.
 		p.createSp.Stop(fmt.Sprintf("Found incomplete setup: %s", p.fullName))
+		// Pages is fresh-create only, like repo features; see enablePagesStep.
+		p.pages = nil
 	} else {
 		p.createSp.Stop(fmt.Sprintf("Created %s", p.fullName))
 	}
@@ -889,6 +900,72 @@ func attachTeamStep(client githubapi.Client, p acceptRepoParams) error {
 	return groupteam.AttachRepo(context.Background(), client, p.org, p.teamSlug, p.repoName)
 }
 
+// enablePagesStep configures the assignment's GitHub Pages site once the branch
+// is readable and before the control-files commit, so a branch source exists
+// and that commit's push is a workflow site's first deploy (a deploy workflow's
+// first run would otherwise fail with no site). Fresh create only, never
+// re-asserted on heal, so a student's own later Pages change survives.
+// Best-effort: a refusal warns with the next step and never fails accept; 409
+// means a site already exists and is left alone.
+func enablePagesStep(client githubapi.Client, u *ui.UI, verbose bool, p acceptRepoParams) {
+	if p.pages == nil {
+		return
+	}
+	const msg = "Enabling GitHub Pages"
+	sp := u.Spinner(msg)
+	sp.Start()
+	if err := classroomcfg.WaitForStableBranch(client, p.org, p.repoName, p.branch); err != nil {
+		sp.Fail(msg)
+		u.Warn("could not enable GitHub Pages on %s/%s (%v); your teacher can enable it from the submissions page", p.org, p.repoName, err)
+		return
+	}
+	body, ok := ghutil.PagesBodyForAssignment(p.pages.Source, p.pages.Branch, p.pages.Path, p.branch)
+	if !ok {
+		sp.Fail(msg)
+		u.Warn("could not enable GitHub Pages on %s/%s: this version of gh-student doesn't understand the assignment's Pages setting (%q). Update gh-student, or your teacher can enable it from the submissions page", p.org, p.repoName, p.pages.Source)
+		return
+	}
+	already, err := githubapi.EnablePages(client, p.org, p.repoName, body)
+	if err != nil {
+		sp.Fail(msg)
+		u.Warn("could not enable GitHub Pages on %s/%s (%v). %s", p.org, p.repoName, err, pagesRefusalHint(err))
+		return
+	}
+	if already {
+		sp.Stop("GitHub Pages already enabled")
+	} else {
+		sp.Stop("GitHub Pages enabled")
+	}
+	if verbose {
+		u.Detail("site: %s (build_type=%s)", studentPagesURL(p.org, p.repoName), body.BuildType)
+	}
+}
+
+// studentPagesURL is the github.io project-site address every repo gets; an org
+// custom Pages domain redirects from it.
+func studentPagesURL(org, repo string) string {
+	return fmt.Sprintf("https://%s.github.io/%s/", strings.ToLower(org), strings.ToLower(repo))
+}
+
+// pagesRefusalHint names the next step for a Pages create refusal, classified
+// from the message GitHub attached (never err.Error(), which embeds the request
+// URL and so the repo name). The teacher's submissions page can retry any of
+// them.
+func pagesRefusalHint(err error) string {
+	message := strings.ToLower(ghutil.HTTPErrorMessage(err))
+	switch {
+	case ghutil.IsRateLimited(err):
+		return "GitHub rate-limited the request; run accept again in a few minutes, or your teacher can enable it from the submissions page"
+	case strings.Contains(message, "upgrade") || strings.Contains(message, "make this repository public"):
+		return "This organization's GitHub plan doesn't allow Pages on private repositories; your teacher can make the repository public and enable Pages from the submissions page"
+	case ghutil.IsHTTPStatus(err, http.StatusUnprocessableEntity) && strings.Contains(message, "branch"):
+		return "The branch it publishes from doesn't exist yet; your teacher can enable Pages from the submissions page once it does"
+	case ghutil.IsHTTPStatus(err, http.StatusForbidden):
+		return "The organization may not let members publish Pages sites; your teacher can enable it from the submissions page"
+	}
+	return "Your teacher can enable it from the submissions page"
+}
+
 // attachTeamBestEffort re-issues the idempotent team attach on an
 // already-accepted repo, healing a prior accept that died between the repo
 // landing and the grant. Probe-first: any team member can read the
@@ -927,6 +1004,9 @@ func attachTeamBestEffort(client githubapi.Client, u *ui.UI, _ bool, p acceptRep
 // paths. Mirrors the GUI's provisionAcceptedRepo so CLI and GUI heal a
 // half-finished accept identically.
 func provisionAcceptedRepo(client githubapi.Client, u *ui.UI, verbose bool, p acceptRepoParams, cfg classroomcfg.Config) error {
+	// Pages goes before the control-files commit; see enablePagesStep.
+	enablePagesStep(client, u, verbose, p)
+
 	// DropFiles lands both control files in one Tree commit, waiting out
 	// GitHub's post-create replication lag; the spinner animates throughout
 	// (no numeric counter — the wait has no guaranteed bound).

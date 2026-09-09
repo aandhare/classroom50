@@ -3,6 +3,7 @@ import {
   CalendarIcon,
   CheckCircleIcon,
   ChevronDownIcon,
+  GlobeIcon,
   LinkExternalIcon,
   LockIcon,
   MarkGithubIcon,
@@ -16,12 +17,14 @@ import {
   Badge,
   Button,
   Card,
+  HelpTooltip,
   Markdown,
   MonoLtr,
   Heading,
   RouterButton,
 } from "@/components/ui"
 import { assignmentDescription } from "@/types/classroom"
+import { defaultRepoPagesUrl } from "@/util/repoPages"
 import { useDocumentTitle } from "@/hooks/useDocumentTitle"
 import type { GitHubUser } from "@/github-core/types"
 import { GitHubAPIError } from "@/github-core/errors"
@@ -1376,6 +1379,23 @@ const AcceptAssignmentPage = () => {
                     </div>
                   </div>
                 </Alert>
+              )}
+
+            {/* Pages disclosure: one line that Pages is on, the explanation in a
+                tooltip. A site only exists once the student deploys something,
+                so the copy must not promise a live website. */}
+            {assignmentData.pages &&
+              !repoExistsAlready &&
+              !acceptMutation.data && (
+                <div className="flex items-center gap-1.5 text-sm text-base-content/70">
+                  <GlobeIcon aria-hidden="true" className="size-4 shrink-0" />
+                  <span>{t("accept.pagesSite.enabled")}</span>
+                  <HelpTooltip
+                    help={t("accept.pagesSite.help", {
+                      url: defaultRepoPagesUrl(org ?? "", expectedRepoName),
+                    })}
+                  />
+                </div>
               )}
 
             {(acceptMutation.isPending ||

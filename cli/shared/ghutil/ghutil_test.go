@@ -2,10 +2,13 @@ package ghutil
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -213,6 +216,102 @@ func TestSetCollaborator(t *testing.T) {
 			}
 			if status != tc.status {
 				t.Errorf("status = %d, want %d", status, tc.status)
+			}
+		})
+	}
+}
+
+func TestPagesBodyForAssignment(t *testing.T) {
+	cases := []struct {
+		name                        string
+		source, branch, path, defBr string
+		want                        string
+	}{
+		{"workflow", "workflow", "", "", "main", `{"build_type":"workflow"}`},
+		{"branch defaults", "branch", "", "", "master", `{"build_type":"legacy","source":{"branch":"master","path":"/"}}`},
+		{"branch named docs", "branch", "gh-pages", "/docs", "main", `{"build_type":"legacy","source":{"branch":"gh-pages","path":"/docs"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, ok := PagesBodyForAssignment(tc.source, tc.branch, tc.path, tc.defBr)
+			if !ok {
+				t.Fatalf("PagesBodyForAssignment(%q) ok = false, want true", tc.source)
+			}
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(raw) != tc.want {
+				t.Errorf("body = %s, want %s", raw, tc.want)
+			}
+		})
+	}
+	// A source this release does not know must fail closed (skip the POST), so
+	// a newer writer's value never yields a different site per accept client.
+	if _, ok := PagesBodyForAssignment("container", "", "", "main"); ok {
+		t.Errorf("unknown source must not map to a body")
+	}
+}
+
+func TestHTTPErrorMessage(t *testing.T) {
+	err := fmt.Errorf("POST repos/o/git-branching-alice/pages: %w", &api.HTTPError{
+		StatusCode: http.StatusUnprocessableEntity,
+		Message:    "Validation Failed",
+		Errors:     []api.HTTPErrorItem{{Message: "The branch does not exist"}},
+	})
+	got := HTTPErrorMessage(err)
+	if !strings.Contains(got, "Validation Failed") || !strings.Contains(got, "The branch does not exist") {
+		t.Errorf("HTTPErrorMessage = %q, want message and error items", got)
+	}
+	if strings.Contains(got, "git-branching") {
+		t.Errorf("HTTPErrorMessage must not include the request path: %q", got)
+	}
+	if HTTPErrorMessage(errors.New("dial tcp: timeout")) != "" {
+		t.Errorf("non-HTTPError must yield an empty message")
+	}
+}
+
+func TestEnablePages(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		wantAlready bool
+		wantErr     bool
+	}{
+		{"created", http.StatusCreated, false, false},
+		{"already exists", http.StatusConflict, true, false},
+		{"plan refusal", http.StatusUnprocessableEntity, false, true},
+		{"forbidden", http.StatusForbidden, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/o/r/pages", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want POST", r.Method)
+				}
+				body, _ := io.ReadAll(r.Body)
+				if want := `{"build_type":"workflow"}`; string(body) != want {
+					t.Errorf("body = %s, want %s", body, want)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"message":"x"}`))
+			})
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			already, err := EnablePages(newTestRESTClient(t, server), "o", "r", PagesCreateBody{BuildType: "workflow"})
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for status %d, got nil", tc.status)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EnablePages: %v", err)
+			}
+			if already != tc.wantAlready {
+				t.Errorf("alreadyEnabled = %v, want %v", already, tc.wantAlready)
 			}
 		})
 	}

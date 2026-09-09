@@ -51,8 +51,11 @@ import { deriveFormShape } from "./formShape"
 import { resolveSubmissionMode } from "@/domain/assignments/submissionDetection"
 import type {
   Assignment,
+  AssignmentPages,
   AssignmentTestDefaults,
   AssignmentTestFailureDetails,
+  PagesPath,
+  PagesSource,
   RepoPermission,
   RepoFeatures,
   RepoVisibility,
@@ -66,6 +69,8 @@ import {
   DEFAULT_PASS_THRESHOLD,
   PASS_THRESHOLD_MAX,
   PASS_THRESHOLD_MIN,
+  PAGES_PATHS,
+  PAGES_SOURCES,
   REPO_PERMISSIONS,
   REPO_VISIBILITIES,
   SUBMISSION_MODES,
@@ -193,6 +198,18 @@ export type CreateAssignmentFormValues = {
   // Editing it later affects only repos created from then on; existing repos
   // are flipped from the submissions page.
   repo_visibility: RepoVisibility
+  // How each student repo's GitHub Pages site deploys: "off" (the default; no
+  // `pages` block on the wire), "workflow" (a GitHub Actions workflow in the
+  // repo publishes), or "branch" (GitHub publishes a branch directly). Accept-
+  // time, fresh create only: editing it affects repos created from then on;
+  // existing repos are enabled from the submissions page.
+  pages_source: PagesSourceChoice
+  // Branch to publish for pages_source "branch"; "" = the repo's default
+  // branch. Cleared on submit otherwise.
+  pages_branch: string
+  // Folder to publish for pages_source "branch"; "/" is the wire default and
+  // omitted. Cleared on submit otherwise.
+  pages_path: PagesPath
   // When the autograder fires: "every-push" (the default; omitted on the
   // wire) or "tag" (only submit/* tag pushes grade — the submit flows push
   // the tag; plain `git push` costs no Actions minutes). Baked into each
@@ -234,6 +251,45 @@ export type CreateAssignmentFormValues = {
 // A single repo-feature control's value. "inherit" is the default and omits the
 // wire key; "on"/"off" force true/false.
 export type RepoFeatureChoice = "inherit" | "on" | "off"
+
+// The Pages control's value: "off" omits the wire `pages` block; the others are
+// the schema's pages.source enum.
+export type PagesSourceChoice = "off" | PagesSource
+export const PAGES_SOURCE_CHOICES: readonly PagesSourceChoice[] = [
+  "off",
+  ...PAGES_SOURCES,
+]
+
+// Read mapping: a stored pages block (or absent) -> the three form fields.
+export function pagesToFormValues(
+  pages: AssignmentPages | undefined,
+): Pick<
+  CreateAssignmentFormValues,
+  "pages_source" | "pages_branch" | "pages_path"
+> {
+  return {
+    pages_source: pages?.source ?? "off",
+    pages_branch: pages?.branch ?? "",
+    pages_path: pages?.path ?? "/",
+  }
+}
+
+// Write mapping: the three form fields -> the wire pages block, or undefined
+// when off. branch/path ride only with the "branch" source; "/" is omitted.
+export function formValuesToPages(
+  value: Pick<
+    CreateAssignmentFormValues,
+    "pages_source" | "pages_branch" | "pages_path"
+  >,
+): AssignmentPages | undefined {
+  if (value.pages_source === "off") return undefined
+  if (value.pages_source === "workflow") return { source: "workflow" }
+  const result: AssignmentPages = { source: "branch" }
+  const branch = value.pages_branch.trim()
+  if (branch) result.branch = branch
+  if (value.pages_path !== "/") result.path = value.pages_path
+  return result
+}
 
 // Read mapping: a stored boolean/absent -> the form choice. Absent (or an
 // absent object) is "inherit"; true is "on"; false is "off". Shared by create
@@ -565,6 +621,24 @@ export function validateAssignmentForm(
     )
   }
 
+  // Pages: guard the pickers and, for the branch source, a branch name GitHub
+  // would refuse (whitespace, over the ref limit); "" means the default branch.
+  // A bare repo is deliberately not rejected here: PagesField is disabled and
+  // shows Off while the stored value stays, so an error would land on a control
+  // the teacher cannot change. toSubmitValues clears it; buildAssignmentEntry
+  // is the backstop.
+  if (!PAGES_SOURCE_CHOICES.includes(value.pages_source)) {
+    errors.pages_source = t("assignments.form.validation.pagesSourceInvalid")
+  } else if (value.pages_source === "branch") {
+    const branch = value.pages_branch.trim()
+    if (/\s/.test(branch) || branch.length > 255) {
+      errors.pages_branch = t("assignments.form.validation.pagesBranchInvalid")
+    }
+    if (!PAGES_PATHS.includes(value.pages_path)) {
+      errors.pages_path = t("assignments.form.validation.pagesPathInvalid")
+    }
+  }
+
   // Mirror the CLI's ValidateSubmissionTags so a bad pattern can't reach the
   // file (the util returns its own user-readable message). Only validated in
   // "tag" mode: the tags field is hidden and cleared on submit for every-push,
@@ -698,6 +772,15 @@ export function toSubmitValues(
     // Repo visibility is accept-time provisioning like student_permission, so
     // it is NOT cleared by any repo shape.
     repo_visibility: value.repo_visibility,
+    // A bare repo has no branch to publish (the schema excludes the pair), so
+    // clear Pages there; branch/path ride only with the "branch" source.
+    pages_source: isEmptyRepo ? "off" : value.pages_source,
+    pages_branch:
+      !isEmptyRepo && value.pages_source === "branch"
+        ? value.pages_branch.trim()
+        : "",
+    pages_path:
+      !isEmptyRepo && value.pages_source === "branch" ? value.pages_path : "/",
     // The submission MODE is how the app identifies submissions and is valid
     // for every repo shape (with a shim it also drives the trigger; without one
     // it's the detection definition), so it is NOT cleared by noBuiltIn.
@@ -790,6 +873,9 @@ export const useAssignmentForm = (
       pass_threshold: defaultValues?.pass_threshold ?? DEFAULT_PASS_THRESHOLD,
       student_permission: defaultValues?.student_permission ?? "",
       repo_visibility: defaultValues?.repo_visibility ?? "private",
+      pages_source: defaultValues?.pages_source ?? "off",
+      pages_branch: defaultValues?.pages_branch ?? "",
+      pages_path: defaultValues?.pages_path ?? "/",
       submission_mode: resolveSubmissionMode(defaultValues?.submission_mode),
       submission_tags: defaultValues?.submission_tags || "",
       // Create default is "off" (not graded); the option order is off ->
@@ -915,6 +1001,7 @@ export const assignmentToFormValues = (
     student_permission: assignment.student_permission ?? "",
     // Absent means private (the wire default, collapsed by writers).
     repo_visibility: assignment.repo_visibility ?? "private",
+    ...pagesToFormValues(assignment.pages),
     // Absent means every-push (the wire default, collapsed by writers).
     submission_mode: resolveSubmissionMode(assignment.submission_mode),
     // Milestone tag patterns, joined one-per-line for the textarea.

@@ -85,6 +85,27 @@ func IsHTTPNotFound(err error) bool {
 	return IsHTTPStatus(err, http.StatusNotFound)
 }
 
+// HTTPErrorMessage returns the text GitHub attached to an API error (the body
+// `message` plus any `errors[]` items), or "" for a non-HTTPError. Classify a
+// refusal by wording from this, not err.Error(): the latter embeds the request
+// URL, so a repo named after a keyword (e.g. "branch") would match.
+func HTTPErrorMessage(err error) string {
+	httpErr, ok := errors.AsType[*api.HTTPError](err)
+	if !ok {
+		return ""
+	}
+	parts := []string{httpErr.Message}
+	for _, item := range httpErr.Errors {
+		if item.Message != "" {
+			parts = append(parts, item.Message)
+		}
+		if item.Code != "" {
+			parts = append(parts, item.Code)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 // IsRateLimited reports whether err is a GitHub rate-limit / secondary-limit
 // (abuse) response rather than a genuine permission denial. GitHub signals these
 // with a `Retry-After` header (secondary limit / 429) or `x-ratelimit-remaining:
@@ -249,6 +270,63 @@ func SetCollaborator(client *api.RESTClient, owner, repo, username, permission s
 		return resp.StatusCode, fmt.Errorf("PUT %s: unexpected status %d", path, resp.StatusCode)
 	}
 	return resp.StatusCode, nil
+}
+
+// PagesSource is the branch+path half of a Pages create body (build_type
+// "legacy"). Path must be "/" or "/docs".
+type PagesSource struct {
+	Branch string `json:"branch"`
+	Path   string `json:"path,omitempty"`
+}
+
+// PagesCreateBody is the POST /repos/{owner}/{repo}/pages body. Source is sent
+// only for BuildType "legacy"; "workflow" carries none.
+// https://docs.github.com/en/rest/pages/pages#create-a-github-pages-site
+type PagesCreateBody struct {
+	BuildType string       `json:"build_type"`
+	Source    *PagesSource `json:"source,omitempty"`
+}
+
+// PagesBodyForAssignment maps an assignments.json pages block onto the API
+// body; defaultBranch fills an unset branch for the branch source. ok is false
+// for a source this release does not know (a newer writer's value) so the
+// caller skips the POST instead of guessing a deploy model; the web mapper
+// fails closed the same way, so both accept clients agree.
+func PagesBodyForAssignment(source, branch, path, defaultBranch string) (body PagesCreateBody, ok bool) {
+	buildType := contract.PagesBuildType(source)
+	switch buildType {
+	case contract.PagesBuildTypeLegacy:
+		if branch == "" {
+			branch = defaultBranch
+		}
+		if path == "" {
+			path = contract.PagesPathRoot
+		}
+		return PagesCreateBody{BuildType: buildType, Source: &PagesSource{Branch: branch, Path: path}}, true
+	case contract.PagesBuildTypeWorkflow:
+		return PagesCreateBody{BuildType: buildType}, true
+	}
+	return PagesCreateBody{}, false
+}
+
+// EnablePages POSTs a Pages site configuration for owner/repo (needs repo
+// admin). 201 = created; 409 = a site already exists and is left untouched
+// (alreadyEnabled). Any other failure is returned for the caller to fail open
+// or hard on.
+func EnablePages(client *api.RESTClient, owner, repo string, body PagesCreateBody) (alreadyEnabled bool, err error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return false, fmt.Errorf("encode body: %w", err)
+	}
+	path := fmt.Sprintf("repos/%s/%s/pages", url.PathEscape(owner), url.PathEscape(repo))
+	switch err := client.Post(path, bytes.NewReader(raw), nil); {
+	case err == nil:
+		return false, nil
+	case IsHTTPStatus(err, http.StatusConflict):
+		return true, nil
+	default:
+		return false, fmt.Errorf("POST %s: %w", path, err)
+	}
 }
 
 // DecodeContentsBase64 decodes the base64 envelope the GitHub contents/git-data

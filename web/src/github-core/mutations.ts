@@ -154,3 +154,10 @@ export {
 } from "./mutations/inviteTeams"
 export { updateOrgProfile, type OrgProfileUpdate } from "./mutations/orgProfile"
 export { updateOrgTeamCreation } from "./mutations/orgTeamCreation"
+export {
+  enableRepoPages,
+  classifyPagesEnableError,
+  type PagesCreateBody,
+  type PagesEnableReason,
+  type EnableRepoPagesResult,
+} from "./mutations/repoPages"

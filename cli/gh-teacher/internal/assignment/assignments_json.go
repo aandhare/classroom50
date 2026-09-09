@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/foundation50/classroom50-cli-shared/contract"
 	"github.com/foundation50/gh-teacher/internal/output"
@@ -218,6 +219,7 @@ type AssignmentEntry struct {
 	SubmissionTags     []string         `json:"submission_tags,omitempty"`
 	RepoVisibility     string           `json:"repo_visibility,omitempty"`
 	RepoFeatures       *RepoFeatures    `json:"repo_features,omitempty"`
+	Pages              *PagesConfig     `json:"pages,omitempty"`
 	MigratedFrom       *MigratedFromRef `json:"migrated_from,omitempty"`
 
 	// RenamedFrom is the assignment's PREVIOUS slug, recorded by the one-shot
@@ -253,6 +255,7 @@ var knownEntryKeys = map[string]struct{}{
 	"init_shim":            {},
 	"include_all_branches": {},
 	"repo_features":        {},
+	"pages":                {},
 	"grading":              {},
 }
 
@@ -357,6 +360,42 @@ type RepoFeatures struct {
 	Wiki         *bool `json:"wiki,omitempty"`
 	Projects     *bool `json:"projects,omitempty"`
 	PullRequests *bool `json:"pull_requests,omitempty"`
+}
+
+// PagesConfig is the GitHub Pages site configured on each student repo at
+// accept (fresh create only). Source is contract.PagesSourceWorkflow or
+// contract.PagesSourceBranch; Branch and Path apply only to the branch source
+// (empty = the repo's default branch / "/"). Closed object like RepoFeatures:
+// an unknown sub-key is a hard parse error.
+type PagesConfig struct {
+	Source string `json:"source"`
+	Branch string `json:"branch,omitempty"`
+	Path   string `json:"path,omitempty"`
+}
+
+// ValidatePagesConfig checks a pages block against the schema: a known source,
+// branch/path only with the branch source, a branch GitHub would accept, and a
+// path of "/" or "/docs".
+func ValidatePagesConfig(p *PagesConfig) error {
+	if p == nil {
+		return nil
+	}
+	if !contract.IsValidPagesSource(p.Source) {
+		return fmt.Errorf("pages.source %q must be one of %s", p.Source, strings.Join(contract.PagesSources, ", "))
+	}
+	if p.Source == contract.PagesSourceWorkflow {
+		if p.Branch != "" || p.Path != "" {
+			return fmt.Errorf("pages.branch and pages.path only apply when pages.source is %q", contract.PagesSourceBranch)
+		}
+		return nil
+	}
+	if strings.ContainsFunc(p.Branch, unicode.IsSpace) || len(p.Branch) > 255 {
+		return fmt.Errorf("pages.branch %q must not contain whitespace and must be at most 255 characters", p.Branch)
+	}
+	if p.Path != "" && !contract.IsValidPagesPath(p.Path) {
+		return fmt.Errorf("pages.path %q must be one of %s", p.Path, strings.Join(contract.PagesPaths, ", "))
+	}
+	return nil
 }
 
 // MaxGroupSizeCap bounds max_group_size (when set; 0 = unset).
@@ -1063,6 +1102,9 @@ func ValidateAssignmentEntry(entry AssignmentEntry) error {
 	if err := ValidateRepoVisibility(entry.RepoVisibility); err != nil {
 		return err
 	}
+	if err := ValidatePagesConfig(entry.Pages); err != nil {
+		return err
+	}
 	if err := ValidateSubmissionTags(entry.SubmissionTags); err != nil {
 		return err
 	}
@@ -1111,6 +1153,9 @@ func validateEmptyRepoExclusions(entry AssignmentEntry) error {
 	}
 	if entry.PassThreshold != nil {
 		return errors.New("empty_repo is mutually exclusive with pass_threshold (--empty-repo vs --pass-threshold): a bare repo never autogrades")
+	}
+	if entry.Pages != nil {
+		return errors.New("empty_repo is mutually exclusive with pages (--empty-repo vs --pages): a bare repo has no branch to publish")
 	}
 	return nil
 }
@@ -1325,6 +1370,9 @@ func ValidateExistingEntry(entry AssignmentEntry) error {
 		return fmt.Errorf("entry %q: %w", entry.Slug, err)
 	}
 	if err := ValidateRepoVisibility(entry.RepoVisibility); err != nil {
+		return fmt.Errorf("entry %q: %w", entry.Slug, err)
+	}
+	if err := ValidatePagesConfig(entry.Pages); err != nil {
 		return fmt.Errorf("entry %q: %w", entry.Slug, err)
 	}
 	if err := ValidateSubmissionTags(entry.SubmissionTags); err != nil {

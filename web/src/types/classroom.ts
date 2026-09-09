@@ -172,6 +172,29 @@ export type RepoFeatures = {
   pull_requests?: boolean
 }
 
+// How each student repo's GitHub Pages site is deployed: "workflow" = a GitHub
+// Actions workflow in the repo publishes (GitHub build_type "workflow");
+// "branch" = GitHub publishes a branch directly (build_type "legacy"). In
+// lockstep with the CLI's assignments-v1 schema enum and contract.PagesSources
+// (parity-tested).
+export const PAGES_SOURCES = ["workflow", "branch"] as const
+export type PagesSource = (typeof PAGES_SOURCES)[number]
+
+// The only publish directories GitHub accepts for a branch-deployed site.
+export const PAGES_PATHS = ["/", "/docs"] as const
+export type PagesPath = (typeof PAGES_PATHS)[number]
+
+// The `pages` block on Assignment: a GitHub Pages site configured on each
+// student repo at accept (fresh create only), so students never need admin to
+// publish. `branch`/`path` apply only to source "branch"; absent = the repo's
+// default branch and "/". In lockstep with the CLI's assignments-v1 schema and
+// the Go PagesConfig struct (closed object).
+export type AssignmentPages = {
+  source: PagesSource
+  branch?: string
+  path?: PagesPath
+}
+
 // Mirrors one entry of classroom50/assignments/v1 — the shape gh-teacher writes
 // and parses strictly (unknown fields rejected).
 // Schema: https://github.com/foundation50/classroom50/blob/main/schemas/assignments-v1.schema.json
@@ -380,6 +403,10 @@ export type Assignment = {
   // re-accept. In lockstep with the CLI's assignments-v1 schema and the Go
   // RepoFeatures struct (`repo_features`, closed object).
   repo_features?: RepoFeatures
+  // GitHub Pages site configured on each student repo at accept (fresh create
+  // only, best-effort). Absent = off. Excluded with empty_repo. In lockstep
+  // with the CLI's assignments-v1 schema and the Go PagesConfig struct.
+  pages?: AssignmentPages
   tests?: AssignmentTest[]
   // Assignment-level defaults for the per-test reporting options
   // (failure-details / show-output); per-test values override. Only

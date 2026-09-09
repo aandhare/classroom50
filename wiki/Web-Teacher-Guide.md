@@ -302,6 +302,28 @@ section. Most assignments never need them:
   private instead and tells the student. The setting applies to repositories
   created from then on; to change existing ones, use **Change repository
   visibility** on the submissions page.
+- **GitHub Pages**: publish each student repository as a website, configured
+  automatically when the student accepts so students never need admin access
+  to their repository. **Off** is the default. **GitHub Actions** deploys
+  through a workflow in the student repository (for sites with a build step).
+  The workflow must grant `pages: write` and `id-token: write` and use
+  `actions/upload-pages-artifact` and `actions/deploy-pages`; ship it in your
+  template or have students add it. The site is created when the student
+  accepts, so the workflow's first run deploys it. **A branch** publishes the
+  files in a branch directly, no
+  workflow needed (plain HTML, CSS, and JavaScript): pick the branch (blank
+  means the repository's default branch) and the folder (`/` or `/docs`).
+  The site is public on the internet even when the repository is private, and
+  every file in the published branch and folder is served (only GitHub
+  Enterprise Cloud can restrict who sees a site); tell students what belongs in
+  the published folder. Pages on private repositories needs a GitHub plan that
+  includes it; on GitHub Free for organizations, pair it with a **Public**
+  repository visibility or the site isn't created (accept tells the student,
+  and the assignment still works). Not available for an empty repository. The setting
+  applies to repositories created from then on; to configure existing ones,
+  use **Enable GitHub Pages** on the submissions page. Each site lives at
+  `https://<org>.github.io/<repo>/` (an organization with a custom Pages
+  domain serves it there too).
 - **Student repository access**: the role students get on their own
   repository. The default is **Write (push)** for individual assignments and
   **Admin** for group assignments (so the group owner can add teammates).
@@ -1019,6 +1041,16 @@ order:
   students accept later use the assignment's **Repository visibility** setting
   instead. A row whose repository is public shows a **Public** badge, and a
   single repository can be flipped from its row's manage dialog.
+- **Enable GitHub Pages** (owners): configure the assignment's **GitHub
+  Pages** setting on every accepted repository in one pass, for repositories
+  accepted before Pages was turned on or whose site couldn't be created at
+  accept time. Repositories that already have a site are left as they are; a
+  refusal (for example, a private repository on a plan without private Pages)
+  is listed with what to do. A row whose repository has a site shows an
+  **Open GitHub Pages site** shortcut, and the row's manage dialog shows the
+  live site URL (plus the default `github.io` URL when the organization uses
+  a custom domain), its build status, and a per-repository **Enable GitHub
+  Pages** action.
 - **Update autograding triggers** (owners): retrofit existing repositories
   after a submission-type change (see
   [Changing the submission type later](#changing-the-submission-type-later)).

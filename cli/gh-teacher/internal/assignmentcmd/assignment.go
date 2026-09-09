@@ -89,6 +89,9 @@ func assignmentAddCmd() *cobra.Command {
 		submissionMd   string
 		submissionTags []string
 		repoVisibility string
+		pagesSource    string
+		pagesBranch    string
+		pagesPath      string
 		locked         bool
 	)
 
@@ -267,6 +270,13 @@ func assignmentAddCmd() *cobra.Command {
 			if err := assignment.ValidateRepoVisibility(repoVisibilityVal); err != nil {
 				return err
 			}
+			pagesVal, err := parsePagesFlags(pagesSource, pagesBranch, pagesPath, cmd.Flags().Changed("pages-branch"), cmd.Flags().Changed("pages-path"))
+			if err != nil {
+				return err
+			}
+			if pagesVal != nil && emptyRepo {
+				return errors.New("--empty-repo is mutually exclusive with --pages: a bare repo has no branch to publish")
+			}
 			if err := autograderseam.ValidateName(autograderVal); err != nil {
 				return err
 			}
@@ -347,6 +357,8 @@ func assignmentAddCmd() *cobra.Command {
 					SubmissionTagsChanged: cmd.Flags().Changed("submission-tag"),
 					RepoVisibility:        repoVisibilityVal,
 					RepoVisibilityChanged: cmd.Flags().Changed("repo-visibility"),
+					Pages:                 pagesVal,
+					PagesChanged:          cmd.Flags().Changed("pages"),
 					Locked:                locked,
 					LockedChanged:         cmd.Flags().Changed("locked"),
 				})
@@ -372,8 +384,46 @@ func assignmentAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&submissionMd, "submission-mode", contract.SubmissionModeEveryPush, "When the autograder fires: `every-push` (default; every push to the default branch grades) or `tag` (only submit/* tag pushes grade: `gh student submit` pushes the tag, or push any submit/* tag by hand; plain `git push` costs no Actions minutes). Baked into each student repo's shim at accept time; change it later with `gh teacher assignment submission-mode`, which also retrofits existing repos. Mutually exclusive with --empty-repo")
 	cmd.Flags().StringArrayVar(&submissionTags, "submission-tag", nil, "Milestone tag pattern (repeatable) that also triggers grading, for example --submission-tag phase1 --submission-tag phase2, or a glob like 'v*'. A student pushing a matching tag (`git tag phase1 && git push origin phase1`) gets that commit graded; the grading record still lives at the canonical submit/* tag the runner mints, so history and collection are unchanged. The canonical submit/* namespace always triggers too. Baked into the shim at accept time like --submission-mode (same retrofit to change later). Caution: a broad glob like 'v*' grades every matching tag a student pushes. Mutually exclusive with --empty-repo")
 	cmd.Flags().StringVar(&repoVisibility, "repo-visibility", contract.RepoVisibilityPrivate, "Visibility each student repo is created with at accept time: `private` (default) or `public` (for peer-review, portfolio, or showcase assignments; students are told upfront their work will be publicly visible). Applies to students who accept from now on; existing repos are unchanged (flip those from the gradebook's visibility actions). Caution with public: student work (names, emails, commit history) is visible to anyone on the internet from the moment the repo is created. If org policy blocks members from creating public repos, accept falls back to a private repo and tells the student")
+	cmd.Flags().StringVar(&pagesSource, "pages", pagesOff, "GitHub Pages site configured on each student repo at accept time, so students never need admin to publish: `off` (default), `workflow` (a GitHub Actions workflow in the student repo deploys the site; it needs pages: write and id-token: write permissions and comes from the template or the student), or `branch` (GitHub publishes a branch directly, no workflow needed). The site is public on the internet even when the repo is private, and every file in the published branch and folder is served. Applies to students who accept from now on; enable it on existing repos from the gradebook. Pages on private repos needs a GitHub plan that includes it; on GitHub Free for organizations, pair it with --repo-visibility public. Mutually exclusive with --empty-repo")
+	cmd.Flags().StringVar(&pagesBranch, "pages-branch", "", "Branch GitHub publishes with --pages branch. Omit for each student repo's default branch. A named branch must exist in the generated repo (for example, copied from the template with include_all_branches)")
+	cmd.Flags().StringVar(&pagesPath, "pages-path", contract.PagesPathRoot, "Folder GitHub publishes with --pages branch: `/` (default) or `/docs`")
 	cmd.Flags().BoolVar(&locked, "locked", false, "Lock the assignment so students can't see or accept it, including students who already accepted. For a private template in the org, the classroom team gets no read access until you unlock. Same effect as `gh teacher assignment lock`. On a same-slug re-add, --locked=false unlocks and omitting the flag keeps the stored lock")
 	return cmd
+}
+
+// pagesOff is the --pages value that writes no pages block.
+const pagesOff = "off"
+
+// parsePagesFlags turns --pages / --pages-branch / --pages-path into the entry's
+// pages block (nil for off), rejecting branch/path with a non-branch source and
+// collapsing the wire defaults ("" branch, "/" path). Enum validation is shared
+// with the parser (assignment.ValidatePagesConfig).
+func parsePagesFlags(source, branch, path string, branchSet, pathSet bool) (*assignment.PagesConfig, error) {
+	source = strings.TrimSpace(source)
+	if source == "" || source == pagesOff {
+		if branchSet || pathSet {
+			return nil, errors.New("--pages-branch and --pages-path require --pages branch")
+		}
+		return nil, nil
+	}
+	if !contract.IsValidPagesSource(source) {
+		return nil, fmt.Errorf("--pages must be one of %s, %s", pagesOff, strings.Join(contract.PagesSources, ", "))
+	}
+	cfg := &assignment.PagesConfig{Source: source}
+	if source == contract.PagesSourceWorkflow {
+		if branchSet || pathSet {
+			return nil, errors.New("--pages-branch and --pages-path only apply with --pages branch")
+		}
+		return cfg, nil
+	}
+	cfg.Branch = strings.TrimSpace(branch)
+	if p := strings.TrimSpace(path); p != "" && p != contract.PagesPathRoot {
+		cfg.Path = p
+	}
+	if err := assignment.ValidatePagesConfig(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // assignmentRemoveCmd is idempotent (missing slug exits 0) and leaves existing
@@ -692,7 +742,13 @@ type addAssignmentParams struct {
 	// flag carries a prior entry's visibility forward (often GUI-authored);
 	// an explicit --repo-visibility private is a deliberate reset.
 	RepoVisibilityChanged bool
-	Locked                bool
+	// Pages is the --pages trio as an entry block (nil = off).
+	Pages *assignment.PagesConfig
+	// Same omitted-vs-explicit distinction for --pages: an omitted flag
+	// carries a prior entry's block forward (often GUI-authored); an explicit
+	// --pages off is a deliberate reset.
+	PagesChanged bool
+	Locked       bool
 	// Same omitted-vs-explicit distinction for --locked: an omitted flag
 	// carries a prior entry's lock forward (it may have been set by
 	// `assignment lock` or the web app); an explicit --locked / --locked=false
@@ -785,6 +841,7 @@ func runAssignmentAdd(client githubapi.Client, out, errOut io.Writer, p addAssig
 		SubmissionMode:    p.SubmissionMode,
 		SubmissionTags:    p.SubmissionTags,
 		RepoVisibility:    p.RepoVisibility,
+		Pages:             p.Pages,
 		Locked:            p.Locked,
 	}
 	if err := assignment.ValidateAssignmentEntry(entry); err != nil {
@@ -798,6 +855,7 @@ func runAssignmentAdd(client githubapi.Client, out, errOut io.Writer, p addAssig
 		droppedTemplate      *assignment.TemplateRef
 		droppedAllowedCnt    int
 		droppedPassThreshold *int
+		droppedPages         bool
 		droppedStudentPerm   string
 		// empty_repo changed on a same-slug re-add. No longer blocked — the
 		// change only affects repos accepted from now on (already-accepted repos
@@ -818,6 +876,7 @@ func runAssignmentAdd(client githubapi.Client, out, errOut io.Writer, p addAssig
 		droppedTemplate = nil
 		droppedAllowedCnt = 0
 		droppedPassThreshold = nil
+		droppedPages = false
 		droppedStudentPerm = ""
 		changedEmptyRepo = false
 		previousLocked = false
@@ -1020,6 +1079,20 @@ func runAssignmentAdd(client githubapi.Client, out, errOut io.Writer, p addAssig
 			if !p.RepoVisibilityChanged {
 				attemptEntry.RepoVisibility = previous.RepoVisibility
 			}
+			// pages gets the same treatment: often GUI-authored, and a silent
+			// reset to off would stop configuring future accepters' sites. Copy
+			// so the carried block doesn't alias the previous entry. A bare repo
+			// has no branch to publish (the schema excludes the pair), so
+			// --empty-repo drops the stored block with a warning instead of
+			// failing on a flag the teacher never passed.
+			if !p.PagesChanged && previous.Pages != nil {
+				if attemptEntry.EmptyRepo {
+					droppedPages = true
+				} else {
+					carried := *previous.Pages
+					attemptEntry.Pages = &carried
+				}
+			}
 		}
 		committedLocked = attemptEntry.Locked
 		// Re-validate the fully assembled entry after every carry-forward: the
@@ -1127,6 +1200,11 @@ func runAssignmentAdd(client githubapi.Client, out, errOut io.Writer, p addAssig
 		_, _ = fmt.Fprintf(errOut,
 			"Warning: replacing %q dropped its pass_threshold (%d%%): `assignment add` rewrites the whole entry, and you re-ran it without --pass-threshold. The passing bar (often set in the web app) is now off. Pass --pass-threshold %d to keep it.\n",
 			slug, *droppedPassThreshold, *droppedPassThreshold)
+	}
+	if droppedPages {
+		_, _ = fmt.Fprintf(errOut,
+			"Warning: replacing %q dropped its GitHub Pages setting: an empty repository has no branch to publish, so --empty-repo turns Pages off for students who accept from now on. Drop --empty-repo to keep it.\n",
+			slug)
 	}
 	if droppedStudentPerm != "" {
 		_, _ = fmt.Fprintf(errOut,

@@ -1,12 +1,19 @@
 import type { GitHubClient } from "@/github-core/client"
-import type { AssignmentMode, RepoPermission } from "@/types/classroom"
+import type {
+  AssignmentMode,
+  AssignmentPages,
+  RepoPermission,
+} from "@/types/classroom"
 import { getUser } from "@/github-core/queries"
 import { studentRepoName } from "@/util/studentRepo"
+import { pagesCreateBody } from "@/util/repoPages"
 import {
   assignmentAcceptTree,
   commitRepoFiles,
   readRepoHead,
   getRepoTreeRecursive,
+  enableRepoPages,
+  type PagesEnableReason,
 } from "@/github-core/mutations"
 import { getRepo } from "@/github-core/repoReads"
 import type { GitHubRepo } from "@/github-core/types"
@@ -101,6 +108,10 @@ async function commitAcceptFilesWithFreshRepoRetry(params: {
   // default branch, which is only known after GitHub's async template copy
   // settles (see below). Omitted for branch-agnostic (teacher-authored) shims.
   rerenderShimForBranch?: (branch: string) => string
+  // Runs after the fresh repo is readable and before the accept commit, so a
+  // side effect the commit's push should see (the Pages site) exists first.
+  // Re-invoked on retry, so it must be idempotent, and it must not throw.
+  beforeCommit?: (settledBranch: string) => Promise<void>
   // Called once the wait has gone on long enough to be worth explaining.
   onStillInitializing?: () => void
 }): Promise<{ commitSha: string; branch: string }> {
@@ -113,6 +124,7 @@ async function commitAcceptFilesWithFreshRepoRetry(params: {
     autogradeYaml,
     removeSeededReadme = false,
     rerenderShimForBranch,
+    beforeCommit,
     onStillInitializing,
   } = params
 
@@ -154,6 +166,8 @@ async function commitAcceptFilesWithFreshRepoRetry(params: {
           : []
       }
 
+      await beforeCommit?.(targetBranch)
+
       // The accept commit that lands `.classroom50.yaml`, the marker the runner
       // uses to resolve the Feedback-PR baseline (see the constant).
       const { commitSha } = await commitRepoFiles(
@@ -193,6 +207,15 @@ type AcceptAssignmentResult = {
 // org-banned inherited key can't drop a forced override. An all-inherit
 // assignment carries `{ full: {}, explicit: {} }` (no PATCH).
 type RepoFeatureApply = { full: RepoFeaturePatch; explicit: RepoFeaturePatch }
+
+// The setup step's done message when the Pages create was refused, by reason.
+const PAGES_SKIPPED_MESSAGE_KEYS: Record<PagesEnableReason, string> = {
+  plan: "accept.stepDone.pagesSkipped.plan",
+  policy: "accept.stepDone.pagesSkipped.policy",
+  branch: "accept.stepDone.pagesSkipped.branch",
+  access: "accept.stepDone.pagesSkipped.access",
+  unknown: "accept.stepDone.pagesSkipped.unknown",
+}
 
 // The tracked "access" step: patch the repo surface + grant the founder role
 // (both idempotent upserts). Throws on failure so the checklist surfaces the
@@ -284,6 +307,10 @@ async function provisionAcceptedRepo(params: {
   repoFeatures: RepoFeatureApply
   // Template About/Topics to copy, forwarded to the founder-access step.
   repoAboutTopics: RepoAboutTopics
+  // The assignment's Pages block, configured before the accept commit. Fresh
+  // create only: the heal/re-accept paths pass undefined so a student's own
+  // later Pages change survives.
+  pages?: AssignmentPages
   branch: string
   metadataYaml: string
   autogradeYaml: string
@@ -307,6 +334,7 @@ async function provisionAcceptedRepo(params: {
     groupTeamSlug,
     repoFeatures,
     repoAboutTopics,
+    pages,
     branch,
     metadataYaml,
     autogradeYaml,
@@ -316,6 +344,48 @@ async function provisionAcceptedRepo(params: {
     rerenderShimForBranch,
     onStepUpdate,
   } = params
+
+  // Pages goes before the accept commit so that commit's push is the site's
+  // first deploy (a deploy workflow's first run would otherwise fail: no site
+  // yet). Best-effort: any refusal, including a rate limit enableRepoPages
+  // rethrows for the bulk fan-out's sake, is remembered for the setup step's
+  // done message and never thrown.
+  let pagesRefusal: PagesEnableReason | null = null
+  const configurePages = pages
+    ? async (settledBranch: string) => {
+        const body = pagesCreateBody(pages, settledBranch)
+        if (!body) {
+          pagesRefusal = "unknown"
+          log.warn("pages: unknown source, skipped (non-fatal)", {
+            org,
+            repo: repo.name,
+            source: pages.source,
+          })
+          return
+        }
+        try {
+          const result = await enableRepoPages(client, org, repo.name, body)
+          if (result.enabled) {
+            pagesRefusal = null
+            return
+          }
+          pagesRefusal = result.reason
+          log.warn("pages: enable refused (non-fatal)", {
+            org,
+            repo: repo.name,
+            reason: result.reason,
+            error: result.error,
+          })
+        } catch (err) {
+          pagesRefusal = "unknown"
+          log.warn("pages: enable failed (non-fatal)", {
+            org,
+            repo: repo.name,
+            error: err,
+          })
+        }
+      }
+    : undefined
 
   // Land the metadata + autograde shim, retrying through GitHub's post-generate
   // git-data lag (see commitAcceptFilesWithFreshRepoRetry).
@@ -340,6 +410,7 @@ async function provisionAcceptedRepo(params: {
         autogradeYaml,
         removeSeededReadme,
         rerenderShimForBranch,
+        beforeCommit: configurePages,
         onStillInitializing: () =>
           onStepUpdate?.({
             id: "setup",
@@ -348,6 +419,16 @@ async function provisionAcceptedRepo(params: {
           }),
       }),
   )
+
+  // Tell the student the site was not configured and why; the teacher can
+  // enable it from the submissions page.
+  if (pagesRefusal) {
+    onStepUpdate?.({
+      id: "setup",
+      status: "complete",
+      message: { key: PAGES_SKIPPED_MESSAGE_KEYS[pagesRefusal] },
+    })
+  }
 
   // Best-effort: a Feedback PR failure only defers creation to the runner, so it
   // never throws. Runs before the founder grant so the repo is fully set up
@@ -1217,6 +1298,8 @@ export async function acceptAssignment(params: {
       // re-applied when repairing an already-existing repo (a re-accept), so a
       // student's own later edit survives. Nothing to copy on this path.
       repoAboutTopics: {},
+      // Pages too: fresh create only.
+      pages: undefined,
       branch: created.repo.default_branch || sourceBranch,
       metadataYaml,
       autogradeYaml,
@@ -1259,6 +1342,7 @@ export async function acceptAssignment(params: {
     groupTeamSlug: groupTeam?.slug,
     repoFeatures,
     repoAboutTopics,
+    pages: assignment.pages,
     branch: targetBranch,
     metadataYaml,
     autogradeYaml,
