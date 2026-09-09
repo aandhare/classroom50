@@ -9,14 +9,19 @@ export { dismissFailedInvitation } from "./rosterPrimitives"
 export type EmailReinviteTarget = {
   email: string
   role: ClassroomRole
-  // The live invitation to replace (a pending email-only row). GitHub refuses a
-  // second invitation for an address that already has one, so a resend must
-  // cancel it; bulkInviteByEmail does so right before the create and restores
-  // it if the create fails.
+  // The live invitation to replace (a pending email-only row). Posting an
+  // address that already has one returns the existing invitation unchanged
+  // rather than sending again, so a resend must cancel it; bulkInviteByEmail
+  // does so right before the create and restores it if the create fails.
   pendingInvitationId?: number
   // The failed record the roster attributed to the row (see
   // TeamRosterRow.failed_invitation), dismissed once the fresh invite is out.
   failedInvitationId?: number
+  // Written with a NEW pending row (a roster upload); an address already on the
+  // roster keeps its row unchanged.
+  first_name?: string
+  last_name?: string
+  section?: string
 }
 
 export type ReinviteEmailRowsInput = {
@@ -82,6 +87,9 @@ export async function reinviteEmailRows(
       return {
         email: t.email,
         role: t.role,
+        first_name: t.first_name,
+        last_name: t.last_name,
+        section: t.section,
         pendingInvitationId: t.pendingInvitationId,
         failedInvitationIds: ids.size > 0 ? [...ids] : undefined,
       }
@@ -101,9 +109,10 @@ export type ReinviteEmailRowInput = {
 
 export type ReinviteEmailRowResult =
   | { status: "sent" }
-  // GitHub answered 422: the address already has a live invitation (one the
-  // classroom team can't see, possibly sent from another classroom) or belongs
-  // to an org member. Nothing was sent.
+  // GitHub answered an "already" 422 (see classifyInvitation422): the address
+  // belongs to an org member, or is otherwise already covered. Nothing was
+  // sent. (An address with a pending invitation does not 422; GitHub returns
+  // the existing invitation, which is why a resend cancels it first.)
   | { status: "already-invited-or-member" }
   | { status: "rate-limited" }
 

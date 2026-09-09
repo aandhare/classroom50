@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { DownloadIcon, UploadIcon } from "@/components/ui/icons"
+import { AlertIcon, DownloadIcon, UploadIcon } from "@/components/ui/icons"
 
 import { resolveRosterUploadContext } from "@/domain/students"
 import type {
@@ -11,7 +11,7 @@ import type {
   RosterUploadContext,
 } from "@/domain/students"
 import type { GitHubClient } from "@/github-core/client"
-import { Alert, Button, Checkbox, Modal } from "@/components/ui"
+import { Alert, Button, Checkbox, HelpTooltip, Modal } from "@/components/ui"
 import { BulkProgressRow, bulkProgressPct } from "@/components/bulk/resultView"
 import {
   classifyRosterUpload,
@@ -23,7 +23,7 @@ import { errorText } from "@/types/localizedMessage"
 import { decodeTextFile } from "@/util/fileBytes"
 import { downloadBlob } from "@/util/downloadBlob"
 import { isTeacherRole } from "@/authz"
-import type { ClassroomRole } from "@/util/teamRoster"
+import type { ClassroomRole, TeamRosterRow } from "@/util/teamRoster"
 import {
   DEFAULT_UPLOAD_KIND,
   type UploadKind,
@@ -35,6 +35,7 @@ import {
   identityKey,
   isAccountRow,
   isEmailRow,
+  indexRosterByEmail,
   loginIdentityKey,
   resolveImportIdentities,
   splitEmailRowsByLink,
@@ -95,6 +96,11 @@ type UploadRosterProps = {
   // button drives file selection from there.
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  // The roster page's rows, so an uploaded address the roster already knows is
+  // handled by its standing: a live invitation is left alone, a failed one is
+  // replaced. Without them (or for a non-owner, whose rows carry no invitation
+  // data) every address is a plain invitation.
+  rosterRows?: readonly TeamRosterRow[]
 }
 type ImportPhase = "idle" | "preview" | "importing" | "complete" | "error"
 
@@ -106,10 +112,15 @@ const UploadRoster = ({
   onEmailSuccess,
   open,
   onOpenChange,
+  rosterRows,
 }: UploadRosterProps) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const { t } = useTranslation()
   const resolveUploadedEmails = useResolveEmailRows(client, org)
+  const standingByEmail = useMemo(
+    () => indexRosterByEmail(rosterRows ?? []),
+    [rosterRows],
+  )
 
   const [phase, setPhase] = useState<ImportPhase>("idle")
   useBeforeUnloadGuard(phase === "importing")
@@ -133,6 +144,8 @@ const UploadRoster = ({
   // How many unlinked rows the completed run actually wrote (name-only rows
   // plus email rows whose invitation couldn't be sent).
   const [unlinkedKept, setUnlinkedKept] = useState(0)
+  // Left alone by the completed run: their invitation was still live.
+  const [emailAlreadyPending, setEmailAlreadyPending] = useState<string[]>([])
   const [parseId, setParseId] = useState(0)
   // Rows with a resolved identity (account or email), and the ones a github_id
   // made unusable. Null until resolution runs.
@@ -144,12 +157,16 @@ const UploadRoster = ({
     useState<BulkInviteByEmailResult | null>(null)
   const [emailError, setEmailError] = useState<string | null>(null)
   // Uploaded addresses the identity directory matched to a verified member of a
-  // previous classroom — enrolled directly instead of invited, once confirmed.
-  // Resolved ONCE per parse, alongside the identity resolution below.
+  // previous classroom — enrolled directly instead of invited. Resolved ONCE
+  // per parse, alongside the identity resolution below.
   const [emailLinks, setEmailLinks] = useState<ResolvedEmailLink[]>([])
   const [emailLinksDegraded, setEmailLinksDegraded] = useState(false)
-  // The teacher's explicit confirmation of those email→account links.
-  const [linksConfirmed, setLinksConfirmed] = useState(false)
+  // Linking is the default; declining goes through the inline acknowledgement
+  // below, since GitHub skips an email invitation to an existing member and the
+  // rows would stay unlinked. Reset to false (link) on a new parse, but kept
+  // across role edits: the decision doesn't depend on roles.
+  const [linksDeclined, setLinksDeclined] = useState(false)
+  const [confirmingUnlink, setConfirmingUnlink] = useState(false)
   // The links the completed run actually applied, for the result dialog.
   const [linkedApplied, setLinkedApplied] = useState<
     { email: string; login: string; classroom: string }[]
@@ -211,6 +228,7 @@ const UploadRoster = ({
     setDroppedRows([])
     setUnlinkedParsed([])
     setUnlinkedKept(0)
+    setEmailAlreadyPending([])
     setResolved(null)
     setUnusableRows([])
     setHeaderIssue(null)
@@ -218,7 +236,8 @@ const UploadRoster = ({
     setEmailError(null)
     setEmailLinks([])
     setEmailLinksDegraded(false)
-    setLinksConfirmed(false)
+    setLinksDeclined(false)
+    setConfirmingUnlink(false)
     setLinkedApplied([])
     setProgress({ processed: 0, total: 0, message: "" })
     setResult(null)
@@ -403,7 +422,7 @@ const UploadRoster = ({
     setRoleChangesConfirmed(false)
     setMetadataConfirmed(false)
     setMismatchConfirmed(false)
-    setLinksConfirmed(false)
+    // Not linksDeclined: it doesn't depend on roles (see its declaration).
   }, [rolesKey])
 
   const roleChanges = useMemo(() => preflight?.roleChanges ?? [], [preflight])
@@ -498,17 +517,38 @@ const UploadRoster = ({
   // mismatch — it repairs the stored username. Counting only the preflight
   // buckets would leave either kind of file on a disabled "No changes to apply".
   const emailRowCount = emailRows.length
+  // The links applied at submit (none once declined): one value for the count,
+  // the split, and the notice.
+  const appliedLinks = useMemo(
+    () => (linksDeclined ? [] : emailLinks),
+    [linksDeclined, emailLinks],
+  )
+  // Not re-sent by an upload (see splitEmailRowsByLink), so not invitations.
+  const pendingEmailCount = useMemo(() => {
+    const linked = new Set(appliedLinks.map((l) => l.email))
+    return emailRows.filter(
+      (r) =>
+        !linked.has(r.identity.email) &&
+        standingByEmail.get(r.identity.email.toLowerCase())?.state ===
+          "pending",
+    ).length
+  }, [emailRows, appliedLinks, standingByEmail])
   // How many people this upload will actually invite: non-members it will invite
   // by username, plus every email-identity row. ONE source, so the notice, the
   // summary, and the primary button can't disagree — a row that's already a
   // member (or only getting its details updated) is not an invitation.
-  const inviteCount = (preflight?.needsInvite.length ?? 0) + emailRowCount
+  const inviteCount =
+    (preflight?.needsInvite.length ?? 0) +
+    emailRowCount -
+    appliedLinks.length -
+    pendingEmailCount
+  // Live-pending email rows are left alone, so they aren't work.
   const hasActionableWork =
     (preflight?.needsInvite.length ?? 0) +
       (preflight?.enroll.length ?? 0) +
       (preflight?.roleChanges.length ?? 0) +
       (preflight?.metadataUpdate.length ?? 0) +
-      emailRowCount +
+      (emailRowCount - pendingEmailCount) +
       mismatches.length >
     0
   const needsMetadataConfirm = (preflight?.metadataUpdate.length ?? 0) > 0
@@ -546,8 +586,22 @@ const UploadRoster = ({
     (!preflight || hasActionableWork) &&
     (!needsRoleConfirm || roleChangesConfirmed) &&
     (!needsMetadataConfirm || metadataConfirmed) &&
-    (!needsMismatchConfirm || mismatchConfirmed) &&
-    (emailLinks.length === 0 || linksConfirmed)
+    (!needsMismatchConfirm || mismatchConfirmed)
+
+  // The first unmet gate, in the order the teacher clears them. None for "no
+  // changes": the label says it. Shown as a tooltip beside the button (a
+  // disabled button can't be hovered in every browser) and as its title.
+  const disabledReason = (() => {
+    if (canProcess) return null
+    if (preflighting) return t("students.uploadBlockedChecking")
+    if (needsRoleConfirm && !roleChangesConfirmed)
+      return t("students.uploadBlockedRoles")
+    if (needsMetadataConfirm && !metadataConfirmed)
+      return t("students.uploadBlockedDetails")
+    if (needsMismatchConfirm && !mismatchConfirmed)
+      return t("students.uploadBlockedUsernames")
+    return null
+  })()
 
   // The roster primary-button label names the action and its scale. Counts here
   // come from inviteCount / metadataUpdate — never the row total — so the button
@@ -585,7 +639,8 @@ const UploadRoster = ({
     setRoleChangesConfirmed(false)
     setMetadataConfirmed(false)
     setMismatchConfirmed(false)
-    setLinksConfirmed(false)
+    setLinksDeclined(false)
+    setConfirmingUnlink(false)
     setParseId((n) => n + 1)
     const parsed = parseRosterImportFile(text, kind)
     setParsedRows(parsed.rows)
@@ -672,17 +727,15 @@ const UploadRoster = ({
     // Resolve-before-invite: a confirmed link's email row imports as an ACCOUNT
     // row under the verified member's current login, and its address leaves the
     // invite list — see splitEmailRowsByLink.
-    const { linkedRows, linkedEmails, emailInvites } = splitEmailRowsByLink(
-      emailRows,
-      emailLinks,
-      roleFor,
-    )
+    const { linkedRows, linkedEmails, emailInvites, alreadyPending } =
+      splitEmailRowsByLink(emailRows, appliedLinks, roleFor, standingByEmail)
 
     const outcome = await runRosterImport(client, {
       org,
       classroom,
       rows: [...accountImportRows, ...linkedRows],
       emailInvites,
+      emailAlreadyPending: alreadyPending,
       linkedEmails,
       unlinkedRows: unlinkedParsed,
       // Snapshot the classification computed in the preview so the process pass
@@ -717,6 +770,7 @@ const UploadRoster = ({
     setEmailError(outcome.emailError)
     setUnlinkedKept(outcome.unlinkedKept)
     setLinkedApplied(outcome.linked)
+    setEmailAlreadyPending(outcome.emailAlreadyPending)
     setPhase("complete")
     onSuccess?.(outcome.importResult)
     // A mixed batch touches both caches, so both callbacks fire.
@@ -760,9 +814,18 @@ const UploadRoster = ({
               <Button variant="ghost" onClick={resetToDropZone}>
                 {t("common.cancel")}
               </Button>
+              {/* Opens toward Cancel so the modal box doesn't clip it. */}
+              {disabledReason ? (
+                <HelpTooltip
+                  help={disabledReason}
+                  position="left"
+                  icon={AlertIcon}
+                />
+              ) : null}
               <Button
                 variant="primary"
                 disabled={!canProcess}
+                title={disabledReason ?? undefined}
                 onClick={startImport}
               >
                 {rosterPrimaryLabel}
@@ -911,18 +974,21 @@ const UploadRoster = ({
                     <span>{t("students.emailInviteRosterNotice")}</span>
                   </Alert>
                 ) : null}
-                {/* Resolve-before-invite: addresses matched (and re-verified) to
-                    members of previous classrooms skip the invitation entirely.
-                    The teacher confirms the CONCRETE bindings — each address is
-                    listed with the account and source classroom it links to —
-                    mirroring the metadata gate above. */}
+                {/* Resolve-before-invite: matched addresses are linked to their
+                    account and enrolled directly, with each binding listed.
+                    Unchecking opens an inline acknowledgement (a nested dialog
+                    can't stack on this one); the box stays checked until the
+                    teacher confirms. */}
                 {emailLinks.length > 0 ? (
                   <Alert tone="info" className="mb-4">
                     <div className="flex flex-col gap-2">
                       <span>
-                        {t("students.emailLinksNotice", {
-                          count: emailLinks.length,
-                        })}
+                        {t(
+                          linksDeclined
+                            ? "students.emailLinksDeclinedNotice"
+                            : "students.emailLinksNotice",
+                          { count: emailLinks.length },
+                        )}
                       </span>
                       <ul className="flex flex-col gap-0.5 text-sm">
                         {emailLinks.map((link) => (
@@ -938,13 +1004,53 @@ const UploadRoster = ({
                       <label className="flex items-start gap-2 text-sm">
                         <Checkbox
                           className="mt-0.5"
-                          checked={linksConfirmed}
-                          onChange={(e) =>
-                            setLinksConfirmed(e.currentTarget.checked)
-                          }
+                          checked={!linksDeclined}
+                          onChange={(e) => {
+                            if (e.currentTarget.checked) {
+                              setLinksDeclined(false)
+                              setConfirmingUnlink(false)
+                            } else {
+                              setConfirmingUnlink(true)
+                            }
+                          }}
                         />
                         <span>{t("students.emailLinksConfirm")}</span>
                       </label>
+                      {confirmingUnlink ? (
+                        <div
+                          role="group"
+                          aria-label={t("students.emailLinksUnlinkTitle")}
+                          className="flex flex-col gap-3 rounded-box border border-warning/40 bg-warning/10 p-3 text-sm"
+                        >
+                          <p className="font-medium">
+                            {t("students.emailLinksUnlinkTitle")}
+                          </p>
+                          <p className="text-base-content/80">
+                            {t("students.emailLinksUnlinkBody", {
+                              count: emailLinks.length,
+                            })}
+                          </p>
+                          <div className="flex justify-end gap-2">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setConfirmingUnlink(false)}
+                            >
+                              {t("common.cancel")}
+                            </Button>
+                            <Button
+                              variant="warning"
+                              size="sm"
+                              onClick={() => {
+                                setLinksDeclined(true)
+                                setConfirmingUnlink(false)
+                              }}
+                            >
+                              {t("students.emailLinksUnlinkConfirm")}
+                            </Button>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   </Alert>
                 ) : null}
@@ -1030,6 +1136,7 @@ const UploadRoster = ({
                   roleChanges={roleChangeByUser}
                   identityChanges={identityChangeByUser}
                   alreadyOnRosterKeys={alreadyOnRosterKeys}
+                  emailStandingByEmail={standingByEmail}
                   loading={preflighting}
                   onRoleChange={(key, role) =>
                     setRolesByUser((prev) => ({ ...prev, [key]: role }))
@@ -1094,6 +1201,7 @@ const UploadRoster = ({
             emailError={emailError}
             unlinkedKept={unlinkedKept}
             linked={linkedApplied}
+            emailAlreadyPending={emailAlreadyPending}
           />
         )}
 

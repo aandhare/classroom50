@@ -9,6 +9,7 @@ import type { MetadataField } from "@/util/rosterMetadataMerge"
 import type { MetadataChange } from "@/util/rosterUploadPreflight"
 import {
   identityKey,
+  type EmailStanding,
   type ResolvedImportRow,
 } from "@/pages/students/rosterImportResolve"
 import { coerceImportRole } from "./rosterImportParse"
@@ -97,25 +98,36 @@ const IdentityCell = ({
   row,
   declaredUsername,
   alreadyOnRoster,
+  emailStanding,
 }: {
   row: ResolvedImportRow
   declaredUsername?: string
   alreadyOnRoster?: boolean
+  emailStanding?: EmailStanding
 }) => {
   const { t } = useTranslation()
   if (row.identity.kind === "email") {
-    // The address is invited either way; a roster row already carrying it just
-    // means no second row is written, and GitHub may answer the invite with a
-    // 422 if that person is already a member. Say that rather than implying the
-    // row is either a fresh invite or no action at all.
+    // What the send does for this address: a live invitation is left alone, a
+    // failed one is replaced, an address already on the roster gets a new
+    // invitation but no second row, anything else a fresh invitation.
+    const badge =
+      emailStanding?.state === "pending"
+        ? { key: "students.previewAlreadyPending", tone: "neutral" as const }
+        : emailStanding?.failedInvitationId !== undefined
+          ? {
+              key:
+                emailStanding.failedKind === "failed"
+                  ? "students.previewResendFailed"
+                  : "students.previewResendExpired",
+              tone: "warning" as const,
+            }
+          : alreadyOnRoster
+            ? { key: "students.previewEmailOnRoster", tone: "neutral" as const }
+            : { key: "students.previewInviteByEmail", tone: "info" as const }
     return (
       <td>
-        <Badge tone={alreadyOnRoster ? "neutral" : "info"} size="sm">
-          {t(
-            alreadyOnRoster
-              ? "students.previewEmailOnRoster"
-              : "students.previewInviteByEmail",
-          )}
+        <Badge tone={badge.tone} size="sm">
+          {t(badge.key)}
         </Badge>
       </td>
     )
@@ -149,6 +161,7 @@ export const RosterPreviewTable = ({
   roleChanges = {},
   identityChanges = {},
   alreadyOnRosterKeys,
+  emailStandingByEmail,
   loading = false,
   skeletonRowCount,
 }: {
@@ -162,6 +175,8 @@ export const RosterPreviewTable = ({
   // them (GitHub decides whether that is redundant), but no second roster row is
   // written, so the identity cell says so instead of implying a fresh invite.
   alreadyOnRosterKeys?: ReadonlySet<string>
+  // The roster's standing per uploaded address (lowercased email).
+  emailStandingByEmail?: ReadonlyMap<string, EmailStanding>
   // While the preflight resolves, the per-cell changes aren't known yet: render
   // the change-bearing columns as skeletons to signal "computing changes" in
   // place, rather than briefly showing static values that then sprout highlights.
@@ -221,6 +236,13 @@ export const RosterPreviewTable = ({
                     row={row}
                     declaredUsername={identityChange?.declaredUsername}
                     alreadyOnRoster={alreadyOnRosterKeys?.has(key)}
+                    emailStanding={
+                      row.identity.kind === "email"
+                        ? emailStandingByEmail?.get(
+                            row.identity.email.toLowerCase(),
+                          )
+                        : undefined
+                    }
                   />
                   <PreviewCell
                     value={[row.first_name, row.last_name]

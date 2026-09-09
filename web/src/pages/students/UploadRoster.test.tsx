@@ -1,6 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { render, screen, cleanup, waitFor } from "@testing-library/react"
+import {
+  render,
+  screen,
+  cleanup,
+  waitFor,
+  within,
+} from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import type { ReactElement } from "react"
 
@@ -33,6 +39,29 @@ vi.mock("@/domain/students", async (importOriginal) => {
   return {
     ...actual,
     bulkInviteByEmail: (...args: unknown[]) => bulkInviteByEmail(...args),
+    // runRosterImport calls reinviteEmailRows, which wraps bulkInviteByEmail.
+    // Forward to that spy in bulkInviteByEmail's shape so one payload is asserted.
+    reinviteEmailRows: (
+      client: unknown,
+      input: {
+        org: string
+        classroom: string
+        targets: Array<
+          Record<string, unknown> & { failedInvitationId?: number }
+        >
+        onProgress?: unknown
+      },
+    ) =>
+      bulkInviteByEmail(client, {
+        org: input.org,
+        classroom: input.classroom,
+        invites: input.targets.map(({ failedInvitationId, ...t }) => ({
+          ...t,
+          failedInvitationIds:
+            failedInvitationId === undefined ? undefined : [failedInvitationId],
+        })),
+        onProgress: input.onProgress,
+      }),
     resolveRosterUploadContext: (...args: unknown[]) =>
       resolveRosterUploadContext(...args),
     inviteRosterStudents: (...args: unknown[]) => inviteRosterStudents(...args),
@@ -185,11 +214,20 @@ describe("UploadRoster email-invite owner-confirmation gate", () => {
     await user.selectOptions(roleSelect, "teacher")
 
     expect(send.disabled).toBe(true)
+    // The reason is the tooltip trigger's accessible name and the button's title.
+    expect(
+      screen.getByRole("button", { name: "students.uploadBlockedRoles" }),
+    ).toBeTruthy()
+    expect(primaryButton().title).toBe("students.uploadBlockedRoles")
 
     // Ticking the confirmation enables the import.
     const checkbox = screen.getByRole("checkbox") as HTMLInputElement
     await user.click(checkbox)
     await waitFor(() => expect(primaryButton().disabled).toBe(false))
+    expect(
+      screen.queryByRole("button", { name: "students.uploadBlockedRoles" }),
+    ).toBeNull()
+    expect(primaryButton().title).toBe("")
 
     // And it actually sends when clicked.
     bulkInviteByEmail.mockResolvedValue({
@@ -758,6 +796,167 @@ describe("UploadRoster email-identity rows in a roster CSV", () => {
     })
   })
 
+  it("reads a file of only live-pending addresses as no changes to apply", async () => {
+    const user = userEvent.setup()
+    resolveRosterUploadContext.mockResolvedValue({
+      ...stubContext,
+      claimedEmails: new Set(["pending@x.edu"]),
+    })
+    classifyRosterUpload.mockReturnValue({
+      noAction: [],
+      needsInvite: [],
+      enroll: [],
+      roleChanges: [],
+      metadataUpdate: [],
+      identityMismatches: [],
+      allAlreadyMembers: true,
+    })
+    renderModal(
+      <UploadRoster
+        org="acme"
+        classroom="cs50"
+        client={client}
+        open={true}
+        rosterRows={
+          [
+            {
+              key: "k",
+              state: "pending",
+              roles: ["student"],
+              username: "",
+              github_id: "",
+              first_name: "",
+              last_name: "",
+              section: "",
+              email: "pending@x.edu",
+              avatar_url: "",
+              invitation_id: 42,
+            },
+          ] as never
+        }
+      />,
+    )
+
+    await uploadFile(user, file("roster.csv", "email\npending@x.edu\n"))
+
+    // Nothing would be sent, so the button says so and stays disabled.
+    const button = await waitFor(() =>
+      screen.getByRole("button", { name: "students.noChangesToApply" }),
+    )
+    expect(button.disabled).toBe(true)
+  })
+
+  // With the roster's rows, an expired address is re-sent with its failed record
+  // and a live-pending one is left alone and reported.
+  it("re-sends an expired address with its failed record and leaves a pending one alone", async () => {
+    const user = userEvent.setup()
+    resolveRosterUploadContext.mockResolvedValue({
+      ...stubContext,
+      claimedEmails: new Set(["expired@x.edu", "pending@x.edu"]),
+    })
+    classifyRosterUpload.mockReturnValue({
+      noAction: [],
+      needsInvite: [],
+      enroll: [],
+      roleChanges: [],
+      metadataUpdate: [],
+      identityMismatches: [],
+      allAlreadyMembers: true,
+    })
+    const rosterRow = (over: Record<string, unknown>) => ({
+      key: "k",
+      state: "unlinked",
+      roles: ["student"],
+      username: "",
+      github_id: "",
+      first_name: "",
+      last_name: "",
+      section: "",
+      email: "",
+      avatar_url: "",
+      ...over,
+    })
+    renderModal(
+      <UploadRoster
+        org="acme"
+        classroom="cs50"
+        client={client}
+        open={true}
+        rosterRows={
+          [
+            rosterRow({
+              email: "expired@x.edu",
+              failed_invitation: {
+                id: 79153766,
+                kind: "expired",
+                failed_at: null,
+                reason: null,
+              },
+            }),
+            rosterRow({
+              email: "pending@x.edu",
+              state: "pending",
+              invitation_id: 42,
+            }),
+          ] as never
+        }
+      />,
+    )
+
+    await uploadFile(
+      user,
+      file("roster.csv", "email\nexpired@x.edu\npending@x.edu\nnew@x.edu\n"),
+    )
+
+    // Expired + new are invitations; the pending one is not counted.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", {
+          name: "students.importAndInviteMembers:2",
+        }),
+      ).toBeTruthy(),
+    )
+    await user.click(screen.getByText("students.summaryViewDetails"))
+    expect(screen.getByText("students.previewResendExpired")).toBeTruthy()
+    expect(screen.getByText("students.previewAlreadyPending")).toBeTruthy()
+    expect(screen.getByText("students.previewInviteByEmail")).toBeTruthy()
+
+    bulkEnrollStudentsInClassroom.mockResolvedValue({
+      addedStudents: [],
+      skippedStudents: [],
+    })
+    bulkInviteByEmail.mockResolvedValue({
+      invited: [
+        { email: "expired@x.edu", role: "student" },
+        { email: "new@x.edu", role: "student" },
+      ],
+      skipped: [],
+      failed: [],
+      deferred: [],
+    })
+    await user.click(
+      screen.getByRole("button", {
+        name: "students.importAndInviteMembers:2",
+      }),
+    )
+
+    await waitFor(() => expect(bulkInviteByEmail).toHaveBeenCalledTimes(1))
+    // The expired address carries its failed record; the pending one isn't sent.
+    expect(bulkInviteByEmail.mock.calls[0][1]).toMatchObject({
+      invites: [
+        { email: "expired@x.edu", failedInvitationIds: [79153766] },
+        { email: "new@x.edu" },
+      ],
+    })
+    // The result names the address that was left alone and where to resend.
+    await waitFor(() =>
+      expect(
+        screen.getByText("students.emailInviteAlreadyPendingDetail"),
+      ).toBeTruthy(),
+    )
+    expect(screen.getByText("pending@x.edu")).toBeTruthy()
+  })
+
   it("counts invitations, not rows, in the primary button and notice", async () => {
     const user = userEvent.setup()
     // The screenshot case: 3 rows, but one is an existing member only getting a
@@ -860,7 +1059,13 @@ describe("UploadRoster resolve-before-invite email links", () => {
     classroom: "cs50-fall",
   }
 
-  it("surfaces the links notice, gates behind the confirm, then moves linked rows into the account pipeline", async () => {
+  const linkBox = () =>
+    screen
+      .getByText("students.emailLinksConfirm")
+      .closest("label")!
+      .querySelector("input[type=checkbox]") as HTMLInputElement
+
+  it("links by default: the box starts checked, the import is enabled, and linked rows ride the account pipeline", async () => {
     const user = userEvent.setup()
     resolveEmailRows.mockResolvedValue({ links: [zoeLink], degraded: false })
     renderModal(
@@ -878,20 +1083,16 @@ describe("UploadRoster resolve-before-invite email links", () => {
       ),
     )
 
-    // The notice names the linked count, and the import stays disabled until
-    // the teacher confirms the linking.
     await waitFor(() =>
       expect(screen.getByText(/students.emailLinksNotice:1/)).toBeTruthy(),
     )
-    const button = primaryButton()
-    expect(button.disabled).toBe(true)
-
-    const confirm = screen
-      .getByText("students.emailLinksConfirm")
-      .closest("label")!
-      .querySelector("input[type=checkbox]") as HTMLInputElement
-    await user.click(confirm)
+    // On by default, so nothing gates the button.
+    expect(linkBox().checked).toBe(true)
     await waitFor(() => expect(primaryButton().disabled).toBe(false))
+    // The button counts only the address that will actually be invited.
+    expect(primaryButton().textContent).toContain(
+      "students.importAndInviteMembers:1",
+    )
 
     bulkEnrollStudentsInClassroom.mockResolvedValue({
       addedStudents: [],
@@ -927,6 +1128,60 @@ describe("UploadRoster resolve-before-invite email links", () => {
     expect(bulkInviteByEmail.mock.calls[0][1]).toMatchObject({
       invites: [{ email: "newbie@x.edu" }],
     })
+  })
+
+  it("unchecking opens an acknowledgement; Cancel keeps the link, confirming declines it and invites by email instead", async () => {
+    const user = userEvent.setup()
+    resolveEmailRows.mockResolvedValue({ links: [zoeLink], degraded: false })
+    renderModal(
+      <UploadRoster org="acme" classroom="cs50" client={client} open={true} />,
+    )
+    await uploadFile(user, file("roster.csv", "email\nzoe@x.edu\n"))
+    await waitFor(() => expect(linkBox().checked).toBe(true))
+
+    // Clicking to uncheck opens the panel; the box stays checked.
+    await user.click(linkBox())
+    expect(screen.getByText("students.emailLinksUnlinkTitle")).toBeTruthy()
+    expect(linkBox().checked).toBe(true)
+
+    // The panel's own Cancel (the footer has one too) closes it; still linking.
+    const panel = () =>
+      screen.getByRole("group", { name: "students.emailLinksUnlinkTitle" })
+    await user.click(within(panel()).getByText("common.cancel"))
+    expect(screen.queryByText("students.emailLinksUnlinkTitle")).toBeNull()
+    expect(linkBox().checked).toBe(true)
+
+    // Confirming declines: the box unchecks, the notice changes, the row is
+    // now an invitation.
+    await user.click(linkBox())
+    await user.click(screen.getByText("students.emailLinksUnlinkConfirm"))
+    expect(screen.queryByText("students.emailLinksUnlinkTitle")).toBeNull()
+    expect(linkBox().checked).toBe(false)
+    expect(screen.getByText(/students.emailLinksDeclinedNotice:1/)).toBeTruthy()
+    expect(primaryButton().textContent).toContain(
+      "students.importAndInviteMembers:1",
+    )
+
+    // A role edit doesn't undo the decline.
+    await user.click(screen.getByText("students.summaryViewDetails"))
+    await user.selectOptions(
+      screen.getByLabelText("students.assignRoleLabel"),
+      "ta",
+    )
+    expect(linkBox().checked).toBe(false)
+
+    bulkInviteByEmail.mockResolvedValue({
+      invited: [],
+      skipped: [{ email: "zoe@x.edu" }],
+      failed: [],
+      deferred: [],
+    })
+    await user.click(primaryButton())
+    await waitFor(() => expect(bulkInviteByEmail).toHaveBeenCalledTimes(1))
+    expect(bulkInviteByEmail.mock.calls[0][1]).toMatchObject({
+      invites: [{ email: "zoe@x.edu" }],
+    })
+    expect(bulkEnrollStudentsInClassroom).not.toHaveBeenCalled()
   })
 
   it("appends the degraded warning to the links notice", async () => {

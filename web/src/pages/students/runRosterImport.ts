@@ -2,9 +2,9 @@ import {
   applyClassroomRoleChange,
   appendUnlinkedRows,
   bulkEnrollStudentsInClassroom,
-  bulkInviteByEmail,
   inviteRosterStudents,
   NoNewStudentsError,
+  reinviteEmailRows,
   repairRosterUsernames,
   RosterCsvMalformedError,
   updateClassroomMetadata,
@@ -78,6 +78,8 @@ export type RosterImportOutcome =
       // classroom; their rows rode the account pipeline. Carried through
       // untouched, purely for the result dialog.
       linked: { email: string; login: string; classroom: string }[]
+      // Left alone: their invitation was still live.
+      emailAlreadyPending: string[]
     }
 
 // The roster-import flow. Runs up to two pipelines SEQUENTIALLY over one shared
@@ -97,15 +99,19 @@ export async function runRosterImport(
     org: string
     classroom: string
     rows: ImportRosterRow[]
-    // Email-identity rows, each already carrying the role the teacher assigned
-    // and any name/section the file supplied. Empty for an account-only file.
+    // Email-identity rows with the teacher's role, the file's name/section,
+    // and the roster's failed record for the address, if any. Empty for an
+    // account-only file.
     emailInvites?: {
       email: string
       role: ClassroomRole
       first_name?: string
       last_name?: string
       section?: string
+      failedInvitationId?: number
     }[]
+    // Left alone (invitation still live); echoed so the result can say so.
+    emailAlreadyPending?: string[]
     // Name-only rows (no identity cell at all) the parse kept: written to the
     // roster as `unlinked` rows for manual reconciliation instead of dropped.
     unlinkedRows?: UnlinkedRowInput[]
@@ -126,6 +132,7 @@ export async function runRosterImport(
     classroom,
     rows,
     emailInvites = [],
+    emailAlreadyPending = [],
     unlinkedRows = [],
     linkedEmails = [],
     plan,
@@ -429,10 +436,12 @@ export async function runRosterImport(
       message: messages.invitingEmails,
     })
     try {
-      emailResult = await bulkInviteByEmail(client, {
+      // The shared recipe dismisses a row's failed records only after the
+      // fresh invitation is sent.
+      emailResult = await reinviteEmailRows(client, {
         org,
         classroom,
-        invites: emailInvites,
+        targets: emailInvites,
         onProgress,
       })
     } catch (err) {
@@ -481,5 +490,6 @@ export async function runRosterImport(
     emailError,
     unlinkedKept,
     linked: linkedEmails,
+    emailAlreadyPending,
   }
 }

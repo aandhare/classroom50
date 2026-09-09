@@ -2,7 +2,7 @@ import { getUserById } from "@/github-core/queries"
 import type { GitHubClient } from "@/github-core/client"
 import { GitHubAPIError } from "@/github-core/errors"
 import { logger } from "@/lib/logger"
-import type { ClassroomRole } from "@/util/teamRoster"
+import type { ClassroomRole, TeamRosterRow } from "@/util/teamRoster"
 import type { ImportRosterRow, ResolvedEmailLink } from "@/domain/students"
 import type { ParsedImportRow } from "@/pages/students/rosterImportParse"
 
@@ -250,36 +250,70 @@ export async function resolveImportIdentities(
   return { rows: rowsOut, unusable }
 }
 
-// An email-identity row headed for the invite pass, carrying the role the
-// teacher assigned and any metadata the file supplied.
+// An email-identity row headed for the invite pass: the teacher's role, the
+// file's metadata, and the roster's failed record for the address, if any
+// (dismissed once the fresh invitation is sent; see bulkInviteByEmail).
 export type EmailInviteInput = {
   email: string
   role: ClassroomRole
   first_name?: string
   last_name?: string
   section?: string
+  failedInvitationId?: number
 }
 
-// Resolve-before-invite: split the email rows on the confirmed links. A linked
-// row imports as an ACCOUNT row under the verified member's current login —
-// the account pipeline enrolls/team-adds it like any other row — and its
-// address leaves the invite list; the rest go to the email-invite pass.
-// File order is preserved within each bucket.
+// The roster's standing for an uploaded address, from the same rows the roster
+// page renders so the two can't disagree.
+export type EmailStanding = {
+  state: TeamRosterRow["state"]
+  invitationId?: number
+  failedInvitationId?: number
+  failedKind?: "expired" | "failed"
+}
+
+export const indexRosterByEmail = (
+  rows: readonly TeamRosterRow[],
+): Map<string, EmailStanding> => {
+  const out = new Map<string, EmailStanding>()
+  for (const row of rows) {
+    const email = row.email.trim().toLowerCase()
+    if (!email || out.has(email)) continue
+    out.set(email, {
+      state: row.state,
+      invitationId: row.invitation_id,
+      failedInvitationId: row.failed_invitation?.id,
+      failedKind: row.failed_invitation?.kind,
+    })
+  }
+  return out
+}
+
+// Split the email rows for the send. A linked row imports as an ACCOUNT row
+// under the member's current login and leaves the invite list. Of the rest, an
+// address with a live invitation on the roster is left alone (re-sending is
+// the row's own Resend, not an upload's job); everything else is invited,
+// carrying the roster's failed record so the send can dismiss it. File order
+// is preserved within each bucket.
 export const splitEmailRowsByLink = (
   emailRows: readonly EmailImportRow[],
   emailLinks: readonly ResolvedEmailLink[],
   roleFor: (identity: ImportIdentity) => ClassroomRole,
+  standingByEmail: ReadonlyMap<string, EmailStanding> = new Map(),
 ): {
   linkedRows: ImportRosterRow[]
   linkedEmails: { email: string; login: string; classroom: string }[]
   emailInvites: EmailInviteInput[]
+  // Left alone: their invitation is still live.
+  alreadyPending: string[]
 } => {
   const linkByEmail = new Map(emailLinks.map((l) => [l.email, l]))
   const linkedRows: ImportRosterRow[] = []
   const linkedEmails: { email: string; login: string; classroom: string }[] = []
   const emailInvites: EmailInviteInput[] = []
+  const alreadyPending: string[] = []
   for (const r of emailRows) {
     const link = linkByEmail.get(r.identity.email)
+    const standing = standingByEmail.get(r.identity.email.toLowerCase())
     if (link) {
       linkedRows.push({
         username: link.login,
@@ -297,6 +331,8 @@ export const splitEmailRowsByLink = (
         login: link.login,
         classroom: link.classroom,
       })
+    } else if (standing?.state === "pending") {
+      alreadyPending.push(r.identity.email)
     } else {
       emailInvites.push({
         email: r.identity.email,
@@ -304,8 +340,9 @@ export const splitEmailRowsByLink = (
         first_name: r.first_name,
         last_name: r.last_name,
         section: r.section,
+        failedInvitationId: standing?.failedInvitationId,
       })
     }
   }
-  return { linkedRows, linkedEmails, emailInvites }
+  return { linkedRows, linkedEmails, emailInvites, alreadyPending }
 }
