@@ -11,6 +11,7 @@ import {
 
 import {
   Alert,
+  AlertStack,
   AnimatedAlert,
   Button,
   Checkbox,
@@ -41,6 +42,7 @@ import {
   type OrgMembersStatusFilter,
 } from "@/util/orgMembers"
 import { githubOrgPeopleUrl } from "@/util/orgUrl"
+import { hasExpiredInvite } from "@/util/teamRoster"
 import { isSameGitHubUser } from "@/util/students"
 import { motion } from "motion/react"
 import { blockEnter } from "@/lib/motion"
@@ -49,6 +51,9 @@ import BulkActionsBar, {
   type BulkDoneInput,
 } from "@/pages/orgMembers/BulkActionsBar"
 import MemberDetailModal from "@/pages/orgMembers/MemberDetailModal"
+import OrphanedInvitationsNotice from "@/pages/orgMembers/OrphanedInvitationsNotice"
+import { useDismissFailedInvitations } from "@/hooks/mutations/useDismissFailedInvitations"
+import { getErrorMessage } from "@/github-core/errorMessage"
 import { useRowSelection } from "@/hooks/useRowSelection"
 import { useOrgMembersCacheSync } from "@/hooks/useOrgMembersCacheSync"
 import {
@@ -101,7 +106,10 @@ const OrgMembersPage = () => {
     refetchMembers,
     teamSlugByClassroom,
     displayNameByClassroom,
-    notes,
+    rosterReadFailures,
+    orphanedFailedInvitations,
+    invitationsUnavailable,
+    refetchInvitations,
   } = useOrgMembersOverview(org)
   const { classes } = useGetClasses(org)
   const [query, setQuery] = useState("")
@@ -137,6 +145,53 @@ const OrgMembersPage = () => {
   const handleBulkDone = (input: BulkDoneInput) => {
     cacheSync.afterBulkRun(input, rows)
     clearSelection()
+  }
+
+  // Dismiss GitHub's orphaned failed-invitation records (see the notice). The
+  // hook owns the invalidation; the outcome toast lives here so it skips when
+  // the page has unmounted.
+  const dismissFailedInvitations = useDismissFailedInvitations(org ?? "")
+  const dismissOrphans = (invitationIds: number[]) => {
+    if (invitationIds.length === 0) return
+    dismissFailedInvitations.mutate(invitationIds, {
+      onSuccess: (result) => {
+        if (result.failed.length > 0) {
+          notify({
+            tone: "error",
+            message: t("orgMembers.orphanedInvitesDismissFailed", {
+              count: result.failed.length,
+              error: result.failed[0]!.message,
+            }),
+          })
+        }
+        if (result.deferred.length > 0) {
+          notify({
+            tone: "warning",
+            message: t("orgMembers.orphanedInvitesDeferred", {
+              count: result.deferred.length,
+            }),
+          })
+        }
+        // Only real dismissals are announced; a record already gone on GitHub
+        // just disappears with the refetch.
+        if (result.dismissed > 0) {
+          notify({
+            tone: "success",
+            message: t("orgMembers.orphanedInvitesDismissed", {
+              count: result.dismissed,
+            }),
+          })
+        }
+      },
+      onError: (err) =>
+        notify({
+          tone: "error",
+          message: t("orgMembers.orphanedInvitesDismissFailed", {
+            count: invitationIds.length,
+            error: getErrorMessage(err),
+          }),
+        }),
+    })
   }
 
   // Inline row invite for an on-roster non-member (mirrors the detail-drawer
@@ -250,6 +305,14 @@ const OrgMembersPage = () => {
         .length,
     [rows],
   )
+  const unlinkedCount = useMemo(
+    () => rows.filter((row) => row.classification === "unlinked").length,
+    [rows],
+  )
+  const expiredCount = useMemo(
+    () => rows.filter(hasExpiredInvite).length,
+    [rows],
+  )
 
   // The signed-in owner can't be bulk-added/removed — a row is selectable only
   // when it isn't self. Stable per viewer so the selection memos key on it.
@@ -269,6 +332,7 @@ const OrgMembersPage = () => {
     someSelected: someFilteredSelected,
     toggleSelectAll: handleToggleSelectAll,
     deselect: deselectRow,
+    retain: retainSelection,
     clear: clearSelection,
     handleToggleRow,
     handleRowCheckboxClick,
@@ -326,32 +390,58 @@ const OrgMembersPage = () => {
             }
           />
 
-          {/* Always-on scope warning: a shared org lists other teachers'
-              members and students too, so say so before the destructive
-              member actions below. */}
-          <Alert tone="warning" className="mt-6 text-sm">
-            <span>{t("orgMembers.sharedOrgNotice", { org })}</span>
-          </Alert>
-
-          <AnimatedAlert
-            tone="warning"
-            show={notes.length > 0}
-            className="mt-6 text-sm"
-            role="status"
-          >
-            <span>{notes.join(" ")}</span>
-          </AnimatedAlert>
-
-          <AnimatedAlert
-            tone="error"
-            show={discrepancyCount > 0}
-            className="mt-6 text-sm"
-            role="status"
-          >
-            <span>
-              {t("orgMembers.discrepancy", { count: discrepancyCount })}
-            </span>
-          </AnimatedAlert>
+          {/* Page notices as ONE section (AlertStack): the always-on scope
+              warning first (a shared org lists other teachers' members and
+              students too, so say so before the destructive actions below),
+              then whatever this org currently needs attention on. */}
+          <AlertStack className="mt-6 text-sm">
+            <Alert tone="warning">
+              <span>{t("orgMembers.sharedOrgNotice", { org })}</span>
+            </Alert>
+            <AnimatedAlert
+              tone="warning"
+              show={rosterReadFailures.length > 0}
+              role="status"
+            >
+              <span>
+                {rosterReadFailures
+                  .map((classroom) =>
+                    t("orgMembers.rosterReadFailed", { classroom }),
+                  )
+                  .join(" ")}
+              </span>
+            </AnimatedAlert>
+            <AnimatedAlert
+              tone="warning"
+              show={invitationsUnavailable}
+              role="status"
+              className="flex items-center justify-between gap-3"
+            >
+              <span>{t("orgMembers.invitationsUnavailable")}</span>
+              <Button variant="ghost" size="xs" onClick={refetchInvitations}>
+                {t("orgMembers.invitationsRetry")}
+              </Button>
+            </AnimatedAlert>
+            <OrphanedInvitationsNotice
+              orphans={orphanedFailedInvitations}
+              busy={dismissFailedInvitations.isPending}
+              onDismiss={(id) => dismissOrphans([id])}
+              onDismissAll={() =>
+                dismissOrphans(
+                  orphanedFailedInvitations.map((o) => o.invitation.id),
+                )
+              }
+            />
+            <AnimatedAlert
+              tone="error"
+              show={discrepancyCount > 0}
+              role="status"
+            >
+              <span>
+                {t("orgMembers.discrepancy", { count: discrepancyCount })}
+              </span>
+            </AnimatedAlert>
+          </AlertStack>
 
           {/* One toolbar row (the roster/submissions recipe): member count —
               swapped for the selection cluster while rows are selected — on
@@ -370,6 +460,7 @@ const OrgMembersPage = () => {
                 classrooms={classroomOptions}
                 isOwner={isOwner}
                 onClearSelection={clearSelection}
+                onRetainSelection={retainSelection}
                 onDone={handleBulkDone}
               />
             ) : null}
@@ -402,6 +493,19 @@ const OrgMembersPage = () => {
                 <option value="invitation-pending">
                   {t("orgMembers.filterInvitationPending")}
                 </option>
+                {/* Like the roster, the rarer buckets appear only while such
+                    rows exist (or while selected), so most orgs never see a
+                    dead option. */}
+                {unlinkedCount > 0 || statusFilter === "unlinked" ? (
+                  <option value="unlinked">
+                    {t("orgMembers.filterUnlinked")}
+                  </option>
+                ) : null}
+                {expiredCount > 0 || statusFilter === "invite-expired" ? (
+                  <option value="invite-expired">
+                    {t("orgMembers.filterInviteExpired")}
+                  </option>
+                ) : null}
                 <option value="not-enrolled">
                   {t("orgMembers.filterNotEnrolled")}
                 </option>

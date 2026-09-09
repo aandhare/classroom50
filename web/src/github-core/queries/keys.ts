@@ -118,8 +118,16 @@ export const githubKeys = {
   teamInvitations: (org: string, teamSlug: string) =>
     [...githubKeys.all, "team-invitations", org, teamSlug] as const,
 
-  teamFailedInvitations: (org: string, teamSlug: string) =>
-    [...githubKeys.all, "team-failed-invitations", org, teamSlug] as const,
+  // Org-wide: GitHub has no team-scoped failed list, and a failed invite's
+  // invitation_teams_url 404s, so attribution to a classroom happens by
+  // roster.csv match in buildTeamRoster.
+  orgFailedInvitations: (org: string) =>
+    [...githubKeys.all, "org-failed-invitations", org] as const,
+
+  // Org-wide pending invitations (the Members page); the roster reads
+  // team-scoped lists instead (teamInvitations).
+  orgInvitations: (org: string) =>
+    [...githubKeys.all, "org-invitations", org] as const,
 
   orgTeams: (org: string) => [...githubKeys.all, "org-teams", org] as const,
 
@@ -350,8 +358,9 @@ export function invalidateInviteQueries(queryClient: QueryClient, org: string) {
     queryKey: [...githubKeys.all, "team-invitations", org],
   })
   queryClient.invalidateQueries({
-    queryKey: [...githubKeys.all, "team-failed-invitations", org],
+    queryKey: githubKeys.orgFailedInvitations(org),
   })
+  queryClient.invalidateQueries({ queryKey: githubKeys.orgInvitations(org) })
   queryClient.invalidateQueries({ queryKey: githubKeys.orgMembers(org) })
 }
 

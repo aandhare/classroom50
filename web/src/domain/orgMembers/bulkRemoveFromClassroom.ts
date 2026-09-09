@@ -4,7 +4,10 @@ import { getErrorMessage } from "@/github-core/errorMessage"
 import { studentKey } from "@/util/identity"
 import { canTargetForUnenroll } from "@/util/classroomRoleUI"
 import type { Student } from "@/types/classroom"
-import type { OrgMemberRow } from "@/util/orgMembers"
+import {
+  orgMemberLabel as labelFor,
+  type OrgMemberRow,
+} from "@/util/orgMembers"
 import { logger } from "@/lib/logger"
 
 const log = logger.scope("orgMembers:bulkRemoveFromClassroom")
@@ -30,8 +33,6 @@ export type BulkRemoveFromClassroomResult = {
   warnings: string[]
 }
 
-const labelFor = (row: OrgMemberRow) => row.username || row.email || row.key
-
 // Reconstruct the minimal Student the roster matcher keys on (username /
 // github_id / email). Mirrors removeMemberFromOrg.rowToStudent.
 const rowToStudent = (row: OrgMemberRow): Student => ({
@@ -56,7 +57,8 @@ const rowToStudent = (row: OrgMemberRow): Student => ({
 // This layer owns the per-row PRE-filtering the members view needs:
 //   - rows not on the target classroom (nothing to remove) -> skipped
 //   - rows on an ARCHIVED instance -> skipped (read-only; the write would throw)
-//   - rows with NO GitHub identity — an unaccepted email invite — -> skipped.
+//   - rows with NO GitHub identity (a live email invitation, or an unlinked
+//     row nothing backs) -> skipped, each with its own reason.
 //     The roster matcher keys on username/github_id (a shared address must never
 //     widen a removal), so bulkUnenrollStudents drops such a target and it would
 //     otherwise reconcile to "already removed" while both the row AND the live
@@ -99,11 +101,17 @@ export async function bulkRemoveFromClassroom(
       continue
     }
     if (!canTargetForUnenroll(row)) {
+      // An identity-less row: the roster matcher keys on username/github_id,
+      // so nothing here can target it. Say which kind it is, since the fix
+      // differs (cancel the live invitation vs. remove/re-invite the row).
       outcomes.push({
         key: row.key,
         label: labelFor(row),
         status: "skipped",
-        detail: "pending-email-invite",
+        detail:
+          row.classification === "invitation-pending"
+            ? "pending-email-invite"
+            : "unlinked-row",
       })
       continue
     }

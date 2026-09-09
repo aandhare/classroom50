@@ -6,6 +6,8 @@ import {
   csvFileQuery,
   jsonFileQuery,
   orgAdminsQuery,
+  orgFailedInvitationsQuery,
+  orgInvitationsQuery,
   orgMembersAllQuery,
   teamMembersQuery,
 } from "@/github-core/queries"
@@ -19,7 +21,12 @@ import {
   type Classroom,
   type Student,
 } from "@/types/classroom"
-import { aggregateOrgMembers, type OrgMemberRow } from "@/util/orgMembers"
+import {
+  aggregateOrgMembers,
+  orphanedFailedInvitations,
+  type OrgMemberRow,
+  type OrphanedFailedInvitation,
+} from "@/util/orgMembers"
 import { memberIdSet } from "@/util/identity"
 import type { GitHubUser } from "@/github-core/types"
 
@@ -44,9 +51,19 @@ export type OrgMembersOverview = {
   // classroom path -> display name from classroom.json. Absent while metadata
   // hasn't loaded (or carries no name) — callers fall back to the path.
   displayNameByClassroom: Map<string, string>
-  // Per-classroom roster read failures (a 404/parse error contributes no
-  // students rather than failing the whole page).
-  notes: string[]
+  // Classrooms whose roster.csv couldn't be read (a 404/parse error
+  // contributes no students rather than failing the whole page). The page
+  // renders the note, so no English is assembled here.
+  rosterReadFailures: string[]
+  // GitHub's failed/expired invitations that no classroom roster or member
+  // explains (see orphanedFailedInvitations). Owner-only read; empty while
+  // loading or when unreadable. Only meaningful once every roster has loaded:
+  // a roster still in flight would make its students look like orphans.
+  orphanedFailedInvitations: OrphanedFailedInvitation[]
+  // An owner-only invitation read failed, so non-member rows can't be told
+  // apart (pending vs unlinked vs not in org) and badges may be missing.
+  invitationsUnavailable: boolean
+  refetchInvitations: () => void
 }
 
 // Aggregate the org's members against every classroom roster: dedupe students,
@@ -65,7 +82,23 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
     enabled: Boolean(org),
   })
 
-  const { classes } = useGetClasses(org)
+  // The org's invitation lists (owner-only; this page is owner-gated). Pending
+  // decides "Invitation pending" vs "Unlinked"/"Not in organization"; failed
+  // explains a stranded row ("Invitation expired") and feeds the orphan notice.
+  const pendingInvitesQuery = useQuery({
+    ...orgInvitationsQuery(client, org ?? ""),
+    enabled: Boolean(org),
+  })
+  const failedInvitesQuery = useQuery({
+    ...orgFailedInvitationsQuery(client, org ?? ""),
+    enabled: Boolean(org),
+  })
+
+  const {
+    classes,
+    isLoading: classesLoading,
+    isError: classesError,
+  } = useGetClasses(org)
   // Key by `path` (not `name`) to match useGetClassroom/useGetStudents so these
   // reads hit the same react-query cache instead of duplicating requests.
   const classroomNames = useMemo(() => classes.map((c) => c.path), [classes])
@@ -129,7 +162,7 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
     .map((q) => (q.data ? String(q.data.length) : "-"))
     .join("|")
 
-  const { rosters, notes } = useMemo(() => {
+  const { rosters, rosterReadFailures } = useMemo(() => {
     const collected = classroomNames.map((name, i) => {
       const meta = metaQueries[i]?.data
       const rosterQuery = rosterQueries[i]
@@ -140,19 +173,15 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
         failed: rosterQuery?.isError ?? false,
       }
     })
-    const failedNotes = collected
-      .filter((c) => c.failed)
-      .map(
-        (c) =>
-          `Couldn't read the roster for "${c.classroom}" — its students are not shown.`,
-      )
     return {
       rosters: collected.map(({ classroom, archived, students }) => ({
         classroom,
         archived,
         students,
       })),
-      notes: failedNotes,
+      rosterReadFailures: collected
+        .filter((c) => c.failed)
+        .map((c) => c.classroom),
     }
     // metaQueries/rosterQueries are fresh arrays each render; depend on the
     // names plus stable signatures of the data/error we actually read.
@@ -175,9 +204,24 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [classroomNames, teamSignature])
 
+  // `pending` is passed only once loaded (see OrgInvitationLists); a failed
+  // pending read leaves it undefined, so identity-less rows read as unlinked
+  // rather than as a pending invitation nobody verified.
+  const pendingInvitations = pendingInvitesQuery.data
+  const failedInvitations = failedInvitesQuery.data
   const rows = useMemo(
-    () => aggregateOrgMembers(members, rosters, teamMembersByClassroom),
-    [members, rosters, teamMembersByClassroom],
+    () =>
+      aggregateOrgMembers(members, rosters, teamMembersByClassroom, {
+        pending: pendingInvitations,
+        failed: failedInvitations,
+      }),
+    [
+      members,
+      rosters,
+      teamMembersByClassroom,
+      pendingInvitations,
+      failedInvitations,
+    ],
   )
 
   const ownerIds = useMemo(
@@ -209,11 +253,51 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [classroomNames, metaSignature])
 
+  // The classroom listing and both invitation reads are awaited too: every
+  // roster derives from the listing, a row's standing depends on the pending
+  // list, and its badge on the failed list, so rendering before they land would
+  // flash "Unlinked" over a pending student or pop the badges in late.
   const isLoading =
     membersQuery.isLoading ||
+    classesLoading ||
+    pendingInvitesQuery.isLoading ||
+    failedInvitesQuery.isLoading ||
     metaQueries.some((q) => q.isLoading) ||
     rosterQueries.some((q) => q.isLoading)
   const isError = membersQuery.isError
+  // A failed pending read leaves every non-member's standing unknown; without
+  // this the page would relabel pending students "Not in organization" with an
+  // Invite button. The page shows a warning and refetches from it.
+  const invitationsUnavailable =
+    pendingInvitesQuery.isError || failedInvitesQuery.isError
+
+  // Withheld until every roster read has settled (success or failure): an
+  // orphan is "on no roster", which is unknowable while one is still loading.
+  // A roster that FAILED to read is excluded too, since its students would
+  // wrongly look orphaned; the page already notes that roster is out.
+  // The classroom listing and the members read gate it the same way: while
+  // the listing loads there are no roster queries at all (so `every` would be
+  // vacuously true), and a failed listing or members read leaves rosters or
+  // members unknown, which would make every record look orphaned.
+  const rostersSettled =
+    !isLoading &&
+    !classesError &&
+    !membersQuery.isError &&
+    rosterQueries.every((q) => q.isSuccess || q.isError)
+  const anyRosterFailed = rosterQueries.some((q) => q.isError)
+  const orphans = useMemo(
+    () =>
+      rostersSettled && !anyRosterFailed && failedInvitesQuery.data
+        ? orphanedFailedInvitations(failedInvitesQuery.data, members, rosters)
+        : [],
+    [
+      rostersSettled,
+      anyRosterFailed,
+      failedInvitesQuery.data,
+      members,
+      rosters,
+    ],
+  )
 
   return {
     rows,
@@ -226,7 +310,13 @@ const useOrgMembersOverview = (org: string | undefined): OrgMembersOverview => {
     },
     teamSlugByClassroom,
     displayNameByClassroom,
-    notes,
+    rosterReadFailures,
+    orphanedFailedInvitations: orphans,
+    invitationsUnavailable,
+    refetchInvitations: () => {
+      void pendingInvitesQuery.refetch()
+      void failedInvitesQuery.refetch()
+    },
   }
 }
 

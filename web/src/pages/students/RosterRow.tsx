@@ -7,7 +7,7 @@ import {
   CellPlaceholder,
   GitHubIdentity,
 } from "@/components/memberList/memberPresentation"
-import { STATE_BADGE_TONE, STATE_LABEL_KEY } from "@/util/classroomRoleUI"
+import { rowStatusBadges } from "@/util/classroomRoleUI"
 import { rosterRowToMemberRow, rosterRowInitials } from "@/util/memberRow"
 import { ClickableTr } from "@/lib/motionComponents"
 import type { TeamRosterRow } from "@/util/teamRoster"
@@ -25,7 +25,6 @@ export const RosterRow = ({
   onToggle,
   selectable = true,
   showSection = false,
-  showStatus = true,
 }: {
   row: TeamRosterRow
   selfRow: boolean
@@ -41,9 +40,6 @@ export const RosterRow = ({
   onToggle: (key: string) => void
   // Whether the table renders the Section column (only when some row has one).
   showSection?: boolean
-  // Whether the table renders the Status column (only when some row is not
-  // plainly enrolled — a fully healthy roster has nothing to report there).
-  showStatus?: boolean
 }) => {
   const { t } = useTranslation()
   const member = rosterRowToMemberRow(row)
@@ -62,6 +58,7 @@ export const RosterRow = ({
     row.state !== "needs_attention_not_in_org" &&
     row.roles.length > 0
   const section = row.section.trim()
+  const statusBadges = rowStatusBadges(row)
 
   return (
     <ClickableTr className="group/row hover:bg-base-200" onClick={open}>
@@ -118,21 +115,22 @@ export const RosterRow = ({
           )}
         </td>
       ) : null}
-      {showStatus ? (
-        <td>
-          {row.state !== "enrolled" ? (
+      <td>
+        {/* Same status recipe as the detail modal (rowStatusBadges), enrolled
+            included, so the table and the modal never disagree about a row. */}
+        <div className="flex flex-wrap items-center gap-1">
+          {statusBadges.map((badge) => (
             <Badge
+              key={badge.labelKey}
               size="sm"
-              tone={STATE_BADGE_TONE[row.state]}
+              tone={badge.tone}
               className="whitespace-nowrap"
             >
-              {t(STATE_LABEL_KEY[row.state])}
+              {t(badge.labelKey)}
             </Badge>
-          ) : (
-            <CellPlaceholder />
-          )}
-        </td>
-      ) : null}
+          ))}
+        </div>
+      </td>
       <td className="w-0 ps-2">
         <div className="flex items-center justify-end">
           <ChevronRightIcon

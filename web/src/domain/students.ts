@@ -22,6 +22,15 @@ export {
   retireEmailInvites,
 } from "./students/retireEmailInvite"
 export {
+  dismissFailedInvitation,
+  reinviteEmailRows,
+  reinviteEmailRow,
+  type EmailReinviteTarget,
+  type ReinviteEmailRowsInput,
+  type ReinviteEmailRowInput,
+  type ReinviteEmailRowResult,
+} from "./students/emailReinvite"
+export {
   addStudentToClassroom,
   addStudentToClassroomWithConflictRetry,
   inviteByEmail,

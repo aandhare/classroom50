@@ -7,6 +7,7 @@ import {
 
 import {
   Alert,
+  AlertStack,
   AnimatedAlert,
   Badge,
   Button,
@@ -20,14 +21,12 @@ import {
 import { TableEmptyRow } from "@/components/list"
 import type { Student } from "@/types/classroom"
 import type { RosterCsvProblem } from "@/domain/students"
-import { useDismissFailedInvite } from "@/hooks/mutations/useDismissFailedInvite"
 import { getErrorMessage } from "@/github-core/errorMessage"
 import { useToast } from "@/context/notifications/NotificationProvider"
 import { useGitHubClient } from "@/context/github/GitHubProvider"
 import { useClassroomRoleContextOptional } from "@/context/classroomRole/ClassroomRoleProvider"
 import { useIsOrgOwner } from "@/context/githubOrgRole/useIsOrgOwner"
 import { useGitHubViewer } from "@/hooks/useGitHubResources"
-import type { GitHubOrgInvitation } from "@/github-core/types"
 import { useInvalidateInviteQueries } from "@/hooks/useCacheRefresh"
 import { useUpdateRosterCache } from "@/hooks/useGetStudents"
 import { useTeamRoster, useInvalidateTeamRoster } from "@/hooks/useTeamRoster"
@@ -37,10 +36,10 @@ import {
   useOrgMemberPool,
 } from "@/hooks/useIdentityDirectory"
 import { useRosterLastUpdated } from "@/hooks/useRosterLastUpdated"
-import { useReinviteFailedInvite } from "@/hooks/mutations/useReinviteFailedInvite"
 import type { SuppressedLogins } from "@/hooks/useSuppressedLogins"
 import type { TeamRosterRow, ClassroomRole } from "@/util/teamRoster"
 import {
+  hasExpiredInvite,
   sortTeamRosterRows,
   sortTeamRosterRowsBy,
   type RosterTableSortColumn,
@@ -88,18 +87,18 @@ import {
 } from "./enrolledStudentsHelpers"
 import { useRosterAutoSync } from "./useRosterAutoSync"
 import { RosterRow } from "./RosterRow"
-import { FailedInvitationsList } from "./FailedInvitationsList"
 import { RosterParseProblems } from "./RosterParseProblems"
 import { RosterWarnings } from "./RosterWarnings"
 
-// One bar recipe per column: select, member, username, roles, actions. Loading
-// starts with no rows, so the conditional Section and Status columns (present
-// only when some row carries one) are never part of the skeleton.
+// One bar recipe per column: select, member, username, roles, status, actions.
+// Loading starts with no rows, so the conditional Section column (present only
+// when some row carries one) is never part of the skeleton.
 const SKELETON_BARS = [
   "size-5",
   "h-4 w-40",
   "h-4 w-32",
   "h-6 w-20",
+  "h-5 w-16",
   "ms-auto h-4 w-4",
 ]
 
@@ -122,12 +121,15 @@ const EnrolledStudents = ({
   parseProblems = [],
   onRecheckRoster,
   rechecking = false,
+  initialQuery = "",
   org,
   classroom,
   addActions,
   suppressedLogins,
 }: {
   students: Student[]
+  // Seeds the search box once (a deep link to one person's row).
+  initialQuery?: string
   // Per-line problems from the strict roster.csv parse (empty when the file is
   // well-formed). Surfaced as a banner so the teacher can fix the file.
   parseProblems?: RosterCsvProblem[]
@@ -162,11 +164,6 @@ const EnrolledStudents = ({
 
   // Keyed by row.key so a clean action can't clobber another's warning.
   const [warnings, setWarnings] = useState<Record<string, string>>({})
-  // Failed-invite action (re-invite/dismiss) failure, rendered inline in the
-  // failed-invitations list (Primer: feedback next to its actions).
-  const [inviteActionError, setInviteActionError] = useState<string | null>(
-    null,
-  )
   // Manual/auto roster-sync failure, rendered as a banner above the table.
   const [syncError, setSyncError] = useState<string | null>(null)
   // Batch-edit partial outcome (stale-view misses, failed team adds),
@@ -175,7 +172,7 @@ const EnrolledStudents = ({
   // Explains a no-op select-all (visible rows exist but none are selectable).
   const [noneSelectableNotice, setNoneSelectableNotice] = useState(false)
   const [grouping, setGrouping] = useState<RosterGrouping>("none")
-  const [query, setQuery] = useState("")
+  const [query, setQuery] = useState(initialQuery)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
   const [roleFilter, setRoleFilter] = useState<RoleFilter>("all")
   const [sectionFilter, setSectionFilter] = useState<string>("all")
@@ -198,7 +195,6 @@ const EnrolledStudents = ({
     isError,
     isEmpty,
     pendingHidden,
-    failedInvitations,
     teamSlugByRole,
     csvMissingLogins,
     backfillNeededLogins,
@@ -221,34 +217,6 @@ const EnrolledStudents = ({
     })
 
   const invalidateInviteQueries = useInvalidateInviteQueries(org)
-
-  // Dismiss a failed/expired invitation: cancel it on GitHub (removes it from
-  // the failed list) and refresh. The hook owns the invite-query invalidation;
-  // the error toast stays here so it skips on unmount.
-  const dismissFailedInvite = useDismissFailedInvite(org, classroom)
-
-  // Re-invite a failed/expired invitation: dismiss the dead one, then re-issue
-  // an equivalent fresh invite — same classroom role (teacher -> org OWNER),
-  // by username when known (carries the team) else by email. A login-less,
-  // email-less invite can't be re-issued (dismiss-only). The hook owns the
-  // invite-query invalidation; the error toast lives here so it skips when
-  // unmounted.
-  const reinviteFailedInvite = useReinviteFailedInvite(org, classroom, {
-    noTarget: t("students.failedInviteNoTarget"),
-    rateLimited: (who) => t("students.failedInviteRateLimited", { who }),
-    notSent: (who) => t("students.failedInviteNotSent", { who }),
-  })
-  const reinvite = (inv: GitHubOrgInvitation) => {
-    setInviteActionError(null)
-    reinviteFailedInvite.mutate(inv, {
-      onError: (err) =>
-        setInviteActionError(
-          t("students.failedInviteReinviteError", {
-            error: getErrorMessage(err),
-          }),
-        ),
-    })
-  }
 
   // A row is selectable unless it's the signed-in teacher (can't bulk-unenroll
   // yourself), mirroring Org Members' self-exclusion. A pure staff row (no
@@ -409,6 +377,7 @@ const EnrolledStudents = ({
     someSelected,
     toggleSelectAll,
     deselect: deselectRow,
+    retain: retainSelection,
     clear: clearSelection,
     handleToggleRow,
     handleRowCheckboxClick,
@@ -429,8 +398,13 @@ const EnrolledStudents = ({
   // Status-filter options; hide "Pending" when invites are owner-only and this
   // viewer can't read them (avoids a dead, always-empty filter). The two
   // needs-attention options only exist when org membership is known (else those
-  // rows are suppressed, so the filters would be dead). "Unlinked" appears only
-  // while such rows exist — most classrooms never have any.
+  // rows are suppressed, so the filters would be dead). "Unlinked" and
+  // "Invitation expired" appear only while such rows exist — most classrooms
+  // never have any.
+  const expiredCount = useMemo(
+    () => rows.filter(hasExpiredInvite).length,
+    [rows],
+  )
   const statusOptions: { value: StatusFilter; label: string }[] = [
     { value: "all", label: t("students.filterAll") },
     { value: "enrolled", label: t("students.filterEnrolled") },
@@ -451,6 +425,14 @@ const EnrolledStudents = ({
       : []),
     ...(counts.unlinked > 0 || statusFilter === "unlinked"
       ? [{ value: "unlinked" as const, label: t("students.filterUnlinked") }]
+      : []),
+    ...(expiredCount > 0 || statusFilter === "invite_expired"
+      ? [
+          {
+            value: "invite_expired" as const,
+            label: t("students.filterInviteExpired"),
+          },
+        ]
       : []),
   ]
 
@@ -666,16 +648,11 @@ const EnrolledStudents = ({
 
   // The Section column exists only when some row carries a section label —
   // derived from the status-independent sectionOptions so toggling a filter
-  // can't add/remove a column mid-view. Status follows the same rule: a fully
-  // enrolled roster has nothing to report there, so the column only appears
-  // while some row is pending or needs attention (derived from ALL rows, so
-  // filtering can't add/remove it mid-view either).
+  // can't add/remove a column mid-view. Status is always shown: every row has
+  // a state, and a column that came and went as students accepted invites read
+  // as a bug, not as "nothing to report".
   const showSection = sectionOptions.length > 0
-  const showStatus = useMemo(
-    () => rows.some((r) => r.state !== "enrolled"),
-    [rows],
-  )
-  const colCount = 5 + (showSection ? 1 : 0) + (showStatus ? 1 : 0)
+  const colCount = 6 + (showSection ? 1 : 0)
 
   // The combined "Show" select folds the status and role filters into ONE
   // control (mirroring the submissions status select): picking a status
@@ -719,149 +696,119 @@ const EnrolledStudents = ({
       onCheckboxClick={handleRowCheckboxClick}
       onToggle={handleToggleRow}
       showSection={showSection}
-      showStatus={showStatus}
     />
   )
 
   return (
     <div className="flex w-full flex-col gap-6">
-      {parseProblems.length > 0 ? (
-        <RosterParseProblems
-          parseProblems={parseProblems}
-          org={org}
-          classroom={classroom}
-          onRecheckRoster={onRecheckRoster}
-          rechecking={rechecking}
-        />
-      ) : null}
+      {/* Every page notice is one section (AlertStack): file problems, per-row
+          warnings, then the state banners. */}
+      <AlertStack>
+        {parseProblems.length > 0 ? (
+          <RosterParseProblems
+            parseProblems={parseProblems}
+            org={org}
+            classroom={classroom}
+            onRecheckRoster={onRecheckRoster}
+            rechecking={rechecking}
+          />
+        ) : null}
 
-      {/* Per-row action warnings/results. */}
-      {Object.keys(warnings).length > 0 ? (
-        <RosterWarnings warnings={warnings} onDismiss={dismissWarning} />
-      ) : null}
+        {/* Per-row action warnings/results. */}
+        {Object.keys(warnings).length > 0 ? (
+          <RosterWarnings warnings={warnings} onDismiss={dismissWarning} />
+        ) : null}
 
-      {/* A non-owner off the secret classroom team reads it as 404, so their
+        {/* A non-owner off the secret classroom team reads it as 404, so their
           rows come from roster.csv. Say so, since the list lags live
           enrollment and Sync is hidden for them. */}
-      {rosterSource === "csv" && !isLoading ? (
-        <Alert tone="info" role="status">
-          {t("students.rosterFromCsvNotice")}
-        </Alert>
-      ) : null}
+        {rosterSource === "csv" && !isLoading ? (
+          <Alert tone="info" role="status">
+            {t("students.rosterFromCsvNotice")}
+          </Alert>
+        ) : null}
 
-      {/* Pending-invites banner: clicking "Review" filters to pending so the
+        {/* Pending-invites banner: clicking "Review" filters to pending so the
           teacher can select rows and bulk-resend (cancel + re-send).
           Dismissable for the session. */}
-      <AnimatedAlert
-        tone="info"
-        show={
-          !isLoading &&
-          !isError &&
-          !pendingHidden &&
-          !pendingDismissed &&
-          counts.pending > 0
-        }
-        className="flex items-center justify-between gap-3"
-      >
-        <span className="flex items-center gap-2 text-sm">
-          <PaperAirplaneIcon aria-hidden="true" className="size-4 shrink-0" />
-          {t("students.pendingBanner", { count: counts.pending })}
-        </span>
-        <div className="flex shrink-0 items-center gap-1">
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() => onShowChange("pending")}
-          >
-            {t("students.pendingReview")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="xs"
-            shape="square"
-            aria-label={t("students.dismiss")}
-            title={t("students.dismiss")}
-            onClick={() => setPendingDismissed(true)}
-          >
-            <XIcon aria-hidden="true" className="size-4" />
-          </Button>
-        </div>
-      </AnimatedAlert>
+        <AnimatedAlert
+          tone="info"
+          show={
+            !isLoading &&
+            !isError &&
+            !pendingHidden &&
+            !pendingDismissed &&
+            counts.pending > 0
+          }
+          className="flex items-center justify-between gap-3"
+        >
+          <span className="flex items-center gap-2 text-sm">
+            <PaperAirplaneIcon aria-hidden="true" className="size-4 shrink-0" />
+            {t("students.pendingBanner", { count: counts.pending })}
+          </span>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="ghost"
+              size="xs"
+              onClick={() => onShowChange("pending")}
+            >
+              {t("students.pendingReview")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="xs"
+              shape="square"
+              aria-label={t("students.dismiss")}
+              title={t("students.dismiss")}
+              onClick={() => setPendingDismissed(true)}
+            >
+              <XIcon aria-hidden="true" className="size-4" />
+            </Button>
+          </div>
+        </AnimatedAlert>
 
-      {/* Unlinked-rows banner: rows with no GitHub account for the teacher to
+        {/* Unlinked-rows banner: rows with no GitHub account for the teacher to
           reconcile (link to a member, or remove) — "Review" applies the
           Unlinked filter. Dismissable for the session. */}
-      <AnimatedAlert
-        tone="info"
-        show={
-          !isLoading && !isError && !unlinkedDismissed && counts.unlinked > 0
-        }
-        className="flex items-center justify-between gap-3"
-      >
-        <span className="flex items-center gap-2 text-sm">
-          <PeopleIcon aria-hidden="true" className="size-4 shrink-0" />
-          {t("students.unlinkedBanner", { count: counts.unlinked })}
-        </span>
-        <div className="flex shrink-0 items-center gap-1">
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() => onShowChange("unlinked")}
-          >
-            {t("students.pendingReview")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="xs"
-            shape="square"
-            aria-label={t("students.dismiss")}
-            title={t("students.dismiss")}
-            onClick={() => setUnlinkedDismissed(true)}
-          >
-            <XIcon aria-hidden="true" className="size-4" />
-          </Button>
-        </div>
-      </AnimatedAlert>
-
-      {/* Non-owner: pending invites are owner-only. */}
-      {!isLoading && !isError && pendingHidden ? (
-        <Alert tone="unavailable">
-          <span className="text-sm">{t("students.pendingOwnerOnly")}</span>
-        </Alert>
-      ) : null}
-
-      {/* Failed/expired invitations (owner-only). Usable during a sync — a
-          concurrent re-invite/dismiss commit simply rebases (or is folded by
-          the pass's own conflict retry), so only the per-action pending
-          states gate the buttons. */}
-      {!isLoading && !isError && failedInvitations.length > 0 ? (
-        <FailedInvitationsList
-          failedInvitations={failedInvitations}
-          actionsDisabled={
-            reinviteFailedInvite.isPending || dismissFailedInvite.isPending
+        <AnimatedAlert
+          tone="info"
+          show={
+            !isLoading && !isError && !unlinkedDismissed && counts.unlinked > 0
           }
-          onReinvite={reinvite}
-          actionError={inviteActionError}
-          onDismiss={(inv) => {
-            setInviteActionError(null)
-            dismissFailedInvite.mutate(
-              {
-                invitationId: inv.id,
-                // Only an email-only invite has a metadata team to tear down.
-                inviteEmail: inv.login ? undefined : inv.email,
-              },
-              {
-                onError: (err) =>
-                  setInviteActionError(
-                    t("students.failedInviteDismissError", {
-                      error: getErrorMessage(err),
-                    }),
-                  ),
-              },
-            )
-          }}
-        />
-      ) : null}
+          className="flex items-center justify-between gap-3"
+        >
+          <span className="flex items-center gap-2 text-sm">
+            <PeopleIcon aria-hidden="true" className="size-4 shrink-0" />
+            {t("students.unlinkedBanner", { count: counts.unlinked })}
+          </span>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="ghost"
+              size="xs"
+              onClick={() => onShowChange("unlinked")}
+            >
+              {t("students.pendingReview")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="xs"
+              shape="square"
+              aria-label={t("students.dismiss")}
+              title={t("students.dismiss")}
+              onClick={() => setUnlinkedDismissed(true)}
+            >
+              <XIcon aria-hidden="true" className="size-4" />
+            </Button>
+          </div>
+        </AnimatedAlert>
+
+        {/* Non-owner: pending invites are owner-only. */}
+        {!isLoading && !isError && pendingHidden ? (
+          <Alert tone="unavailable">
+            <span className="text-sm">{t("students.pendingOwnerOnly")}</span>
+          </Alert>
+        ) : null}
+      </AlertStack>
 
       {/* Toolbar: Sync leading on the left (mirroring the submissions
           toolbar's collect affordance) and doubling as the sync-in-progress
@@ -893,6 +840,7 @@ const EnrolledStudents = ({
           }
           selectedRows={selectedRows}
           onClearSelection={clearSelection}
+          onRetainSelection={retainSelection}
           onBulkDone={onBulkDone}
           query={query}
           onQueryChange={setQuery}
@@ -916,38 +864,39 @@ const EnrolledStudents = ({
         />
       ) : null}
 
-      {/* Roster-sync failure: a banner above the table it degrades, with the
-          retry being the Sync control itself. */}
-      <AnimatedAlert
-        tone="error"
-        show={syncError != null}
-        className="mb-3 text-sm"
-        onDismiss={() => setSyncError(null)}
-      >
-        {syncError}
-      </AnimatedAlert>
-      {/* Batch-edit partial outcome: the refreshed table is the retry
-          surface, so the detail banner sits right above it. */}
-      <OutcomeAlert
-        outcome={editWarning ? { tone: "warning", message: editWarning } : null}
-        className="mb-3 text-sm"
-        onDismiss={() => setEditWarning(null)}
-      />
-      {/* Select-all explanation: inline above the table (Primer: feedback
-          near the control). `show` re-derives against the current view so
-          the notice self-clears the moment a filter/search change makes
-          rows selectable again — a latch alone would turn stale. */}
-      <AnimatedAlert
-        tone="info"
-        show={
-          noneSelectableNotice &&
-          shouldWarnNoneSelectable(filtered.length, selectableFiltered.length)
-        }
-        className="mb-3 text-sm"
-        onDismiss={() => setNoneSelectableNotice(false)}
-      >
-        {t("students.bulk.noneSelectable")}
-      </AnimatedAlert>
+      {/* Feedback for the table below, as one group right above it (Primer:
+          feedback near the control). */}
+      <AlertStack className="text-sm">
+        {/* Roster-sync failure: the retry is the Sync control itself. */}
+        <AnimatedAlert
+          tone="error"
+          show={syncError != null}
+          onDismiss={() => setSyncError(null)}
+        >
+          {syncError}
+        </AnimatedAlert>
+        {/* Batch-edit partial outcome: the refreshed table is the retry
+            surface. */}
+        <OutcomeAlert
+          outcome={
+            editWarning ? { tone: "warning", message: editWarning } : null
+          }
+          onDismiss={() => setEditWarning(null)}
+        />
+        {/* Select-all explanation. `show` re-derives against the current view
+            so the notice self-clears the moment a filter/search change makes
+            rows selectable again — a latch alone would turn stale. */}
+        <AnimatedAlert
+          tone="info"
+          show={
+            noneSelectableNotice &&
+            shouldWarnNoneSelectable(filtered.length, selectableFiltered.length)
+          }
+          onDismiss={() => setNoneSelectableNotice(false)}
+        >
+          {t("students.bulk.noneSelectable")}
+        </AnimatedAlert>
+      </AlertStack>
 
       {/* The roster table: Primer DataTable treatment via the shared
           TableShell frame (matching the assignments/submissions tables);
@@ -1025,15 +974,13 @@ const EnrolledStudents = ({
                     onSortChange={setTableSort}
                   />
                 ) : null}
-                {showStatus ? (
-                  <SortableTh
-                    label={t("students.table.colStatus")}
-                    sort={tableSort ?? undefined}
-                    asc="status-asc"
-                    desc="status-desc"
-                    onSortChange={setTableSort}
-                  />
-                ) : null}
+                <SortableTh
+                  label={t("students.table.colStatus")}
+                  sort={tableSort ?? undefined}
+                  asc="status-asc"
+                  desc="status-desc"
+                  onSortChange={setTableSort}
+                />
                 <th scope="col" className="w-0">
                   <span className="sr-only">
                     {t("students.table.colActions")}

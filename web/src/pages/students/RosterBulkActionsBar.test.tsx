@@ -12,8 +12,12 @@ vi.mock("react-i18next", async (importOriginal) => {
   return {
     ...actual,
     useTranslation: () => ({
-      t: (key: string, opts?: Record<string, unknown>) =>
-        opts && "count" in opts ? `${key}:${opts.count}` : key,
+      // `label` composes (the "(N)" menu suffix); `count` renders as a suffix.
+      t: (key: string, opts?: Record<string, unknown>) => {
+        if (opts && "label" in opts && "count" in opts)
+          return `${opts.label} (${opts.count})`
+        return opts && "count" in opts ? `${key}:${opts.count}` : key
+      },
     }),
   }
 })
@@ -26,12 +30,16 @@ vi.mock("@/components/modals", () => ({
     open: boolean
     title: string
     onConfirm: () => void
+    onClose: () => void
   }) =>
     props.open ? (
       <div data-testid="confirm-modal">
         <span>{props.title}</span>
         <button type="button" onClick={props.onConfirm}>
           confirm-run
+        </button>
+        <button type="button" onClick={props.onClose}>
+          confirm-close
         </button>
       </div>
     ) : null,
@@ -46,9 +54,19 @@ const bulkUnenrollRoster = vi.fn()
 vi.mock("@/domain/roster/bulkUnenrollRoster", () => ({
   bulkUnenrollRoster: (...args: unknown[]) => bulkUnenrollRoster(...args),
 }))
+const resendClassroomInvite = vi.fn()
+const reinviteEmailRows = vi.fn()
+const inviteRosterStudents = vi.fn()
+const dismissFailedInvitation = vi.fn()
 vi.mock("@/domain/students", () => ({
-  resendClassroomInvite: vi.fn(),
+  resendClassroomInvite: (...args: unknown[]) => resendClassroomInvite(...args),
+  reinviteEmailRows: (...args: unknown[]) => reinviteEmailRows(...args),
+  inviteRosterStudents: (...args: unknown[]) => inviteRosterStudents(...args),
+  dismissFailedInvitation: (...args: unknown[]) =>
+    dismissFailedInvitation(...args),
   retireEmailInvites: vi.fn(),
+  removeUnlinkedRows: vi.fn(),
+  unlinkedRowRef: vi.fn(),
 }))
 vi.mock("@/github-core/mutations", () => ({
   cancelOrgInvitation: vi.fn(),
@@ -57,6 +75,7 @@ vi.mock("@/github-core/mutations", () => ({
 import RosterBulkActionsBar from "./RosterBulkActionsBar"
 import type { TeamRosterRow } from "@/util/teamRoster"
 import type { GitHubClient } from "@/github-core/client"
+import { GitHubAPIError } from "@/github-core/errors"
 
 const row = (over: Partial<TeamRosterRow>): TeamRosterRow => ({
   key: over.username || over.email || "k",
@@ -79,16 +98,48 @@ const pending = row({
   state: "pending",
   invitation_id: 42,
 })
+// The rows the teacher in #921 had: an email-only pending invite, an unlinked
+// address whose invitation expired, and a not-in-org account whose invitation
+// expired. Each is invitable in its own lane.
+const pendingEmail = row({
+  email: "pend@x.edu",
+  state: "pending",
+  invitation_id: 43,
+})
+const expiredEmail = row({
+  key: "unlinked:grace.hopper@x.edu",
+  email: "grace.hopper@x.edu",
+  state: "unlinked",
+  failed_invitation: {
+    id: 79153766,
+    kind: "expired",
+    failed_at: null,
+    reason: null,
+  },
+})
+const nameOnlyUnlinked = row({ key: "unlinked:x", state: "unlinked" })
+const expiredLogin = row({
+  username: "monalisa",
+  state: "needs_attention_not_in_org",
+  failed_invitation: {
+    id: 79153763,
+    kind: "expired",
+    failed_at: null,
+    reason: null,
+  },
+})
 
 const renderBar = (
   selectedRows: TeamRosterRow[],
   {
     disabled = false,
     onClearSelection = vi.fn(),
+    onRetainSelection = vi.fn(),
     onDone = vi.fn(),
   }: {
     disabled?: boolean
     onClearSelection?: () => void
+    onRetainSelection?: (keys: Iterable<string>) => void
     onDone?: () => void
   } = {},
 ) =>
@@ -99,6 +150,7 @@ const renderBar = (
       client={{} as GitHubClient}
       selectedRows={selectedRows}
       onClearSelection={onClearSelection}
+      onRetainSelection={onRetainSelection}
       onDone={onDone}
       disabled={disabled}
     />,
@@ -129,13 +181,13 @@ describe("RosterBulkActionsBar — selection cluster", () => {
   it("enables each action only for the selection shapes it can act on", () => {
     renderBar([enrolled])
     const invite = screen
-      .getByText("students.bulk.invite")
+      .getByText(/^students\.bulk\.invite \(\d+\)$/)
       .closest("button") as HTMLButtonElement
     const cancel = screen
-      .getByText("students.bulk.cancelInvite")
+      .getByText(/^students\.bulk\.cancelInvite \(\d+\)$/)
       .closest("button") as HTMLButtonElement
     const unenroll = screen
-      .getByText("students.bulk.unenroll")
+      .getByText(/^students\.bulk\.unenroll \(\d+\)$/)
       .closest("button") as HTMLButtonElement
     // An enrolled row: unenrollable, but not invitable/cancellable.
     expect(invite.disabled).toBe(true)
@@ -146,7 +198,7 @@ describe("RosterBulkActionsBar — selection cluster", () => {
   it("opens the unenroll confirm from the menu and runs on confirm", async () => {
     bulkUnenrollRoster.mockResolvedValue({ outcomes: [] })
     renderBar([enrolled])
-    fireEvent.click(screen.getByText("students.bulk.unenroll"))
+    fireEvent.click(screen.getByText(/^students\.bulk\.unenroll \(\d+\)$/))
     expect(screen.getByTestId("confirm-modal")).not.toBeNull()
     await act(async () => {
       fireEvent.click(screen.getByText("confirm-run"))
@@ -164,7 +216,7 @@ describe("RosterBulkActionsBar — selection cluster", () => {
 
   it("hides an already-open confirm when disabled arms (the sync lock)", () => {
     const { rerender } = renderBar([enrolled])
-    fireEvent.click(screen.getByText("students.bulk.unenroll"))
+    fireEvent.click(screen.getByText(/^students\.bulk\.unenroll \(\d+\)$/))
     expect(screen.getByTestId("confirm-modal")).not.toBeNull()
     rerender(
       <RosterBulkActionsBar
@@ -173,6 +225,7 @@ describe("RosterBulkActionsBar — selection cluster", () => {
         client={{} as GitHubClient}
         selectedRows={[enrolled]}
         onClearSelection={vi.fn()}
+        onRetainSelection={vi.fn()}
         onDone={vi.fn()}
         disabled
       />,
@@ -187,10 +240,217 @@ describe("RosterBulkActionsBar — selection cluster", () => {
         client={{} as GitHubClient}
         selectedRows={[enrolled]}
         onClearSelection={vi.fn()}
+        onRetainSelection={vi.fn()}
         onDone={vi.fn()}
       />,
     )
     expect(screen.getByTestId("confirm-modal")).not.toBeNull()
     expect(bulkUnenrollRoster).not.toHaveBeenCalled()
+  })
+})
+
+describe("RosterBulkActionsBar — send invitations", () => {
+  const inviteButton = () =>
+    screen
+      .getByText(/^students\.bulk\.invite \(\d+\)$/)
+      .closest("button") as HTMLButtonElement
+
+  it("is enabled for every row that can receive a fresh invite, and only those", () => {
+    // Each lane on its own.
+    for (const rows of [
+      [pending],
+      [pendingEmail],
+      [expiredEmail],
+      [expiredLogin],
+    ]) {
+      renderBar(rows)
+      expect(inviteButton().disabled).toBe(false)
+      cleanup()
+    }
+    // A name-only unlinked row has nowhere to send an invitation.
+    renderBar([nameOnlyUnlinked])
+    expect(inviteButton().disabled).toBe(true)
+  })
+
+  it("shows the eligible count in the label against the larger selection", () => {
+    renderBar([enrolled, pending, pendingEmail, expiredEmail, expiredLogin])
+    // Five selected, four invitable: the label says so before any click.
+    expect(inviteButton().textContent).toContain("students.bulk.invite (4)")
+    expect(inviteButton().title).toBe("students.bulk.inviteSelected:4")
+    expect(
+      screen.getByText(/^students\.bulk\.cancelInvite \(\d+\)$/).textContent,
+    ).toContain("(2)")
+  })
+
+  it("narrows the selection to the eligible rows when the action is chosen", () => {
+    const onRetainSelection = vi.fn()
+    renderBar([enrolled, pending, pendingEmail, expiredEmail, expiredLogin], {
+      onRetainSelection,
+    })
+
+    fireEvent.click(inviteButton())
+
+    // The enrolled row is dropped; the confirm opens over exactly the four.
+    expect(onRetainSelection).toHaveBeenCalledTimes(1)
+    expect([...onRetainSelection.mock.calls[0]![0]]).toEqual([
+      pending.key,
+      pendingEmail.key,
+      expiredEmail.key,
+      expiredLogin.key,
+    ])
+    expect(screen.getByTestId("confirm-modal")).not.toBeNull()
+    // Cancelling keeps that narrowed set: nothing clears or re-widens it.
+    fireEvent.click(screen.getByText("confirm-close"))
+    expect(onRetainSelection).toHaveBeenCalledTimes(1)
+  })
+
+  it("routes each row to its lane with the ids the recipe must clear first", async () => {
+    resendClassroomInvite.mockResolvedValue({ state: "invited" })
+    reinviteEmailRows.mockResolvedValue({
+      invited: [{ email: "pend@x.edu", role: "student" }],
+      skipped: [{ email: "grace.hopper@x.edu" }],
+      failed: [],
+      deferred: [],
+    })
+    inviteRosterStudents.mockResolvedValue({
+      invited: [{ username: "monalisa", role: "student" }],
+      skipped: [],
+      failed: [],
+      deferred: [],
+    })
+    const onDone = vi.fn()
+    renderBar([pending, pendingEmail, expiredEmail, expiredLogin], { onDone })
+
+    fireEvent.click(inviteButton())
+    await act(async () => {
+      fireEvent.click(screen.getByText("confirm-run"))
+    })
+
+    // Lane 1: the login resend, by id.
+    expect(resendClassroomInvite).toHaveBeenCalledTimes(1)
+    expect(resendClassroomInvite.mock.calls[0]?.[1]).toMatchObject({
+      username: "grace",
+      inviteeId: 2,
+      invitationId: 42,
+    })
+    // Lane 2: both email rows in ONE batch, the pending one carrying its live
+    // invitation id and the expired one its failed record.
+    expect(reinviteEmailRows).toHaveBeenCalledTimes(1)
+    expect(reinviteEmailRows.mock.calls[0]?.[1]).toMatchObject({
+      org: "acme",
+      classroom: "cs101",
+      targets: [
+        { email: "pend@x.edu", role: "student", pendingInvitationId: 43 },
+        {
+          email: "grace.hopper@x.edu",
+          role: "student",
+          failedInvitationId: 79153766,
+        },
+      ],
+    })
+    // Lane 3: a fresh invite carrying the expired login's record, which the
+    // recipe dismisses once the invite is out; the page dismisses nothing.
+    expect(inviteRosterStudents.mock.calls[0]?.[1]).toMatchObject({
+      students: [
+        { username: "monalisa", role: "student", failedInvitationId: 79153763 },
+      ],
+    })
+    expect(dismissFailedInvitation).not.toHaveBeenCalled()
+    expect(onDone).toHaveBeenCalledWith("invite")
+  })
+
+  const rateLimit = () =>
+    new GitHubAPIError({
+      status: 429,
+      url: "/orgs/acme/invitations",
+      message: "secondary rate limit",
+      body: null,
+      rateLimit: {
+        limit: null,
+        remaining: null,
+        used: null,
+        reset: null,
+        resource: null,
+        retryAfter: null,
+      },
+    })
+
+  const runInvite = async (rows: TeamRosterRow[]) => {
+    renderBar(rows)
+    fireEvent.click(inviteButton())
+    await act(async () => {
+      fireEvent.click(screen.getByText("confirm-run"))
+    })
+  }
+
+  it("stops at a lane-1 rate limit: later lanes are never sent, every row is deferred", async () => {
+    resendClassroomInvite.mockRejectedValue(rateLimit())
+
+    await runInvite([pending, pendingEmail, expiredLogin])
+
+    expect(reinviteEmailRows).not.toHaveBeenCalled()
+    expect(inviteRosterStudents).not.toHaveBeenCalled()
+    expect(screen.getByText("students.bulk.resultWarnings")).not.toBeNull()
+    expect(
+      screen.getByText(/students\.resendAllRateLimitedShort/),
+    ).not.toBeNull()
+    for (const label of ["grace", "pend@x.edu", "monalisa"])
+      expect(screen.getByText(label)).not.toBeNull()
+    expect(screen.queryByText("students.bulk.resultFailed")).toBeNull()
+  })
+
+  it("treats a rate limit thrown by a batch lane as deferred, not failed, and stops the next lane", async () => {
+    reinviteEmailRows.mockRejectedValue(rateLimit())
+
+    await runInvite([pendingEmail, expiredLogin])
+
+    expect(inviteRosterStudents).not.toHaveBeenCalled()
+    expect(screen.getByText("students.bulk.resultWarnings")).not.toBeNull()
+    expect(screen.queryByText("students.bulk.resultFailed")).toBeNull()
+    expect(screen.getByText("pend@x.edu")).not.toBeNull()
+    expect(screen.getByText("monalisa")).not.toBeNull()
+  })
+
+  it("reports every row of a lane whose precondition threw, and still runs the next lane", async () => {
+    reinviteEmailRows.mockRejectedValue(new Error("team missing"))
+    inviteRosterStudents.mockResolvedValue({
+      invited: [{ username: "monalisa", role: "student" }],
+      skipped: [],
+      failed: [],
+      deferred: [],
+    })
+
+    await runInvite([pendingEmail, expiredEmail, expiredLogin])
+
+    expect(inviteRosterStudents).toHaveBeenCalledTimes(1)
+    expect(screen.getByText("students.bulk.resultFailed")).not.toBeNull()
+    expect(screen.getAllByText("team missing")).toHaveLength(2)
+    expect(screen.getByText("students.bulk.invitedHeadline:1")).not.toBeNull()
+  })
+
+  it("counts progress up once across lanes using the batch lane's offset", async () => {
+    resendClassroomInvite.mockResolvedValue({ state: "invited" })
+    let captured: ((p: { processed: number; message: string }) => void) | null =
+      null
+    reinviteEmailRows.mockImplementation(
+      (_c: unknown, input: { onProgress: typeof captured }) => {
+        captured = input.onProgress
+        return new Promise(() => {})
+      },
+    )
+
+    renderBar([pending, pendingEmail, expiredEmail])
+    fireEvent.click(inviteButton())
+    await act(async () => {
+      fireEvent.click(screen.getByText("confirm-run"))
+    })
+    // Lane 1 finished one row; lane 2 reports from zero, offset by that one:
+    // 2 of 3 done, so the bar reads 67%, and the caption names the address.
+    await act(async () => {
+      captured!({ processed: 1, message: "pend@x.edu" })
+    })
+    const bar = document.querySelector("progress") as HTMLProgressElement
+    expect(bar.value).toBe(67)
+    expect(bar.getAttribute("aria-label")).toBe("pend@x.edu")
   })
 })

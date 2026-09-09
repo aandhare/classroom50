@@ -15,11 +15,11 @@ import EditStudentForm from "@/pages/students/EditStudentForm"
 import { useGitHubClient } from "@/context/github/GitHubProvider"
 import { useUnenrollStudent } from "@/hooks/mutations/useUnenrollStudent"
 import { useBeforeUnloadGuard } from "@/hooks/useBeforeUnloadGuard"
+import { useReinviteEmailRow } from "@/hooks/mutations/useReinviteEmailRow"
 import {
   assignRosterMemberRole,
   applyClassroomRoleChange,
   inviteRosterStudents,
-  bulkInviteByEmail,
   resendClassroomInvite,
   retireEmailInvite,
   type StudentCsvRow,
@@ -43,8 +43,7 @@ import {
 import {
   canTargetForUnenroll,
   hasStudentEnrollment,
-  STATE_BADGE_TONE,
-  STATE_LABEL_KEY,
+  rowStatusBadges,
 } from "@/util/classroomRoleUI"
 import {
   Badge,
@@ -135,6 +134,7 @@ const RosterMemberModal = ({
 }) => {
   const { t } = useTranslation()
   const client = useGitHubClient()
+  const reinviteEmailRow = useReinviteEmailRow(org, classroom)
   const canManage = canManageProp
   const [confirmingUnenroll, setConfirmingUnenroll] = useState(false)
   const [confirmingResend, setConfirmingResend] = useState(false)
@@ -254,6 +254,7 @@ const RosterMemberModal = ({
     nameFromParts(row.first_name, row.last_name) || row.username || row.email
   const displayInitials = rosterRowInitials(row)
   const label = row.username || row.email
+  const statusBadges = rowStatusBadges(row)
   // Re-sending needs SOMETHING to address the invitation to: an account (id), or
   // an address for an email-only pending invite. Excluding the latter left a
   // student whose invitation went to spam with no option but Cancel.
@@ -270,9 +271,10 @@ const RosterMemberModal = ({
     typeof row.invitation_id === "number"
   const needsRole = canManage && row.state === "needs_attention_in_org"
   const needsInvite = canManage && row.state === "needs_attention_not_in_org"
-  // An UNLINKED row (no GitHub identity) offers exactly two actions: link it
-  // to an org member, or remove it. Everything identity-keyed above is
-  // structurally unavailable (no username/id, no invitation).
+  // An UNLINKED row (no GitHub identity) is handled by UnlinkedRowSection:
+  // re-invite the address (email rows), link the row to an org member, or
+  // remove it. Everything identity-keyed above is structurally unavailable (no
+  // username/id, no live invitation).
   const canLink = canManage && row.state === "unlinked"
   // Unenroll drops a roster.csv row + student-team membership — a student-only
   // action. Hidden for a staff-only row (nothing to unenroll from the roster),
@@ -345,10 +347,19 @@ const RosterMemberModal = ({
     }
     setResolving(true)
     try {
+      // GitHub's failed record for the row's last invitation rides along and is
+      // dismissed once the fresh invite is confirmed, so a send that fails keeps
+      // the row's "Invitation expired" explanation.
       const res = await inviteRosterStudents(client, {
         org,
         classroom,
-        students: [{ username, github_id }],
+        students: [
+          {
+            username,
+            github_id,
+            failedInvitationId: row.failed_invitation?.id,
+          },
+        ],
       })
       // A failed target sent nothing; a rate-limited (deferred) target also sent
       // nothing. Only a fresh invite or an already-active/pending skip is a real
@@ -388,20 +399,26 @@ const RosterMemberModal = ({
   const handleResend = async () => {
     if (resending) return
     // An email-only pending invite has no account to re-invite by id, so re-send
-    // by address instead — bulkInviteByEmail recreates the invitation and its
-    // invite team, the same recipe useReinviteFailedInvite uses for a failed one.
-    // appendEmailInviteRows skips the already-claimed address, so no second row.
+    // by address through the shared recipe (cancel the live invitation right
+    // before the create, restore it if the create fails); the existing roster
+    // row is re-claimed. Same hook as the unlinked row's Re-invite.
     if (!row.username && row.email) {
       setResending(true)
       try {
         const role = sortRolesByRank(row.roles)[0] ?? "student"
-        const res = await bulkInviteByEmail(client, {
-          org,
-          classroom,
-          invites: [{ email: row.email, role }],
+        const result = await reinviteEmailRow.mutateAsync({
+          email: row.email,
+          role,
+          pendingInvitationId: row.invitation_id,
+          failedInvitationId: row.failed_invitation?.id,
         })
-        if (res.failed.length > 0) {
-          throw new Error(res.failed[0]!.message)
+        if (result.status === "rate-limited") {
+          onError(row.key, t("students.resendRateLimited", { label }))
+          return
+        }
+        if (result.status === "already-invited-or-member") {
+          onError(row.key, t("students.resendNotSent", { label }))
+          return
         }
         onResent(row.key)
         onClose()
@@ -644,10 +661,11 @@ const RosterMemberModal = ({
           </p>
         ) : null}
 
-        {/* Unlinked-row reconciliation: link the row to an org member, or
-            remove it. Keyed on open + row identity so the section's own state
-            (picker text/selection, remove confirm) resets the way the modal's
-            other per-row drafts do — by remount instead of hand-resets. */}
+        {/* Unlinked-row reconciliation: re-invite the address, link the row
+            to an org member, or remove it. Keyed on open + row identity so the
+            section's own state (picker text/selection, remove confirm) resets
+            the way the modal's other per-row drafts do — by remount instead of
+            hand-resets. */}
         {canLink ? (
           <UnlinkedRowSection
             key={`${open}:${row.key}`}
@@ -809,7 +827,14 @@ const RosterMemberModal = ({
 
         {needsInvite ? (
           <p className="text-sm text-base-content/80">
-            {t("students.needsAttentionNotInOrgHelp", { label })}
+            {row.failed_invitation
+              ? t(
+                  row.failed_invitation.kind === "expired"
+                    ? "students.needsAttentionExpiredHelp"
+                    : "students.needsAttentionFailedHelp",
+                  { label, reason: row.failed_invitation.reason ?? "" },
+                )
+              : t("students.needsAttentionNotInOrgHelp", { label })}
           </p>
         ) : null}
 
@@ -824,9 +849,13 @@ const RosterMemberModal = ({
               <span className="text-sm text-base-content/70">
                 {t("students.statusLabel")}
               </span>
-              <Badge size="sm" tone={STATE_BADGE_TONE[row.state]}>
-                {t(STATE_LABEL_KEY[row.state])}
-              </Badge>
+              <div className="flex flex-wrap items-center justify-end gap-1">
+                {statusBadges.map((badge) => (
+                  <Badge key={badge.labelKey} size="sm" tone={badge.tone}>
+                    {t(badge.labelKey)}
+                  </Badge>
+                ))}
+              </div>
             </div>
             <div className="flex items-start justify-between gap-3 px-4 py-2.5">
               <span className="text-sm text-base-content/70">

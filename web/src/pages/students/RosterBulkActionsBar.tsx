@@ -20,6 +20,8 @@ import {
   type BulkUnenrollRosterResult,
 } from "@/domain/roster/bulkUnenrollRoster"
 import {
+  inviteRosterStudents,
+  reinviteEmailRows,
   resendClassroomInvite,
   retireEmailInvites,
   removeUnlinkedRows,
@@ -94,16 +96,17 @@ const buildUnenrollResult = (
 }
 
 // Roster multi-select actions: the toolbar's selection cluster (count + one
-// "Actions" menu with Resend / Cancel invite / Unenroll + Clear), shown only
-// while rows are selected. Owns one progress -> results <dialog> shared by all
-// three runs. On completion it calls onDone so the page can refresh its
-// roster/invite caches.
+// "Actions" menu with Send invitations / Cancel invitations / Unenroll /
+// Remove rows + Clear), shown only while rows are selected. Owns one
+// progress -> results <dialog> shared by all runs. On completion it calls
+// onDone so the page can refresh its roster/invite caches.
 const RosterBulkActionsBar = ({
   org,
   classroom,
   client,
   selectedRows,
   onClearSelection,
+  onRetainSelection,
   onDone,
   disabled = false,
 }: {
@@ -112,6 +115,11 @@ const RosterBulkActionsBar = ({
   client: GitHubClient
   selectedRows: TeamRosterRow[]
   onClearSelection: () => void
+  // Narrow the page's selection to these row keys. Each action calls it with
+  // its eligible rows before opening its confirm, so the dialog's count, the
+  // rows the run touches, and the ticked checkboxes are the same set; a
+  // cancelled confirm leaves that narrowed selection in place.
+  onRetainSelection: (keys: Iterable<string>) => void
   // Called after a run completes so the page can invalidate roster + invite
   // caches. `action` distinguishes what changed; on an unenroll run the removed
   // rows are passed so the page can suppress the automatic backfills from
@@ -138,9 +146,29 @@ const RosterBulkActionsBar = ({
 
   const hasSelection = selectedRows.length > 0
   const pendingSelected = selectedRows.filter((r) => r.state === "pending")
-  // Only pending rows are "invitable" — the action resends their org invite.
-  // (The roster is team-driven; there are no CSV-only rows to freshly invite.)
-  const invitableSelected = pendingSelected.length
+  // "Send invitations" covers every row that can receive a fresh org invite,
+  // in three lanes that share one run and one result dialog:
+  //   - a pending row with a GitHub account: cancel + recreate by id;
+  //   - an email row (a pending email-only invite, or an unlinked address
+  //     whose invitation died or expired): cancel/dismiss + recreate by address;
+  //   - a roster row with a GitHub account that isn't in the org (including
+  //     one whose invitation expired): a fresh invite by id.
+  const loginResendSelected = pendingSelected.filter((r) => r.username)
+  const emailReinviteSelected = selectedRows.filter(
+    (r) =>
+      !r.username &&
+      r.email.trim() &&
+      (r.state === "pending" || r.state === "unlinked"),
+  )
+  const notInOrgSelected = selectedRows.filter(
+    (r) => r.state === "needs_attention_not_in_org" && r.username,
+  )
+  const invitableRows = [
+    ...loginResendSelected,
+    ...emailReinviteSelected,
+    ...notInOrgSelected,
+  ]
+  const invitableSelected = invitableRows.length
   // Cancellable = pending rows that carry an org-invitation id.
   const cancellableSelected = pendingSelected.filter(
     (r) => typeof r.invitation_id === "number",
@@ -150,14 +178,27 @@ const RosterBulkActionsBar = ({
   // ordinary rows, so filter rather than sending the whole selection and letting
   // the writer silently report the pending ones as "already removed".
   const unenrollableSelected = selectedRows.filter(canTargetForUnenroll)
-  // Unlinked rows (no GitHub identity): the ONLY bulk action for them is
-  // removing the rows themselves — invite/cancel/unenroll are all keyed on an
-  // identity or an invitation these rows don't have.
+  // Unlinked rows (no GitHub identity) are the bulk remove-rows target; the
+  // email-carrying ones are also re-invitable above.
   const unlinkedSelected = selectedRows.filter((r) => r.state === "unlinked")
 
   // Visibility is its own flag: closing must not reset phase/result/action
   // (close-animation note in ui/Modal); each run resets them anyway.
   const [isOpen, setModalOpen] = useState(false)
+
+  // Opening an action's confirm first narrows the selection to the rows that
+  // action can touch. The menu label already showed "(N)" against M selected;
+  // this makes the checkboxes match, so the dialog never says "5" over a table
+  // showing 12 ticks, and a cancelled confirm leaves the honest 5 behind.
+  const beginAction = (
+    eligible: TeamRosterRow[],
+    setConfirming: (open: boolean) => void,
+  ) => {
+    onRetainSelection(eligible.map((r) => r.key))
+    setConfirming(true)
+  }
+  const withCount = (label: string, count: number) =>
+    t("common.actionWithCount", { label, count })
 
   const deferRun = useDeferredRun()
 
@@ -210,20 +251,32 @@ const RosterBulkActionsBar = ({
     setAction("invite")
     setModalOpen(true)
 
-    const invited: { key: string; label: string; detail?: string }[] = []
-    const skipped: { key: string; label: string; detail?: string }[] = []
-    const failed: { key: string; label: string; detail?: string }[] = []
-    const deferred: { key: string; label: string; detail?: string }[] = []
+    type Outcome = { key: string; label: string; detail?: string }
+    const invited: Outcome[] = []
+    const skipped: Outcome[] = []
+    const failed: Outcome[] = []
+    const deferred: Outcome[] = []
     let rateLimited = false
     let processed = 0
     const tick = (label: string) => {
       processed += 1
       bulk.setProgress({ processed, total: invitableSelected, message: label })
     }
+    // The batch lanes report their own progress from zero; offset it by the
+    // rows already done so the dialog counts up once, across lanes.
+    const laneProgress =
+      (base: number) => (p: { processed: number; message: string }) => {
+        processed = base + p.processed
+        bulk.setProgress({
+          processed,
+          total: invitableSelected,
+          message: p.message,
+        })
+      }
 
-    // Pending rows: cancel + re-send the existing invite (resendOrgInvitation).
-    for (const row of pendingSelected) {
-      const label = row.username || row.email
+    // Lane 1: pending rows with a GitHub account: cancel + recreate by id.
+    for (const row of loginResendSelected) {
+      const label = row.username
       // Once GitHub rate-limits us, stop issuing new resends (hammering only
       // extends the throttle) and defer the rest for a later retry.
       if (rateLimited) {
@@ -232,7 +285,7 @@ const RosterBulkActionsBar = ({
         continue
       }
       const inviteeId = resolveGitHubId(row.github_id)
-      if (inviteeId === null || !row.username) {
+      if (inviteeId === null) {
         skipped.push({
           key: row.key,
           label,
@@ -254,7 +307,12 @@ const RosterBulkActionsBar = ({
           role,
         })
         if (outcome.state === "invited") invited.push({ key: row.key, label })
-        else skipped.push({ key: row.key, label })
+        else
+          skipped.push({
+            key: row.key,
+            label,
+            detail: t("students.bulk.alreadyInvitedOrMember"),
+          })
       } catch (err) {
         // A 429 is deferred (never failed) — mirroring the deferred bucket in
         // inviteRosterStudents — and flips the flag so the remaining rows are
@@ -270,12 +328,122 @@ const RosterBulkActionsBar = ({
       tick(label)
     }
 
+    // Lanes 2 and 3 each send one batch through a domain recipe that reports
+    // four buckets keyed by an address or a login. One runner owns the shared
+    // shape: pre-defer the whole lane once a rate limit was hit, offset its
+    // progress, fold the buckets, and classify a thrown 429 as deferred rather
+    // than failed so the next lane stops too. A thrown precondition (archived
+    // classroom, unresolvable team) sent nothing, so every row is reported
+    // rather than the lane being lost silently.
+    const runBatchLane = async <K extends string>(
+      rows: TeamRosterRow[],
+      keyOf: (row: TeamRosterRow) => K,
+      send: (onProgress: ReturnType<typeof laneProgress>) => Promise<{
+        invited: K[]
+        skipped: K[]
+        failed: { key: K; message: string }[]
+        deferred: K[]
+      }>,
+    ) => {
+      if (rows.length === 0) return
+      const byKey = new Map(rows.map((r) => [keyOf(r).toLowerCase(), r]))
+      const outcome = (k: K, detail?: string): Outcome => {
+        const row = byKey.get(k.toLowerCase())
+        return { key: row?.key ?? k, label: k, detail }
+      }
+      const base = processed
+      if (rateLimited) {
+        for (const row of rows) deferred.push(outcome(keyOf(row)))
+      } else {
+        try {
+          const res = await send(laneProgress(base))
+          for (const k of res.invited) invited.push(outcome(k))
+          for (const k of res.skipped)
+            skipped.push(outcome(k, t("students.bulk.alreadyInvitedOrMember")))
+          for (const f of res.failed) failed.push(outcome(f.key, f.message))
+          if (res.deferred.length > 0) rateLimited = true
+          for (const k of res.deferred) deferred.push(outcome(k))
+        } catch (err) {
+          log.debug("bulk invite: batch lane failed", { err })
+          if (err instanceof GitHubAPIError && err.isRateLimited) {
+            rateLimited = true
+            for (const row of rows) deferred.push(outcome(keyOf(row)))
+          } else {
+            const detail = getErrorMessage(err)
+            for (const row of rows) failed.push(outcome(keyOf(row), detail))
+          }
+        }
+      }
+      processed = base + rows.length
+      bulk.setProgress({
+        processed,
+        total: invitableSelected,
+        message: t("students.bulk.nextBatch"),
+      })
+    }
+
+    // Lane 2: email rows. The recipe cancels a live invitation right before
+    // its create and dismisses failed records only after a confirmed send.
+    await runBatchLane(
+      emailReinviteSelected,
+      (row) => row.email.trim(),
+      async (onProgress) => {
+        const res = await reinviteEmailRows(client, {
+          org,
+          classroom,
+          targets: emailReinviteSelected.map((row) => ({
+            email: row.email,
+            role: sortRolesByRank(row.roles)[0] ?? "student",
+            pendingInvitationId:
+              row.state === "pending" ? row.invitation_id : undefined,
+            failedInvitationId: row.failed_invitation?.id,
+          })),
+          onProgress,
+        })
+        return {
+          invited: res.invited.map((i) => i.email),
+          skipped: res.skipped.map((s) => s.email),
+          failed: res.failed.map((f) => ({ key: f.email, message: f.message })),
+          deferred: res.deferred,
+        }
+      },
+    )
+
+    // Lane 3: roster rows with an account that isn't in the org: fresh invite
+    // by id; the attributed failed record is dismissed once the invite is out.
+    await runBatchLane(
+      notInOrgSelected,
+      (row) => row.username,
+      async (onProgress) => {
+        const res = await inviteRosterStudents(client, {
+          org,
+          classroom,
+          students: notInOrgSelected.map((row) => ({
+            username: row.username,
+            github_id: row.github_id,
+            role: sortRolesByRank(row.roles)[0] ?? "student",
+            failedInvitationId: row.failed_invitation?.id,
+          })),
+          onProgress,
+        })
+        return {
+          invited: res.invited.map((i) => i.username),
+          skipped: res.skipped.map((s) => s.username),
+          failed: res.failed.map((f) => ({
+            key: f.username,
+            message: f.message,
+          })),
+          deferred: res.deferred,
+        }
+      },
+    )
+
     const sections: BulkResultView["sections"] = []
     if (skipped.length > 0)
       sections.push({ title: t("students.bulk.resultSkipped"), rows: skipped })
     if (failed.length > 0)
       sections.push({ title: t("students.bulk.resultFailed"), rows: failed })
-    if (rateLimited)
+    if (deferred.length > 0)
       sections.push({
         title: t("students.bulk.resultWarnings"),
         rows: [
@@ -439,7 +607,7 @@ const RosterBulkActionsBar = ({
           >
             <DropdownMenu.Item
               icon={PaperAirplaneIcon}
-              label={t("students.bulk.invite")}
+              label={withCount(t("students.bulk.invite"), invitableSelected)}
               disabled={invitableSelected === 0}
               title={
                 invitableSelected === 0
@@ -448,11 +616,14 @@ const RosterBulkActionsBar = ({
                       count: invitableSelected,
                     })
               }
-              onSelect={() => setConfirmingInvite(true)}
+              onSelect={() => beginAction(invitableRows, setConfirmingInvite)}
             />
             <DropdownMenu.Item
               icon={XCircleIcon}
-              label={t("students.bulk.cancelInvite")}
+              label={withCount(
+                t("students.bulk.cancelInvite"),
+                cancellableSelected.length,
+              )}
               disabled={cancellableSelected.length === 0}
               title={
                 cancellableSelected.length === 0
@@ -461,19 +632,26 @@ const RosterBulkActionsBar = ({
                       count: cancellableSelected.length,
                     })
               }
-              onSelect={() => setConfirmingCancel(true)}
+              onSelect={() =>
+                beginAction(cancellableSelected, setConfirmingCancel)
+              }
             />
             {/* Unenroll — destructive, so last and in its own group. */}
             <DropdownMenu.Separator />
             <DropdownMenu.Item
               icon={SignOutIcon}
-              label={t("students.bulk.unenroll")}
+              label={withCount(
+                t("students.bulk.unenroll"),
+                unenrollableSelected.length,
+              )}
               destructive
               disabled={unenrollableSelected.length === 0}
               title={t("students.bulk.unenrollSelected", {
                 count: unenrollableSelected.length,
               })}
-              onSelect={() => setConfirmingUnenroll(true)}
+              onSelect={() =>
+                beginAction(unenrollableSelected, setConfirmingUnenroll)
+              }
             />
             {/* Remove unlinked rows — the roster-only delete for rows with
                 no GitHub identity. Rendered only when the selection contains
@@ -481,12 +659,17 @@ const RosterBulkActionsBar = ({
             {unlinkedSelected.length > 0 ? (
               <DropdownMenu.Item
                 icon={TrashIcon}
-                label={t("students.bulk.removeRows")}
+                label={withCount(
+                  t("students.bulk.removeRows"),
+                  unlinkedSelected.length,
+                )}
                 destructive
                 title={t("students.bulk.removeRowsSelected", {
                   count: unlinkedSelected.length,
                 })}
-                onSelect={() => setConfirmingRemoveRows(true)}
+                onSelect={() =>
+                  beginAction(unlinkedSelected, setConfirmingRemoveRows)
+                }
               />
             ) : null}
           </BulkSelectionCluster>
@@ -558,7 +741,9 @@ const RosterBulkActionsBar = ({
         description={t("students.bulk.confirmCancelBody", {
           count: cancellableSelected.length,
         })}
-        confirmLabel={t("students.bulk.cancelInvite")}
+        confirmLabel={t("students.bulk.cancelInviteConfirm", {
+          count: cancellableSelected.length,
+        })}
         onConfirm={async () => {
           setConfirmingCancel(false)
           deferRun(runCancel)

@@ -26,19 +26,14 @@ vi.mock("@/hooks/useTeamRoster", () => ({
   useInvalidateTeamRoster: () => () => {},
 }))
 
-// Mutation hooks -> inert objects (no network); most phase tests never fire
-// them. Sync gets a dedicated, per-test-controllable spy so the composed wiring
+// Sync gets a dedicated, per-test-controllable spy so the composed wiring
 // test can observe the auto-sync.
-const inertMutation = { mutate: vi.fn(), isPending: false }
 const syncMutate = vi.fn()
 // Result of the last completed refresh (drives the toolbar caption);
 // per-test controllable.
 let mockSyncState: { isSuccess: boolean; data?: unknown } = {
   isSuccess: false,
 }
-vi.mock("@/hooks/mutations/useDismissFailedInvite", () => ({
-  useDismissFailedInvite: () => inertMutation,
-}))
 vi.mock("@/hooks/mutations/useSyncRoster", () => ({
   useSyncRoster: () => ({
     mutate: syncMutate,
@@ -61,9 +56,6 @@ vi.mock("@/hooks/useIdentityDirectory", () => ({
     isSuccess: false,
     isError: false,
   }),
-}))
-vi.mock("@/hooks/mutations/useReinviteFailedInvite", () => ({
-  useReinviteFailedInvite: () => inertMutation,
 }))
 vi.mock("@/context/github/GitHubProvider", () => ({
   useGitHubClient: () => ({}),
@@ -146,7 +138,6 @@ const emptyRoster = {
   isError: false,
   isEmpty: true,
   pendingHidden: false,
-  failedInvitations: [],
   teamSlugByRole: {},
   csvMissingCount: 0,
   csvMissingLogins: [],
@@ -231,17 +222,58 @@ describe("EnrolledStudents — rendered phase views", () => {
     expect(screen.getByText("alice")).not.toBeNull()
   })
 
-  it("surfaces failed invitations with a dismiss affordance", () => {
+  // An expired email invitation is a fact about the ROW: the status chip says
+  // "Invitation expired" where a bare unlinked row would say "Unlinked".
+  it("badges a row whose invitation expired instead of calling it unlinked", () => {
     useTeamRoster.mockReturnValue({
       ...emptyRoster,
       isEmpty: false,
-      failedInvitations: [
-        { id: 7, login: "ghost", email: null, failed_reason: "bounced" },
+      counts: { ...emptyRoster.counts, unlinked: 2 },
+      rows: [
+        {
+          key: "unlinked:grace@uni.edu",
+          username: "",
+          email: "grace@uni.edu",
+          first_name: "Grace",
+          last_name: "Hopper",
+          section: "",
+          github_id: "",
+          avatar_url: "",
+          roles: ["student"],
+          state: "unlinked",
+          failed_invitation: {
+            id: 7,
+            kind: "expired",
+            failed_at: "2026-09-07T00:41:28Z",
+            reason:
+              "Invitation expired. User did not accept this invite for 7 days",
+          },
+        },
+        {
+          key: "unlinked:plain@uni.edu",
+          username: "",
+          email: "plain@uni.edu",
+          first_name: "Plain",
+          last_name: "Row",
+          section: "",
+          github_id: "",
+          avatar_url: "",
+          roles: ["student"],
+          state: "unlinked",
+        },
       ],
     })
     render(renderView())
-    expect(screen.getByText("students.failedInvitesTitle:1")).not.toBeNull()
-    expect(screen.getByText("ghost")).not.toBeNull()
+    // The expired row carries BOTH chips: the failure, and the state that still
+    // names what is missing (an account to link). Two unlinked rows -> two
+    // "Unlinked" chips; one "Invitation expired".
+    expect(screen.getByText("students.statusInviteExpired")).not.toBeNull()
+    expect(screen.getAllByText("students.statusUnlinked")).toHaveLength(2)
+    // And the status filter offers the cross-state option only now that such
+    // a row exists.
+    expect(
+      screen.getByRole("option", { name: "students.filterInviteExpired" }),
+    ).not.toBeNull()
   })
 
   // Composed wiring: exercises the useRosterAutoSync seam through
@@ -346,12 +378,16 @@ describe("EnrolledStudents — rendered phase views", () => {
     expect(order()).toBe("zed-first")
   })
 
-  // The Status column only exists while some row has something to report
-  // (pending / needs attention) — a fully enrolled roster drops it.
-  it("shows the Status column only when a row is not plainly enrolled", () => {
+  // Status is a permanent column: enrolled rows show an explicit "Enrolled"
+  // badge (the same recipe the detail modal uses) rather than an empty cell,
+  // so the table and the modal never disagree about a row's state.
+  it("always shows the Status column, with an Enrolled badge for healthy rows", () => {
     useTeamRoster.mockReturnValue(populatedRoster)
     render(renderView())
-    expect(screen.queryByText("students.table.colStatus")).toBeNull()
+    expect(screen.getByText("students.table.colStatus")).not.toBeNull()
+    expect(screen.getAllByText("students.statusEnrolled")).toHaveLength(
+      populatedRoster.rows.length,
+    )
 
     cleanup()
     useTeamRoster.mockReturnValue({
@@ -372,6 +408,7 @@ describe("EnrolledStudents — rendered phase views", () => {
     })
     render(renderView())
     expect(screen.getByText("students.table.colStatus")).not.toBeNull()
+    expect(screen.getByText("students.statusPending")).not.toBeNull()
   })
 
   // The Sync button is a standing affordance now (not drift-gated): always in

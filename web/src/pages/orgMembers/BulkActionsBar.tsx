@@ -1,13 +1,20 @@
 import { useState } from "react"
 import { useTranslation } from "react-i18next"
-import { PlusIcon, SignOutIcon, XCircleIcon } from "@/components/ui/icons"
+import {
+  PaperAirplaneIcon,
+  PlusIcon,
+  SignOutIcon,
+  XCircleIcon,
+} from "@/components/ui/icons"
 
 import { DropdownMenu, FormField, Select } from "@/components/ui"
 import { BulkSelectionCluster } from "@/components/bulk/BulkSelectionCluster"
 import type { GitHubUser } from "@/github-core/types"
-import type { OrgMemberRow } from "@/util/orgMembers"
+import { isInvitableToOrg, type OrgMemberRow } from "@/util/orgMembers"
+import { canTargetForUnenroll } from "@/util/classroomRoleUI"
 import type { OrgMembersBulkOutcome } from "@/hooks/useOrgMembersCacheSync"
 import { useBulkAddToClassroom } from "@/hooks/mutations/useBulkAddToClassroom"
+import { useBulkInviteMembersToOrg } from "@/hooks/mutations/useBulkInviteMembersToOrg"
 import { useBulkRemoveFromClassroom } from "@/hooks/mutations/useBulkRemoveFromClassroom"
 import { useBulkRemoveFromOrg } from "@/hooks/mutations/useBulkRemoveFromOrg"
 import { ConfirmModal } from "@/components/modals"
@@ -17,6 +24,7 @@ import { BulkRunModal, type BulkResultView } from "@/components/bulk/resultView"
 import { useBulkRun } from "@/components/bulk/useBulkRun"
 import {
   buildAddResult,
+  buildInviteResult,
   buildOrgRemoveResult,
   buildRemoveResult,
 } from "@/pages/orgMembers/bulkResults"
@@ -44,6 +52,7 @@ const BulkActionsBar = ({
   classrooms,
   isOwner,
   onClearSelection,
+  onRetainSelection,
   onDone,
 }: {
   org: string
@@ -54,19 +63,25 @@ const BulkActionsBar = ({
   // warns when the selection would strip co-owners.
   isOwner: (row: OrgMemberRow) => boolean
   onClearSelection: () => void
+  // Narrow the page's selection to these row keys (the roster bar's recipe):
+  // each action keeps only the rows it can act on before confirming, so the
+  // dialog's count and the ticked checkboxes agree, and a cancelled confirm
+  // leaves that narrowed selection in place.
+  onRetainSelection: (keys: Iterable<string>) => void
   onDone: (input: BulkDoneInput) => void
 }) => {
   const { t } = useTranslation()
   const bulkAdd = useBulkAddToClassroom(org)
+  const bulkInvite = useBulkInviteMembersToOrg(org)
   const bulkRemove = useBulkRemoveFromClassroom(org)
   const bulkRemoveOrg = useBulkRemoveFromOrg(org)
 
   // The classroom a menu action targets: `target` is the config-repo path
   // (what the writers key on); `targetName` the display name copy shows.
   const [target, setTarget] = useState("")
-  const [action, setAction] = useState<"add" | "remove" | "remove-org" | null>(
-    null,
-  )
+  const [action, setAction] = useState<
+    "add" | "invite" | "remove" | "remove-org" | null
+  >(null)
   const bulk = useBulkRun()
   const { progress } = bulk
   // Gates the destructive remove behind a confirmation. Scope is the menu
@@ -76,8 +91,9 @@ const BulkActionsBar = ({
   const [removeScope, setRemoveScope] = useState<"classroom" | "org">(
     "classroom",
   )
-  // Gates the bulk add (org invite + classroom enroll) behind a confirmation.
+  // Gates the bulk add (classroom enroll) behind a confirmation.
   const [confirmingAdd, setConfirmingAdd] = useState(false)
+  const [confirmingInvite, setConfirmingInvite] = useState(false)
   // The #664 opt-in: escalate the remove from the picked classroom to the
   // whole organization.
   const [alsoRemoveFromOrg, setAlsoRemoveFromOrg] = useState(false)
@@ -85,6 +101,28 @@ const BulkActionsBar = ({
   const hasSelection = selectedRows.length > 0
 
   const targetName = classrooms.find((c) => c.path === target)?.name ?? target
+
+  // Per-action eligibility that does not depend on the classroom picked in the
+  // dialog (that part stays in each preview): only members can be added; only
+  // an identity-bearing row on some active classroom can be removed from one;
+  // only a member with a username can be removed from the org (the DELETE is
+  // keyed by username).
+  const addableRows = selectedRows.filter((row) => row.isMember)
+  // Pending and unlinked rows are handled from the roster.
+  const invitableRows = selectedRows.filter(isInvitableToOrg)
+  const classroomRemovableRows = selectedRows.filter(
+    (row) =>
+      canTargetForUnenroll(row) && row.classrooms.some((a) => !a.archived),
+  )
+  const orgRemovableRows = selectedRows.filter(
+    (row) => row.isMember && Boolean(row.username),
+  )
+  const withCount = (label: string, count: number) =>
+    t("common.actionWithCount", { label, count })
+  const beginAction = (eligible: OrgMemberRow[], open: () => void) => {
+    onRetainSelection(eligible.map((r) => r.key))
+    open()
+  }
 
   // Add preview, mirroring bulkAddToClassroom's PRE-filters (runtime skips
   // can only shrink it; results report those). Remove previews live in
@@ -120,16 +158,28 @@ const BulkActionsBar = ({
     setModalOpen(false)
   }
 
-  const run = async (which: "add" | "remove" | "remove-org") => {
+  const run = async (which: "add" | "invite" | "remove" | "remove-org") => {
     if (selectedRows.length === 0) return
-    if (which !== "remove-org" && !target) return
+    if ((which === "add" || which === "remove") && !target) return
     if (!bulk.begin(selectedRows.length, t("orgMembers.bulk.starting"))) return
     setAction(which)
     setModalOpen(true)
 
     try {
       let result: BulkResultView
-      if (which === "add") {
+      if (which === "invite") {
+        const res = await bulkInvite.mutateAsync({
+          rows: selectedRows,
+          onProgress: bulk.setProgress,
+        })
+        result = buildInviteResult(res, t)
+        onDone({
+          action: "invite",
+          affectedKeys: res.outcomes
+            .filter((o) => o.status === "invited")
+            .map((o) => o.key),
+        })
+      } else if (which === "add") {
         const res = await bulkAdd.mutateAsync({
           classroom: target,
           rows: selectedRows,
@@ -193,48 +243,93 @@ const BulkActionsBar = ({
           onClearSelection={onClearSelection}
         >
           <DropdownMenu.Item
+            icon={PaperAirplaneIcon}
+            label={withCount(
+              t("orgMembers.bulk.sendInvitations"),
+              invitableRows.length,
+            )}
+            disabled={invitableRows.length === 0}
+            title={
+              invitableRows.length === 0
+                ? t("orgMembers.bulk.inviteNoneInvitable")
+                : t("orgMembers.bulk.inviteSelected", {
+                    count: invitableRows.length,
+                  })
+            }
+            onSelect={() =>
+              beginAction(invitableRows, () => setConfirmingInvite(true))
+            }
+          />
+          <DropdownMenu.Item
             icon={PlusIcon}
-            label={t("orgMembers.bulk.addToClassroomMenu")}
-            disabled={classrooms.length === 0}
+            label={withCount(
+              t("orgMembers.bulk.addToClassroomMenu"),
+              addableRows.length,
+            )}
+            disabled={classrooms.length === 0 || addableRows.length === 0}
             title={
               classrooms.length === 0
                 ? t("orgMembers.bulk.noClassrooms")
-                : undefined
+                : addableRows.length === 0
+                  ? t("orgMembers.bulk.addNoneMembers")
+                  : undefined
             }
-            onSelect={() => {
-              setTarget(classrooms[0].path)
-              setConfirmingAdd(true)
-            }}
+            onSelect={() =>
+              beginAction(addableRows, () => {
+                setTarget(classrooms[0].path)
+                setConfirmingAdd(true)
+              })
+            }
           />
           {/* Removals — destructive, so last and in their own group. */}
           <DropdownMenu.Separator />
           <DropdownMenu.Item
             icon={SignOutIcon}
-            label={t("orgMembers.bulk.removeFromClassroomMenu")}
+            label={withCount(
+              t("orgMembers.bulk.removeFromClassroomMenu"),
+              classroomRemovableRows.length,
+            )}
             destructive
-            disabled={removableClassrooms.length === 0}
+            disabled={
+              removableClassrooms.length === 0 ||
+              classroomRemovableRows.length === 0
+            }
             title={
-              removableClassrooms.length === 0
+              removableClassrooms.length === 0 ||
+              classroomRemovableRows.length === 0
                 ? t("orgMembers.bulk.removeNoneOnClassroom")
                 : undefined
             }
-            onSelect={() => {
-              setTarget(removableClassrooms[0].path)
-              setRemoveScope("classroom")
-              // Fresh decision each time: the escalation is opt-in per run.
-              setAlsoRemoveFromOrg(false)
-              setConfirmingRemove(true)
-            }}
+            onSelect={() =>
+              beginAction(classroomRemovableRows, () => {
+                setTarget(removableClassrooms[0].path)
+                setRemoveScope("classroom")
+                // Fresh decision each time: the escalation is opt-in per run.
+                setAlsoRemoveFromOrg(false)
+                setConfirmingRemove(true)
+              })
+            }
           />
           <DropdownMenu.Item
             icon={XCircleIcon}
-            label={t("orgMembers.removeFromOrg")}
+            label={withCount(
+              t("orgMembers.removeFromOrg"),
+              orgRemovableRows.length,
+            )}
             destructive
-            onSelect={() => {
-              setRemoveScope("org")
-              setAlsoRemoveFromOrg(false)
-              setConfirmingRemove(true)
-            }}
+            disabled={orgRemovableRows.length === 0}
+            title={
+              orgRemovableRows.length === 0
+                ? t("orgMembers.bulk.removeOrgNoneEligible")
+                : undefined
+            }
+            onSelect={() =>
+              beginAction(orgRemovableRows, () => {
+                setRemoveScope("org")
+                setAlsoRemoveFromOrg(false)
+                setConfirmingRemove(true)
+              })
+            }
           />
         </BulkSelectionCluster>
       ) : null}
@@ -258,6 +353,26 @@ const BulkActionsBar = ({
           deferRun(() => run(which))
         }}
         onClose={() => setConfirmingRemove(false)}
+      />
+
+      <ConfirmModal
+        open={confirmingInvite}
+        tone="warning"
+        needsConfirm={false}
+        title={t("orgMembers.bulk.confirmInviteTitle", {
+          count: invitableRows.length,
+        })}
+        description={t("orgMembers.bulk.confirmInviteBody", {
+          count: invitableRows.length,
+          org,
+        })}
+        confirmLabel={t("orgMembers.bulk.sendInvitations")}
+        confirmDisabled={invitableRows.length === 0}
+        onConfirm={async () => {
+          setConfirmingInvite(false)
+          deferRun(() => run("invite"))
+        }}
+        onClose={() => setConfirmingInvite(false)}
       />
 
       <ConfirmModal
@@ -325,15 +440,17 @@ const BulkActionsBar = ({
         onClose={closeModal}
         run={bulk}
         title={
-          action === "remove-org"
-            ? t("orgMembers.bulk.removeOrgTitle", { org })
-            : action === "remove"
-              ? t("orgMembers.bulk.removeTitle", {
-                  classroom: targetName,
-                })
-              : t("orgMembers.bulk.addTitle", {
-                  classroom: targetName,
-                })
+          action === "invite"
+            ? t("orgMembers.bulk.inviteTitle", { org })
+            : action === "remove-org"
+              ? t("orgMembers.bulk.removeOrgTitle", { org })
+              : action === "remove"
+                ? t("orgMembers.bulk.removeTitle", {
+                    classroom: targetName,
+                  })
+                : t("orgMembers.bulk.addTitle", {
+                    classroom: targetName,
+                  })
         }
         processedCaption={t("orgMembers.bulk.progressProcessed", {
           processed: progress.processed,

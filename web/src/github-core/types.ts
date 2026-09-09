@@ -22,9 +22,9 @@ export type GitHubOrgInvitation = {
   created_at: string
   failed_at: string | null
   failed_reason: string | null
-  // Teams on the invite: 0 => a team-less org invite (belongs to no classroom);
-  // >0 => resolve invitation_teams_url for the slugs. Used to scope a failed
-  // invite (which has no team-scoped list endpoint) to a classroom team.
+  // Present on the org-wide lists. Not usable for attributing a FAILED invite
+  // to a classroom: its invitation_teams_url 404s once the invite has failed
+  // (verified live, 2026-09-09). The roster matches by email/login instead.
   team_count?: number
   invitation_teams_url?: string | null
 }
@@ -220,8 +220,8 @@ export type MyTeam = GitHubTeam & {
 export type GitHubOrgDetails = {
   login: string
   id: number
-  // Org display name (the human-friendly name shown on GitHub), e.g., "Classroom
-  // 50 Summer Dev" for the `classroom50-summer-dev` login. Only GET /orgs/{org}
+  // Org display name (the human-friendly name shown on GitHub), e.g., "CS50
+  // Fall 2026" for the `cs50-fall-2026` login. Only GET /orgs/{org}
   // returns it; the membership list does not. Optional/nullable — fall back to
   // the login when absent.
   name?: string | null

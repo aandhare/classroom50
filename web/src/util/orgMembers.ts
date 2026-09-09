@@ -1,6 +1,13 @@
 import type { Student } from "@/types/classroom"
-import type { GitHubUser } from "@/github-core/types"
+import type { GitHubOrgInvitation, GitHubUser } from "@/github-core/types"
 import { memberIdSet, studentKey } from "@/util/identity"
+import {
+  failedInvitationRef,
+  hasExpiredInvite,
+  indexFailedInvitations,
+  type FailedInvitationRef,
+} from "./teamRoster"
+import { resolveGitHubId } from "./students"
 import { sortByColumn } from "./sortColumns"
 
 // Per-classroom enrollment state for an aggregated member, mirroring
@@ -20,20 +27,25 @@ export type ClassroomAccess = {
   state: ClassroomAccessState
 }
 
-// How an aggregated row relates org membership to roster presence:
-//  - member-on-roster: a healthy member on >=1 roster.
-//  - on-roster-not-member: the target discrepancy — on a roster but no longer
-//    (or never) an org member.
-//  - invitation-pending: on a roster with NO GitHub identity at all, which is
-//    what an unaccepted email invite's row looks like. Not a discrepancy: the
-//    invitation is live and the account simply doesn't exist here yet, so it must
-//    not land in the count that asks the teacher to act.
+// How an aggregated row relates org membership to roster presence. Mirrors the
+// roster's states (util/teamRoster) so the two pages agree about a person:
+//  - member-on-roster: a healthy member on >=1 roster (roster: enrolled).
+//  - on-roster-not-member: on a roster with a GitHub account that is not an org
+//    member and has no live invitation (roster: needs_attention_not_in_org).
+//    The discrepancy the teacher acts on.
+//  - invitation-pending: on a roster with a LIVE org invitation, by account or
+//    by email (roster: pending). Verified against GitHub's pending list, never
+//    inferred from the row's shape. Informational, not a discrepancy.
+//  - unlinked: on a roster with no GitHub account and no live invitation
+//    (roster: unlinked). The invitation expired, was canceled, or never went
+//    out; `failed_invitation` says which when GitHub still has the record.
 //  - member-no-roster: an org member on no roster (e.g., co-teacher, or a
 //    leftover after an unenroll).
 export type MemberClassification =
   | "member-on-roster"
   | "on-roster-not-member"
   | "invitation-pending"
+  | "unlinked"
   | "member-no-roster"
 
 export type OrgMemberRow = {
@@ -55,6 +67,20 @@ export type OrgMemberRow = {
   // uncollected). Empty when team data was unavailable or all consistent. Only
   // meaningful for members (a non-member is already on-roster-not-member).
   unprovisionedClassrooms: string[]
+  // The live org invitation behind an `invitation-pending` row.
+  invitation_id?: number
+  // GitHub's failed record for the last invitation to a stranded row (unlinked
+  // or on-roster-not-member), the same shape the roster attaches. Explains why
+  // the row is stranded and names the record a re-invite must dismiss.
+  failed_invitation?: FailedInvitationRef
+}
+
+// The org's invitation lists (owner-only reads). Pass `pending` only once it
+// has loaded: without it every identity-less row reads as unlinked, since a
+// live invitation is unknowable, and a pending student would be mislabeled.
+export type OrgInvitationLists = {
+  pending?: GitHubOrgInvitation[]
+  failed?: GitHubOrgInvitation[]
 }
 
 export type ClassroomRoster = {
@@ -83,8 +109,39 @@ export function aggregateOrgMembers(
   // each ClassroomAccess is marked onTeam and CSV/team drift surfaced. A
   // classroom absent from the map has "unknown" team data and is never flagged.
   teamMembersByClassroom?: Map<string, Set<string>>,
+  invitations: OrgInvitationLists = {},
 ): OrgMemberRow[] {
   const memberIds = memberIdSet(members)
+
+  // Live invitations by lowercased login and email. A login invite (sent by
+  // id) carries the account's login; an email invite carries only the address.
+  const pendingByLogin = new Map<string, number>()
+  const pendingByEmail = new Map<string, number>()
+  for (const inv of invitations.pending ?? []) {
+    const login = inv.login?.trim().toLowerCase()
+    const email = inv.email?.trim().toLowerCase()
+    if (login && !pendingByLogin.has(login)) pendingByLogin.set(login, inv.id)
+    if (email && !pendingByEmail.has(email)) pendingByEmail.set(email, inv.id)
+  }
+  const { byLogin: failedByLogin, byEmail: failedByEmail } =
+    indexFailedInvitations(invitations.failed ?? [])
+  // A row's live invitation, else its latest failed record. Login first (the
+  // account is the stronger identity), then any of the row's addresses.
+  const invitationFor = (acc: {
+    username: string
+    emails: string[]
+  }): { invitation_id?: number; failed_invitation?: FailedInvitationRef } => {
+    const login = acc.username.trim().toLowerCase()
+    const emails = acc.emails.map((e) => e.trim().toLowerCase())
+    const pendingId =
+      (login ? pendingByLogin.get(login) : undefined) ??
+      emails.map((e) => pendingByEmail.get(e)).find((id) => id !== undefined)
+    if (pendingId !== undefined) return { invitation_id: pendingId }
+    const failed =
+      (login ? failedByLogin.get(login) : undefined) ??
+      emails.map((e) => failedByEmail.get(e)).find((ref) => ref !== undefined)
+    return failed ? { failed_invitation: failed } : {}
+  }
   // Login -> id, so a roster row with a username but no github_id (typed before
   // reconcile) still matches a live member. Without this it's classified
   // on-roster-not-member AND the member is emitted as member-no-roster — the
@@ -189,6 +246,21 @@ export function aggregateOrgMembers(
       }
     })
 
+    // A non-member's standing is decided by GitHub's invitation lists, never by
+    // the row's shape: a live invitation makes it pending whether it went to an
+    // account or an address; otherwise an account-bearing row is not in the
+    // org and an identity-less one is unlinked, each carrying the failed record
+    // that explains it when GitHub still has one. A member's stale record is
+    // noise (they got in some other way) and is dropped.
+    const invite = isMember ? {} : invitationFor(acc)
+    const classification: MemberClassification = isMember
+      ? "member-on-roster"
+      : invite.invitation_id !== undefined
+        ? "invitation-pending"
+        : acc.username || acc.github_id
+          ? "on-roster-not-member"
+          : "unlinked"
+
     rows.push({
       key: acc.key,
       username: acc.username,
@@ -200,15 +272,9 @@ export function aggregateOrgMembers(
       emails: acc.emails,
       isMember,
       classrooms,
-      // An identity-less roster row is an unaccepted email invite, not a person
-      // who left the org — there is no account to have left. Classify it as
-      // pending so it stays visible without being counted as a discrepancy.
-      classification: isMember
-        ? "member-on-roster"
-        : acc.username || acc.github_id
-          ? "on-roster-not-member"
-          : "invitation-pending",
+      classification,
       unprovisionedClassrooms,
+      ...invite,
     })
   }
 
@@ -232,9 +298,10 @@ export function aggregateOrgMembers(
     })
   }
 
-  // Discrepancies first (the actionable rows), then members, then by login/name.
-  // A pending invitation sorts after healthy members: it is informational, and
-  // putting it above them would bury the rows a teacher can act on.
+  // Actionable rows first (not in org, then unlinked), then members, then the
+  // informational pending invitations, then members on no roster; ties by
+  // login/name. Pending sorts after healthy members so it never buries the
+  // rows a teacher must act on.
   rows.sort((a, b) => {
     const byClass =
       CLASSIFICATION_ORDER[a.classification] -
@@ -248,9 +315,10 @@ export function aggregateOrgMembers(
 
 const CLASSIFICATION_ORDER: Record<MemberClassification, number> = {
   "on-roster-not-member": 0,
-  "member-on-roster": 1,
-  "invitation-pending": 2,
-  "member-no-roster": 3,
+  unlinked: 1,
+  "member-on-roster": 2,
+  "invitation-pending": 3,
+  "member-no-roster": 4,
 }
 
 const displayName = (row: OrgMemberRow) => row.username || row.name || row.email
@@ -307,10 +375,27 @@ export function sortOrgMemberRowsBy(
 
 // The Members toolbar's "Show" facets (the roster's combined select). Status
 // keys off classification/health; role off org role — a non-member matches
-// neither role.
+// neither role. "invite-expired" is cross-classification, like the roster's:
+// an expired row keeps its classification (unlinked or not in org).
 export type OrgMembersStatusFilter =
-  "all" | "not-in-org" | "invitation-pending" | "not-enrolled"
+  | "all"
+  | "not-in-org"
+  | "invitation-pending"
+  | "unlinked"
+  | "invite-expired"
+  | "not-enrolled"
 export type OrgMembersRoleFilter = "all" | "owner" | "member"
+
+// The rows the org-invite action can send to: on a roster, not a member, no
+// live invitation, and a usable github_id (the invite is sent by id). One rule
+// for the bulk bar's eligibility count and the domain's skip guard.
+export const isInvitableToOrg = (row: OrgMemberRow): boolean =>
+  row.classification === "on-roster-not-member" &&
+  resolveGitHubId(row.github_id) !== null
+
+// How a Members row is named in progress captions and result lists.
+export const orgMemberLabel = (row: OrgMemberRow): string =>
+  row.username || row.email || row.key
 
 export function filterOrgMemberRows(
   rows: OrgMemberRow[],
@@ -326,6 +411,10 @@ export function filterOrgMemberRows(
       if (row.classification !== "on-roster-not-member") return false
     } else if (statusFilter === "invitation-pending") {
       if (row.classification !== "invitation-pending") return false
+    } else if (statusFilter === "unlinked") {
+      if (row.classification !== "unlinked") return false
+    } else if (statusFilter === "invite-expired") {
+      if (!hasExpiredInvite(row)) return false
     } else if (statusFilter === "not-enrolled") {
       if (row.unprovisionedClassrooms.length === 0) return false
     }
@@ -333,4 +422,55 @@ export function filterOrgMemberRows(
     if (roleFilter === "member") return row.isMember && !isOwner(row)
     return true
   })
+}
+
+// A failed/expired invitation GitHub still lists that no classroom can explain:
+// its email and login match no roster row in any classroom AND no active member.
+// Such a record has nothing on any roster to badge or re-invite from (the row
+// was removed, or the invitation was never Classroom 50's), so it can only be
+// dismissed, and only by an explicit owner action: an owner-sent invitation
+// unrelated to any classroom looks identical, so nothing sweeps these
+// automatically.
+export type OrphanedFailedInvitation = {
+  invitation: GitHubOrgInvitation
+  ref: FailedInvitationRef
+}
+
+export function orphanedFailedInvitations(
+  failed: GitHubOrgInvitation[],
+  members: GitHubUser[],
+  rosters: ClassroomRoster[],
+): OrphanedFailedInvitation[] {
+  const logins = new Set<string>()
+  const emails = new Set<string>()
+  for (const m of members) {
+    logins.add(m.login.toLowerCase())
+    const email = m.email?.trim().toLowerCase()
+    if (email) emails.add(email)
+  }
+  for (const roster of rosters) {
+    for (const s of roster.students) {
+      const login = s.username?.trim().toLowerCase()
+      const email = s.email?.trim().toLowerCase()
+      if (login) logins.add(login)
+      if (email) emails.add(email)
+    }
+  }
+  return failed
+    .filter((inv) => {
+      const login = inv.login?.trim().toLowerCase()
+      const email = inv.email?.trim().toLowerCase()
+      if (login && logins.has(login)) return false
+      if (email && emails.has(email)) return false
+      return true
+    })
+    .map((invitation) => ({
+      invitation,
+      ref: failedInvitationRef(invitation),
+    }))
+    .sort(
+      (a, b) =>
+        (b.ref.failed_at ?? "").localeCompare(a.ref.failed_at ?? "") ||
+        a.invitation.id - b.invitation.id,
+    )
 }

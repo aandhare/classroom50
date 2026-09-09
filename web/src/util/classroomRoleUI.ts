@@ -1,7 +1,11 @@
 import type { BadgeTone } from "@/types/badgeTone"
 import { ROLE_RANK, sortRolesByRank, type ClassroomRole } from "@/authz"
 import type { StaffRole } from "@/types/classroom"
-import type { TeamRosterRow, TeamRosterRowState } from "@/util/teamRoster"
+import type {
+  TeamRosterRow,
+  TeamRosterRowState,
+  FailedInvitationRef,
+} from "@/util/teamRoster"
 import type { MetadataField } from "@/util/rosterMetadataMerge"
 
 // Single source of truth for how a classroom role is presented and ranked.
@@ -63,6 +67,40 @@ export const STATE_LABEL_KEY: Record<TeamRosterRowState, string> = {
   needs_attention_in_org: "students.statusNeedsAttentionInOrg",
   needs_attention_not_in_org: "students.statusNeedsAttentionNotInOrg",
   unlinked: "students.statusUnlinked",
+}
+
+// The status chips for one row: the enrollment state, plus GitHub's failed
+// record when the roster attributed one ("Invitation expired" beside
+// "Unlinked" or "Not in organization"). The failure comes first because it is
+// the fact to act on; the state stays because it still names what is missing
+// (an account to link, an org membership) and is what the status filter keys
+// on. Both surfaces (table and modal) go through this so the chips can't
+// disagree between them.
+export type RowStatusBadge = { labelKey: string; tone: BadgeTone }
+
+// GitHub's failed record as a chip. One recipe for the roster and the Members
+// page: one fact, one wording across both.
+export function failedInvitationBadge(
+  failed: FailedInvitationRef,
+): RowStatusBadge {
+  return {
+    labelKey:
+      failed.kind === "expired"
+        ? "students.statusInviteExpired"
+        : "students.statusInviteFailed",
+    tone: "error",
+  }
+}
+
+export function rowStatusBadges(row: TeamRosterRow): RowStatusBadge[] {
+  const badges: RowStatusBadge[] = []
+  if (row.failed_invitation)
+    badges.push(failedInvitationBadge(row.failed_invitation))
+  badges.push({
+    labelKey: STATE_LABEL_KEY[row.state],
+    tone: STATE_BADGE_TONE[row.state],
+  })
+  return badges
 }
 
 // i18n label key per updatable roster metadata field, used by the CSV import
