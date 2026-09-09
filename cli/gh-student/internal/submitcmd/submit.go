@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,20 +187,12 @@ func submitAssignment(ctx context.Context, client githubapi.Client, verbose bool
 			)
 		}
 
-		// One deadline covers both refreshes (and every recursive call inside
-		// fetchRepoPath for .github/'s subtree): go-gh's client has no HTTP
-		// timeout of its own, and each recursive fetchRepoPath call is a
-		// fresh, unbounded request, so without an outer deadline a stalled
-		// connection partway through a deep .github/ tree hangs forever.
-		refreshCtx, cancel := context.WithTimeout(ctx, teacherFileRefreshTimeout)
-		defer cancel()
-
-		if err := fetchRepoPath(refreshCtx, client, workTree, config.Source.Owner, config.Source.Repo, config.Source.Branch, ".gitignore"); err != nil {
+		if err := fetchRepoPath(ctx, client, workTree, config.Source.Owner, config.Source.Repo, config.Source.Branch, ".gitignore"); err != nil {
 			if !classroomcfg.IsHTTPNotFound(err) {
 				return fmt.Errorf("fetch teacher .gitignore: %w", err)
 			}
 		}
-		if err := fetchRepoPath(refreshCtx, client, workTree, config.Source.Owner, config.Source.Repo, config.Source.Branch, ".github"); err != nil {
+		if err := fetchRepoPath(ctx, client, workTree, config.Source.Owner, config.Source.Repo, config.Source.Branch, ".github"); err != nil {
 			if !classroomcfg.IsHTTPNotFound(err) {
 				return fmt.Errorf("fetch teacher .github: %w", err)
 			}
@@ -228,16 +221,8 @@ func submitAssignment(ctx context.Context, client githubapi.Client, verbose bool
 		u.Detail("Pushing submission to %s %s", remote, branch)
 	}
 
-	// git has no notion of a request timeout, and a stalled TCP connection
-	// (dead wifi, VPN drop, silent firewall) can otherwise leave this step
-	// hanging far longer than any reasonable wait — OS-level TCP keepalive
-	// is the only backstop, which can take many minutes. Bind an explicit
-	// deadline instead of relying on that.
-	pushCtx, cancel := context.WithTimeout(ctx, gitNetworkTimeout)
-	defer cancel()
-
 	sha, err := commitWorkTreeOnRemoteBranch(
-		pushCtx,
+		ctx,
 		gitDir,
 		workTree,
 		remoteURL,
@@ -369,13 +354,9 @@ func fetchSubmitEntry(ctx context.Context, org string, config *classroomcfg.Conf
 // it from the temp bare clone left by commitWorkTreeOnRemoteBranch. If a
 // submit/* tag already points at sha (a retry after a tag-push failure, or a
 // hand-pushed tag), it is reused — mirroring the runner's ls-remote
-// idempotency check — so the same commit never grades twice.
-//
-// Bounded by submitTagTimeout, covering both the ls-remote probe and the tag
-// push: like the clone/push in commitWorkTreeOnRemoteBranch, these are git
-// subprocesses talking to the real remote over the network, with no timeout
-// of their own — a stalled connection here must not hang the process after
-// the branch push has already succeeded.
+// idempotency check — so the same commit never grades twice. Bounded by
+// submitTagTimeout: the branch push already landed, so a stall here must not
+// hang the terminal.
 func pushSubmitTag(ctx context.Context, gitDir, sha string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, submitTagTimeout)
 	defer cancel()
@@ -393,12 +374,6 @@ func pushSubmitTag(ctx context.Context, gitDir, sha string) (string, error) {
 	}
 	return tag, nil
 }
-
-// submitTagTimeout bounds pushSubmitTag's ls-remote probe + tag push.
-// Smaller than gitNetworkTimeout: by this point the full clone/push already
-// succeeded, so only a single small ref update remains. A var so tests can
-// shrink it.
-var submitTagTimeout = 30 * time.Second
 
 // existingSubmitTagAt returns the first submit/* tag pointing at sha on
 // origin, or "" when none. `--refs` filters the peeled-ref (^{}) rows
@@ -449,65 +424,63 @@ const assignmentNameTimeout = 3 * time.Second
 // clone/push, so the extra allowance never stalls a completed submission.
 const submitEntryTimeout = 15 * time.Second
 
-// teacherFileRefreshTimeout bounds the whole pre-push .gitignore/.github
-// refresh from the template source repo, including every recursive
-// fetchRepoPath call inside a deep .github/ tree. Generous relative to the
-// single-object timeouts above: a large .github/workflows tree is several
-// sequential requests, but it still must not be able to hang forever.
-// A var so tests can shrink it.
-var teacherFileRefreshTimeout = 30 * time.Second
+// The remaining bounds cover the calls that could otherwise hang forever on a
+// stalled connection: go-gh's client has no HTTP timeout, and git has no
+// request timeout of its own. Vars rather than consts so tests can shrink them.
+var (
+	// One GET, before anything else runs: fail fast.
+	defaultBranchTimeout = 10 * time.Second
+	// Per request inside fetchRepoPath (not one budget for the whole .github/
+	// tree), so a large tree is never penalized for being large.
+	teacherFileTimeout = 15 * time.Second
+	// Post-push ls-remote probe + tag push, both small ref updates.
+	submitTagTimeout = 30 * time.Second
+	// git's stall detector: abort a transfer that moves under 1 byte/s for
+	// this long. Catches the dead-connection case in seconds while leaving a
+	// slow but progressing clone or push alone.
+	gitStallTimeout = 30 * time.Second
+	// Hard ceiling on clone + push. The stall detector only covers HTTPS, so
+	// this is the backstop for SSH remotes; deliberately generous so it never
+	// trips on a legitimately slow transfer.
+	gitNetworkTimeout = 10 * time.Minute
+	// How long Wait() may block on a killed git's pipes. git-remote-https
+	// outlives its parent and inherits stdout/stderr, so without this a stall
+	// would survive the kill.
+	cmdWaitDelay = 5 * time.Second
+)
 
-// gitNetworkTimeout bounds the clone + push step. Generous — it covers the
-// slowest part of submit (full history clone plus push) — but finite, so a
-// stalled connection fails with a clear timeout error instead of hanging
-// indefinitely with no OS-level backstop the user can rely on. A var so
-// tests can shrink it.
-var gitNetworkTimeout = 5 * time.Minute
-
-// cmdWaitDelay bounds how long runCmd/runGitWithDirAndTree wait for a
-// subprocess's I/O pipes to close after its context is canceled. Needed
-// because a killed git process can leave a grandchild transport helper
-// (e.g. git-remote-http) running on a stalled connection, which would
-// otherwise hold Wait() open indefinitely even though git itself is dead.
-// A var so tests can shrink it.
-var cmdWaitDelay = 5 * time.Second
+// getBounded issues a GET under its own deadline and returns the raw body.
+func getBounded(ctx context.Context, client githubapi.Client, path string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	httpResp, err := client.RequestWithContext(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+	return io.ReadAll(httpResp.Body)
+}
 
 // resolveRepoDefaultBranch reads the assignment repo's default branch. A GET
 // failure is returned as an error (submitting to the wrong branch would skip
 // grading); an empty value falls back to "main" (matches an auto_init repo).
-// Bounded by defaultBranchTimeout: go-gh's default client has no HTTP
-// timeout, and this call runs before anything else in submit, so a stalled
-// network here must not hang the process silently before the spinner even
-// starts.
 func resolveRepoDefaultBranch(ctx context.Context, client githubapi.Client, owner, repo string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, defaultBranchTimeout)
-	defer cancel()
-
 	path := fmt.Sprintf("repos/%s/%s", url.PathEscape(owner), url.PathEscape(repo))
-	httpResp, err := client.RequestWithContext(ctx, http.MethodGet, path, nil)
+	raw, err := getBounded(ctx, client, path, defaultBranchTimeout)
 	if err != nil {
 		return "", fmt.Errorf("resolve default branch for %s/%s: %w", owner, repo, err)
 	}
-	defer func() { _ = httpResp.Body.Close() }()
-
 	var resp struct {
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
-		return "", fmt.Errorf("decode default branch response for %s/%s: %w", owner, repo, err)
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("resolve default branch for %s/%s: %w", owner, repo, err)
 	}
 	if resp.DefaultBranch == "" {
 		return "main", nil
 	}
 	return resp.DefaultBranch, nil
 }
-
-// defaultBranchTimeout bounds the pre-everything-else default-branch lookup.
-// Short: it's a single-object GET, and a stall here should fail fast rather
-// than eat into the user's patience before the actual submission starts.
-// A var (not const), like timeNow above, so tests can shrink it temporarily
-// to exercise the timeout path without a real 10s wait.
-var defaultBranchTimeout = 10 * time.Second
 
 func gitOutput(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
@@ -553,15 +526,9 @@ func fetchRepoPath(
 		url.QueryEscape(ref),
 	)
 
-	httpResp, err := client.RequestWithContext(ctx, http.MethodGet, apiPath, nil)
+	raw, err := getBounded(ctx, client, apiPath, teacherFileTimeout)
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", apiPath, err)
-	}
-	defer func() { _ = httpResp.Body.Close() }()
-
-	raw, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return fmt.Errorf("GET %s: read body: %w", apiPath, err)
 	}
 
 	trimmed := bytes.TrimSpace(raw)
@@ -657,13 +624,18 @@ func splitOwnerRepo(s string) (owner, repo string) {
 // commitWorkTreeOnRemoteBranch clones origin into a temporary bare repo,
 // stages workTree onto `branch`, commits with `identity`, and pushes. Returns
 // the new commit SHA (informational; the runner workflow auto-tags on its end).
+// Bounded by gitNetworkTimeout on top of the per-transfer stall detector.
 func commitWorkTreeOnRemoteBranch(ctx context.Context, gitDir string, workTree string, remoteURL string, branch string, message string, identity identitypkg.GitIdentity, out io.Writer, errOut io.Writer) (string, error) {
-	if err := runCmd(ctx, out, errOut, "", "git", "clone", "--bare", remoteURL, gitDir); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, gitNetworkTimeout)
+	defer cancel()
+
+	if err := runGit(ctx, out, errOut, "clone", "--bare", remoteURL, gitDir); err != nil {
 		return "", fmt.Errorf("clone remote history: %w", err)
 	}
 
 	git := func(args ...string) error {
-		return runGitWithDirAndTree(ctx, gitDir, workTree, out, errOut, args...)
+		fullArgs := []string{"--git-dir", gitDir, "--work-tree", workTree}
+		return runGit(ctx, out, errOut, append(fullArgs, args...)...)
 	}
 
 	ref := "refs/heads/" + branch
@@ -698,78 +670,51 @@ func commitWorkTreeOnRemoteBranch(ctx context.Context, gitDir string, workTree s
 	return strings.TrimSpace(sha), nil
 }
 
-// gitOutputWithGitDir runs `git --git-dir=<gitDir> <args>`. Separate from
-// gitOutput because rev-parsing the submitted commit runs against the bare
-// clone (no work tree). Some callers (rev-parse) are local-only, others
-// (push, ls-remote) hit the network — ctx is threaded through uniformly so
-// every caller gets the same stalled-connection backstop via cmdWaitDelay.
+// gitCmd builds a ctx-bound git invocation for the temp clone. Every call
+// gets the HTTPS stall detector and WaitDelay (see the timeout vars); both
+// are no-ops for local-only subcommands, so there is no network/local split.
+func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = append(os.Environ(),
+		"GIT_HTTP_LOW_SPEED_LIMIT=1",
+		"GIT_HTTP_LOW_SPEED_TIME="+strconv.Itoa(int(gitStallTimeout/time.Second)),
+	)
+	cmd.WaitDelay = cmdWaitDelay
+	return cmd
+}
+
+// gitErr wraps a failed git run. Only a deadline hit is reworded: Ctrl-C also
+// cancels ctx, and that must not be reported as a network problem.
+func gitErr(ctx context.Context, args []string, err error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("git timed out, the network connection appears stalled; check your connection and run `gh student submit` again")
+	}
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && len(exitErr.Stderr) > 0 {
+		return fmt.Errorf("git %v: %s", args, strings.TrimSpace(string(exitErr.Stderr)))
+	}
+	return fmt.Errorf("git %v: %w", args, err)
+}
+
+// gitOutputWithGitDir runs `git --git-dir=<gitDir> <args>` and returns stdout.
+// Separate from gitOutput because it runs against the bare clone (no work
+// tree) and is ctx-bound.
 func gitOutputWithGitDir(ctx context.Context, gitDir string, args ...string) (string, error) {
 	fullArgs := append([]string{"--git-dir", gitDir}, args...)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
-	cmd.WaitDelay = cmdWaitDelay
-	out, err := cmd.Output()
+	out, err := gitCmd(ctx, fullArgs...).Output()
 	if err != nil {
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("git %v: %w (network stalled?)", fullArgs, ctx.Err())
-		}
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			return "", fmt.Errorf("git %v: %s", fullArgs, strings.TrimSpace(string(exitErr.Stderr)))
-		}
-		return "", fmt.Errorf("git %v: %w", fullArgs, err)
+		return "", gitErr(ctx, fullArgs, err)
 	}
 	return string(out), nil
 }
 
-func runGitWithDirAndTree(
-	ctx context.Context,
-	gitDir string,
-	workTree string,
-	out io.Writer,
-	errOut io.Writer,
-	args ...string,
-) error {
-	fullArgs := []string{"--git-dir", gitDir}
-	if workTree != "" {
-		fullArgs = append(fullArgs, "--work-tree", workTree)
-	}
-	fullArgs = append(fullArgs, args...)
-
-	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+// runGit runs git with stdout/stderr streamed to the given writers.
+func runGit(ctx context.Context, out io.Writer, errOut io.Writer, args ...string) error {
+	cmd := gitCmd(ctx, args...)
 	cmd.Stdout = out
 	cmd.Stderr = errOut
-	// Bounds Wait() when ctx is canceled: CommandContext's default Cancel
-	// only kills the direct git process, not a grandchild transport helper
-	// (e.g. git-remote-http) stuck reading a stalled connection. Without
-	// WaitDelay, Wait() blocks forever on that grandchild's inherited
-	// stdout/stderr pipes even after git itself is dead.
-	cmd.WaitDelay = cmdWaitDelay
-
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("git %v: %w (network stalled?)", fullArgs, ctx.Err())
-		}
-		return fmt.Errorf("git %v: %w", fullArgs, err)
+		return gitErr(ctx, args, err)
 	}
-
-	return nil
-}
-
-func runCmd(ctx context.Context, out io.Writer, errOut io.Writer, dir string, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Stdout = out
-	cmd.Stderr = errOut
-	cmd.WaitDelay = cmdWaitDelay
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("%s %v: %w (network stalled?)", name, args, ctx.Err())
-		}
-		return fmt.Errorf("%s %v: %w", name, args, err)
-	}
-
 	return nil
 }
 
