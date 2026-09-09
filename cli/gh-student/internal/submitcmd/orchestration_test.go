@@ -1,6 +1,7 @@
 package submitcmd
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -48,7 +49,7 @@ func TestFetchRepoPath(t *testing.T) {
 	client := githubtest.NewTestClient(t, server)
 
 	dst := t.TempDir()
-	if err := fetchRepoPath(client, dst, "o", "r", "main", ".github"); err != nil {
+	if err := fetchRepoPath(context.Background(), client, dst, "o", "r", "main", ".github"); err != nil {
 		t.Fatalf("fetchRepoPath: %v", err)
 	}
 
@@ -78,7 +79,7 @@ func TestFetchRepoPath_RejectsNonBase64(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := githubtest.NewTestClient(t, server)
 
-	err := fetchRepoPath(client, t.TempDir(), "o", "r", "main", "file.txt")
+	err := fetchRepoPath(context.Background(), client, t.TempDir(), "o", "r", "main", "file.txt")
 	if err == nil || !strings.Contains(err.Error(), "unsupported encoding") {
 		t.Fatalf("err = %v, want an 'unsupported encoding' error", err)
 	}
