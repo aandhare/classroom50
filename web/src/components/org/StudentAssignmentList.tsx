@@ -5,6 +5,7 @@ import { motion } from "motion/react"
 import {
   AlertIcon,
   ArrowSwitchIcon,
+  CheckIcon,
   FileAddedIcon,
   FilterIcon,
   PeopleIcon,
@@ -26,6 +27,7 @@ import {
   ModeBadge,
 } from "@/components/assignments/AssignmentCells"
 import { GroupTeamMembersReadOnly } from "@/components/assignments/GroupTeamMembersReadOnly"
+import { StudentLastSubmittedCell } from "@/components/submissions/SubmissionRowCells"
 import { EmptyState, NoSearchResults } from "@/components/list"
 import { ClickableTr } from "@/lib/motionComponents"
 import { blockEnter } from "@/lib/motion"
@@ -33,6 +35,11 @@ import { isInteractiveEventTarget } from "@/util/interactiveTarget"
 import { useGithubAuth } from "@/auth/useGithubAuth"
 import usePagesAssignments from "@/hooks/usePagesAssignments"
 import useGetOrgRepos from "@/hooks/useGetMyOrgRepos"
+import {
+  useMySubmittedAssignments,
+  type AcceptedAssignmentRepo,
+  type MySubmissionState,
+} from "@/hooks/useMySubmittedAssignments"
 import { useClassroomSecret } from "@/hooks/useStudentClassrooms"
 import { useListPrefsState } from "@/lib/listPrefs"
 import { studentAssignmentListPrefs } from "@/lib/studentAssignmentListPrefs"
@@ -40,8 +47,10 @@ import {
   DEFAULT_STUDENT_FILTERS,
   filterAndSortStudentAssignments,
   isListableToStudent,
+  studentAssignmentStatus,
   type StudentAssignmentFilters,
   type StudentAssignmentSort,
+  type StudentAssignmentStatus,
 } from "@/components/org/studentAssignmentFilters"
 import { studentRepoName, parseGroupRepoCounter } from "@/util/studentRepo"
 import type { Assignment } from "@/types/classroom"
@@ -95,8 +104,37 @@ type AssignmentItemProps = {
   org: string
   classroom: string
   assignment: Assignment
-  accepted: boolean
+  // Undefined until accepted: the submission read only runs on accepted repos.
+  submission?: MySubmissionState
   secret?: string
+}
+
+// The Status column: the one place a student reads "is my work in?". Only
+// "Not accepted" is alarming (red); "Accepted" is neutral progress and
+// "Submitted" the green all-clear.
+function StatusBadge({ status }: { status: StudentAssignmentStatus }) {
+  const { t } = useTranslation()
+  if (status === "submitted") {
+    return (
+      <Badge tone="success" className="shrink-0 gap-1 whitespace-nowrap">
+        <CheckIcon aria-hidden="true" className="size-4" />
+        {t("assignments.discover.submitted")}
+      </Badge>
+    )
+  }
+  if (status === "accepted") {
+    return (
+      <Badge tone="info" className="whitespace-nowrap">
+        {t("assignments.discover.accepted")}
+      </Badge>
+    )
+  }
+  return (
+    <Badge tone="error" className="shrink-0 gap-1 whitespace-nowrap">
+      <AlertIcon aria-hidden="true" className="size-4" />
+      {t("assignments.discover.notAccepted")}
+    </Badge>
+  )
 }
 
 // One assignment row, teacher-table style: name + slug, shared type/due
@@ -107,12 +145,18 @@ function AssignmentRow({
   org,
   classroom,
   assignment,
-  accepted,
+  submission,
   secret,
 }: AssignmentItemProps) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const [groupOpen, setGroupOpen] = useState(false)
+  const accepted = submission !== undefined
+  const status = studentAssignmentStatus(
+    accepted,
+    submission?.kind === "submitted",
+  )
+  const settling = submission?.kind === "pending"
   // Accepted team-mode rows get a secondary "View group" action: a read-only
   // look at who shares the repo, without leaving the list.
   const showViewGroup = accepted && assignment.mode === "team"
@@ -153,18 +197,38 @@ function AssignmentRow({
         <ModeBadge mode={assignment.mode} />
       </td>
       <td>
-        <DueDateCell due={assignment.due} relative />
+        {/* Red only once the read has settled on "nothing in": a pending or
+            failed read must not alarm, and a submission clears it. */}
+        <DueDateCell
+          due={assignment.due}
+          relative
+          highlightOverdue={!submission || submission.kind === "none"}
+        />
       </td>
       <td>
-        {accepted ? (
-          <Badge tone="success" className="whitespace-nowrap">
-            {t("assignments.discover.accepted")}
-          </Badge>
+        <StudentLastSubmittedCell
+          className="max-xl:text-xs xl:text-sm"
+          settling={settling}
+          datetime={
+            submission?.kind === "submitted" ? submission.latestAt : undefined
+          }
+          fallback={t(
+            submission?.kind === "unknown"
+              ? "assignments.discover.submissionUnknown"
+              : submission?.kind === "submitted"
+                ? "assignments.discover.submitted"
+                : "submissions.student.notSubmittedYet",
+          )}
+        />
+      </td>
+      <td>
+        {settling ? (
+          <div
+            aria-busy="true"
+            className="skeleton skeleton-shimmer h-4 w-20 rounded-full"
+          />
         ) : (
-          <Badge tone="error" className="shrink-0 gap-1 whitespace-nowrap">
-            <AlertIcon aria-hidden="true" className="size-4" />
-            {t("assignments.discover.notAccepted")}
-          </Badge>
+          <StatusBadge status={status} />
         )}
       </td>
       {/* Quarantined from the row click so a near-miss around the CTA never
@@ -241,6 +305,7 @@ function TableHead({
           onSortChange={onSortChange}
           title={t("assignments.table.sortByDue")}
         />
+        <th scope="col">{t("submissions.table.colLastSubmitted")}</th>
         <th scope="col">{t("assignments.discover.colStatus")}</th>
         <th scope="col">
           <span className="sr-only">{t("assignments.discover.colAction")}</span>
@@ -254,13 +319,15 @@ const SKELETON_BARS = [
   "h-4 w-40",
   "h-4 w-20",
   "h-4 w-28",
+  "h-4 w-32",
   "h-4 w-24",
   "ms-auto h-8 w-28",
 ]
 
-// Student-relevant toolbar: search, plus status (to-do vs accepted — the axis a
-// student cares about most), type, and an overdue filter, with a due-first sort.
-// Deliberately omits teacher-only facets (there's no roster/publish/edit here).
+// Student-relevant toolbar: search, plus status (to do vs accepted vs submitted
+// — the axis a student cares about most), type, and an overdue filter, with a
+// due-first sort. Deliberately omits teacher-only facets (there's no
+// roster/publish/edit here).
 function StudentAssignmentsToolbar({
   query,
   onQueryChange,
@@ -318,6 +385,9 @@ function StudentAssignmentsToolbar({
         </option>
         <option value="accepted">
           {t("assignments.discover.toolbar.statusAccepted")}
+        </option>
+        <option value="submitted">
+          {t("assignments.discover.toolbar.statusSubmitted")}
         </option>
       </Toolbar.FilterSelect>
 
@@ -429,37 +499,67 @@ export function StudentAssignmentList({
   // fold its load into the gate so a row never paints "Accept" and then
   // flips to "View my submission" once the repos land.
   const { data: repos, isLoading: loadingRepos } = useGetOrgRepos(org)
-  const isLoading = loadingSecret || loadingAssignmentsData || loadingRepos
 
-  const acceptedSlugs = useMemo(() => {
-    const set = new Set<string>()
+  // Each accepted assignment with the repo that acceptance resolved to, so the
+  // submission read below targets the exact repo (the group's, in team mode)
+  // without a second membership lookup.
+  const acceptedRepos = useMemo(() => {
+    const list: AcceptedAssignmentRepo[] = []
     const login = user?.login
-    if (!login) return set
-    // Set of the student's own writable repo names, then match each assignment's
-    // canonical repo name against it (one pass each — no nested filter).
-    const writableNames = new Set(
+    if (!login) return list
+    // The student's own writable repos by lowercased name, then match each
+    // assignment's canonical repo name against it (one pass each — no nested
+    // filter).
+    const writable = new Map(
       (repos ?? [])
         .filter((repo) => repo.permissions?.push)
-        .map((repo) => repo.name.toLowerCase()),
+        .map((repo) => [repo.name.toLowerCase(), repo] as const),
     )
+    const push = (a: Assignment, name: string) =>
+      list.push({
+        assignment: a,
+        repo: name,
+        defaultBranch: writable.get(name)?.default_branch,
+      })
     for (const a of assignments ?? []) {
       if (a.mode === "team") {
         // A team-mode repo is named after the group counter, not the login;
         // the viewer's push on any `<classroom>-<slug>-group-<n>` repo (via
         // the team attachment) means their group accepted. Mode-gated parse —
         // `group-3` is also a valid username shape.
-        for (const name of writableNames) {
+        for (const name of writable.keys()) {
           if (parseGroupRepoCounter(name, classroom, a.slug) !== null) {
-            set.add(a.slug)
+            push(a, name)
             break
           }
         }
-      } else if (writableNames.has(studentRepoName(classroom, a.slug, login))) {
-        set.add(a.slug)
+      } else {
+        const name = studentRepoName(classroom, a.slug, login)
+        if (writable.has(name)) push(a, name)
       }
     }
-    return set
+    return list
   }, [repos, assignments, classroom, user?.login])
+
+  const acceptedSlugs = useMemo(
+    () => new Set(acceptedRepos.map(({ assignment }) => assignment.slug)),
+    [acceptedRepos],
+  )
+
+  // One read per accepted repo, settling per row (shimmer in the Status and
+  // Last submitted cells) rather than holding the whole table: a slow repo, or
+  // a repo accepted while the list is open, must not blank rows already shown.
+  const submissions = useMySubmittedAssignments(org, acceptedRepos)
+  const submittedSlugs = useMemo(
+    () =>
+      new Set(
+        Object.entries(submissions)
+          .filter(([, state]) => state.kind === "submitted")
+          .map(([slug]) => slug),
+      ),
+    [submissions],
+  )
+  const isLoading = loadingSecret || loadingAssignmentsData || loadingRepos
 
   const visible = useMemo(
     () =>
@@ -468,8 +568,9 @@ export function StudentAssignmentList({
         filters,
         sort: sortKey,
         acceptedSlugs,
+        submittedSlugs,
       }),
-    [assignments, query, filters, sortKey, acceptedSlugs],
+    [assignments, query, filters, sortKey, acceptedSlugs, submittedSlugs],
   )
 
   // Assignments listable to this student ignoring the search/status/type/due
@@ -572,7 +673,7 @@ export function StudentAssignmentList({
                 org={org}
                 classroom={classroom}
                 assignment={assignment}
-                accepted={acceptedSlugs.has(assignment.slug)}
+                submission={submissions[assignment.slug]}
                 secret={secret}
               />
             ))}

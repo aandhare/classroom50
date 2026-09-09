@@ -114,9 +114,23 @@ export function detectBranchSubmissions(
     label: c.sha.slice(0, 7),
     count: 1,
     sha: c.sha,
-    datetime: c.commit.committer?.date ?? c.commit.author?.date,
+    datetime: commitDatetime(c),
     author: commitAuthor(c),
   }))
+}
+
+// A commit's time: the committer's (when the push landed) over the author's.
+export function commitDatetime(c: GitHubCommit): string | undefined {
+  return c.commit.committer?.date ?? c.commit.author?.date
+}
+
+// The newest push submission's time from a newest-first list (the order the
+// commit log and submissionCommits preserve). Null before the first push.
+export function latestPushSubmittedAt(
+  pushes: GitHubCommit[] | undefined,
+): string | null {
+  const newest = pushes?.[0]
+  return newest ? (commitDatetime(newest) ?? null) : null
 }
 
 // The submission time encoded in a canonical submit/<UTC-ts>-<short-sha> tag
@@ -131,6 +145,15 @@ export function submitTagDatetime(tagName: string): string | undefined {
   if (!m) return undefined
   const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`
   return Number.isFinite(new Date(iso).getTime()) ? iso : undefined
+}
+
+// The tag patterns that count as submissions: the teacher's milestone patterns
+// unioned with the always-on canonical submit/* namespace, mirroring the shim's
+// trigger. Without submit/* a tag-mode assignment with no milestone patterns
+// (the common case, where students push submit/* via `gh student submit`) would
+// detect nothing. The one source for every tag-mode reader.
+export function submissionTagPatterns(submissionTags?: string[]): string[] {
+  return [...(submissionTags ?? []), `${SUBMISSION_TAG_PREFIX}*`]
 }
 
 // Tag mode: for each configured pattern, an EXACT pattern yields one submission
