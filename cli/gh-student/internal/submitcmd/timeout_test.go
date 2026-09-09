@@ -1,9 +1,7 @@
 package submitcmd
 
-// Regression guards for #932: each network step in submit must return (with
-// an error) against a connection that accepts but never answers, instead of
-// blocking until Ctrl-C. Timeouts are shrunk so the tests run in well under
-// the 2s ceiling that would flag a return to "hangs forever".
+// Regression guards for #932: every network step in submit must return an
+// error against a connection that accepts but never answers.
 
 import (
 	"context"
@@ -24,8 +22,8 @@ import (
 
 const stallCeiling = 2 * time.Second
 
-// stalledServer accepts requests and holds them open until the client gives
-// up, so its Close() never blocks on a handler.
+// stalledServer holds every request open until the client gives up, so
+// Close() never blocks on a handler.
 func stalledServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -35,9 +33,8 @@ func stalledServer(t *testing.T) *httptest.Server {
 	return server
 }
 
-// stalledRemoteURL returns an http:// git URL to a socket that completes the
-// TCP handshake (the kernel's listen backlog does that) but never sends a
-// byte, which is what a dead VPN or silent firewall looks like to git.
+// stalledRemoteURL points at a socket that completes the TCP handshake (via
+// the listen backlog) but never sends a byte, like a dead VPN looks to git.
 func stalledRemoteURL(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -89,8 +86,8 @@ func TestFetchRepoPath_FailsFastOnStall(t *testing.T) {
 	}
 }
 
-// The stall detector, not the overall ceiling, is what should fire on a dead
-// HTTPS remote: git exits on its own, so the error is git's, not a deadline.
+// On a dead HTTPS remote the stall detector, not the ceiling, should fire: git
+// exits on its own and the error is git's, not a deadline.
 func TestCommitWorkTreeOnRemoteBranch_StallDetectorAbortsClone(t *testing.T) {
 	setTimeout(t, &gitStallTimeout, time.Second) // git's minimum granularity
 	setTimeout(t, &cmdWaitDelay, 50*time.Millisecond)
@@ -108,8 +105,8 @@ func TestCommitWorkTreeOnRemoteBranch_StallDetectorAbortsClone(t *testing.T) {
 	}
 }
 
-// The ceiling is the SSH backstop (the stall detector is HTTPS-only), so it
-// must also end a stalled clone on its own and say what to do next.
+// The ceiling is the SSH backstop, so it must end a stalled clone on its own
+// and say what to do next.
 func TestCommitWorkTreeOnRemoteBranch_CeilingAbortsClone(t *testing.T) {
 	setTimeout(t, &gitNetworkTimeout, 200*time.Millisecond)
 	setTimeout(t, &cmdWaitDelay, 50*time.Millisecond)
@@ -127,8 +124,7 @@ func TestCommitWorkTreeOnRemoteBranch_CeilingAbortsClone(t *testing.T) {
 	}
 }
 
-// Ctrl-C cancels the root context; that must surface as a plain cancellation,
-// not as network advice.
+// Ctrl-C cancels the root context; that must not read as network advice.
 func TestRunGit_CancelIsNotReportedAsStall(t *testing.T) {
 	setTimeout(t, &cmdWaitDelay, 50*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
