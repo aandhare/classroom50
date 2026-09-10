@@ -6,7 +6,7 @@ import type { NormalizedScores, SubmissionRow } from "./scores"
 import type { GitHubRepo } from "@/github-core/types"
 import { latestDetectedAt } from "@/domain/assignments/submissionDetection"
 import { existingAssignmentRepos } from "@/domain/assignments/assignmentRepoPresence"
-import { isNoAutograderAssignment } from "@/domain/assignments/autogradingState"
+import { assignmentSkipsGrading } from "@/domain/assignments/autogradingState"
 import type { DetectedSubmission } from "@/domain/assignments/submissionDetection"
 import type { Assignment, Student } from "@/types/classroom"
 import type { GroupTeamRef } from "@/domain/teams/groupTeams"
@@ -422,7 +422,7 @@ export function snapshotIsStale(
 //
 // An options object, like effectiveCollectedAt below: the two slug lists share
 // a type, and positional args let a transposition compile clean while silently
-// re-latching the empty_repo badge this exclusion exists to prevent.
+// latching a badge no collect could clear.
 export function classroomSnapshotIsStale({
   repos,
   classroom,
@@ -433,15 +433,13 @@ export function classroomSnapshotIsStale({
 }: {
   repos: GitHubRepo[] | null | undefined
   classroom: string
-  // The slugs asked whether they are behind — collectable assignments only.
+  // The slugs asked whether they are behind.
   measuredSlugs: string[]
   collectedAt: Record<string, string> | undefined
   runCollectedAt?: string | null
-  // Every slug in the classroom, when that differs from the slugs being
-  // measured: the sibling guard needs the complete list even where a slug is
-  // excluded from the question (an empty_repo assignment is never collected,
-  // so it has no stamp to compare against, but its repos still shadow a
-  // slug-extending sibling). Defaults to the measured slugs.
+  // Every slug in the classroom, when a measured slug's repos must still be
+  // shadowed by a slug-extending sibling left out of the question. Defaults
+  // to the measured slugs.
   allSlugs?: string[]
 }): boolean {
   if (!repos || measuredSlugs.length === 0) return false
@@ -565,9 +563,9 @@ export function computeStats(
   let late = 0
   for (const row of rows) {
     // A pending live row (a submit/* release the collector hasn't ingested yet)
-    // carries a placeholder 0/0 and no real grade — exclude it from every graded
-    // tally (matching classAverage), so an uncollected submitter doesn't inflate
-    // `submitted`/`ungraded` in the Metrics summary of the collected snapshot.
+    // carries a placeholder 0/0 and no real grade, so it is excluded from every
+    // graded tally: an uncollected submitter must not inflate `submitted` or
+    // `ungraded`.
     if (row.pending) continue
     submitted++
     switch (rowPassState(row, thresholdFraction)) {
@@ -590,23 +588,6 @@ export function computeStats(
     ungraded,
     late,
   }
-}
-
-// Mean of the numeric scores, rounded to 2 decimals, or null when none is finite
-// (rendered "N/A"). Avoids the old `sum/length || 1` bug where an empty/NaN
-// result showed "1" (`/` binds before `||`). Pending live rows (a submit/*
-// release the collector hasn't ingested yet) carry a placeholder 0/0 and no
-// real grade, so they're excluded — otherwise every uncollected submitter would
-// drag the average toward 0, the opposite of the intended presence signal.
-export function classAverage(rows: SubmissionRow[]): number | null {
-  const numericScores = rows
-    .filter((row) => !row.pending)
-    .map((row) => Number(row["score"]))
-    .filter((n) => Number.isFinite(n))
-  if (numericScores.length === 0) return null
-  const avg =
-    numericScores.reduce((sum, n) => sum + n, 0) / numericScores.length
-  return Math.round(avg * 100) / 100
 }
 
 // Filters the dashboard exposes. Each is independent ("all" = no constraint);
@@ -946,17 +927,6 @@ export function applyStatusSelection(
   }
 }
 
-// Count of ROSTER students who accepted. Intersecting with the roster keeps the
-// "Accepted N / roster" stat from exceeding its denominator when `accepted`
-// includes non-roster owners (an unenrolled student, a stray test repo).
-export function acceptedRosterCount(
-  students: Student[],
-  accepted: Set<string>,
-): number {
-  return students.filter((student) => hasAccepted(student.username, accepted))
-    .length
-}
-
 // Case-insensitive match of a query against a row's identities: each credited
 // username plus its roster display name (so searching a real name works though
 // scores.json only carries logins).
@@ -981,13 +951,11 @@ export function rowMatchesQuery(
 // roster in name order with no grade-implying filter. A time sort, or a status/
 // passing filter that implies a grade, drops that owner from the page's owner
 // set until a collect ingests it. Used to surface an honest hint instead of
-// hiding the sort/status controls. False when the overlay doesn't apply.
+// hiding the sort/status controls.
 export function pendingMayHide(
-  liveCapable: boolean,
   sort: SubmissionSort,
   filters: SubmissionFilters,
 ): boolean {
-  if (!liveCapable) return false
   return (
     !isNameSort(sort) ||
     filters.submission !== "all" ||
@@ -1634,20 +1602,30 @@ export function orgReposReadEnabled(args: {
   return !args.assignmentLoading && (args.isGroupFlavor || !args.rosterLoading)
 }
 
+// Which overlays the Submissions page layers over the collected snapshot. Live
+// presence reads submit/* releases, which an assignment that never autogrades
+// (empty_repo, no_autograder) never produces; detection reads raw repo state,
+// so it applies to every shape once the entry has resolved (an undefined mode
+// would count a tag-mode assignment in branch mode). For the never-autograding
+// shapes detection is the only way a submission shows at all (#659, #950).
+export function overlayCapabilities(args: {
+  assignmentResolved: boolean
+  skipsGrading: boolean
+}): { liveCapable: boolean; detectionCapable: boolean } {
+  return {
+    liveCapable: !args.skipsGrading,
+    detectionCapable: args.assignmentResolved,
+  }
+}
+
 // Whether to show "Checking who accepted..." in place of the submission
 // progress bar: the bar's denominator comes from the org repo read, so until
-// that resolves the wait is explained where the bar will appear. Never for an
-// empty_repo assignment, which has no repos to check.
+// that resolves the wait is explained where the bar will appear.
 export function showCheckingAccepted(args: {
   showSubmissionProgress: boolean
   orgReposPending: boolean
-  isEmptyRepoAssignment: boolean
 }): boolean {
-  return (
-    !args.showSubmissionProgress &&
-    args.orgReposPending &&
-    !args.isEmptyRepoAssignment
-  )
+  return !args.showSubmissionProgress && args.orgReposPending
 }
 
 // See assignmentFunnelCounts for what each count means.
@@ -1682,9 +1660,9 @@ export type FunnelRoster = {
 // writes entries for owners detection also lists (#659).
 //
 // `notCollected`: a `detected` key that is absent (not `[]`) means no collect
-// has walked the bucket yet. Only claimed for no_autograder, whose entries are
-// never autogenerated; an autograded bucket written before detection existed
-// has entries but no key.
+// has walked the bucket yet. Only claimed for never-autograding shapes, whose
+// entries are never autogenerated; an autograded bucket written before
+// detection existed has entries but no key.
 //
 // `accepted`: this assignment's existing repos, reverse-parsed from the org repo
 // list. Individual student repos and group repos share the
@@ -1726,7 +1704,7 @@ export function assignmentFunnelCounts(
     submitted: gradedRows.length + detectedOnly,
     accepted: repos?.filter((repo) => counts(repo.owner)).length,
     notCollected:
-      isNoAutograderAssignment(assignment) &&
+      assignmentSkipsGrading(assignment) &&
       !detectedRows &&
       gradedRows.length === 0,
     hiddenStaffRepos: join

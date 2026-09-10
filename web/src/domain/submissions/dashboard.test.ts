@@ -6,7 +6,6 @@ import type { Student } from "@/types/classroom"
 import type { TeamRosterRow } from "@/util/teamRoster"
 import {
   DEFAULT_FILTERS,
-  acceptedRosterCount,
   acceptedUsernames,
   applyStatusSelection,
   assignmentRepoNames,
@@ -16,7 +15,6 @@ import {
   buildSortedDisplayItems,
   buildScoresCsvRows,
   buildSectionLookup,
-  classAverage,
   classroomSnapshotIsStale,
   computeStats,
   displayItemOwner,
@@ -45,6 +43,7 @@ import {
   scoreTone,
   selectActiveWorkflowAction,
   showCheckingAccepted,
+  overlayCapabilities,
   showsNonSubmitters,
   snapshotIsStale,
   statusSelectValue,
@@ -321,7 +320,7 @@ describe("computeStats", () => {
     })
   })
 
-  it("excludes pending live-only rows from every graded tally (matching classAverage)", () => {
+  it("excludes pending live-only rows from every graded tally", () => {
     const rows = [
       row({ score: 9, "max-score": 10 }), // graded, passing at 0.7
       row({ owner: "bob", score: 0, "max-score": 0, pending: true }), // uncollected
@@ -484,7 +483,7 @@ describe("filterAndSortRows", () => {
   })
 })
 
-describe("acceptedUsernames / hasAccepted / acceptedRosterCount", () => {
+describe("acceptedUsernames / hasAccepted", () => {
   const roster = [
     student({ username: "alice" }),
     student({ username: "bob" }),
@@ -544,11 +543,6 @@ describe("acceptedUsernames / hasAccepted / acceptedRosterCount", () => {
   it("returns an empty set for null/undefined repos", () => {
     expect(acceptedUsernames(null, "cs101", "hw1", roster).size).toBe(0)
     expect(acceptedUsernames(undefined, "cs101", "hw1", roster).size).toBe(0)
-  })
-
-  it("counts roster students who accepted", () => {
-    const set = acceptedUsernames(repos, "cs101", "hw1", roster)
-    expect(acceptedRosterCount(roster, set)).toBe(2)
   })
 })
 
@@ -1335,15 +1329,6 @@ describe("statusSelectValue / applyStatusSelection", () => {
 })
 
 describe("pending rows (collector-emitted, not graded)", () => {
-  it("pending rows are excluded from the class average", () => {
-    const rows = [
-      row({ owner: "alice", score: 10, "max-score": 10 }),
-      row({ owner: "bob", score: 0, "max-score": 0, pending: true }),
-    ]
-    // Only alice's 10 counts; bob's placeholder 0 must not drag it to 5.
-    expect(classAverage(rows)).toBe(10)
-  })
-
   it("pending rows export a blank score/max, not a graded zero", () => {
     const rows = [
       row({
@@ -1551,7 +1536,7 @@ describe("classroomSnapshotIsStale", () => {
     ).toBe(false)
   })
 
-  // An excluded slug (empty_repo) still has to shadow a slug-extending
+  // A slug left out of the question still has to shadow a slug-extending
   // sibling, so the guard list stays complete while the measured list shrinks.
   it("keeps the sibling guard complete when a slug is excluded", () => {
     const withSibling = [
@@ -2333,23 +2318,13 @@ describe("teamMissingForOwner", () => {
 })
 
 describe("pendingMayHide", () => {
-  it("is false when the overlay does not apply (not live-capable)", () => {
-    expect(pendingMayHide(false, "recent", DEFAULT_FILTERS)).toBe(false)
-    expect(
-      pendingMayHide(false, "name-first", {
-        ...DEFAULT_FILTERS,
-        submission: "submitted",
-      }),
-    ).toBe(false)
-  })
-
   it("is false for a live name sort with no grade-implying filter", () => {
-    expect(pendingMayHide(true, "name-first", DEFAULT_FILTERS)).toBe(false)
-    expect(pendingMayHide(true, "name-last", DEFAULT_FILTERS)).toBe(false)
+    expect(pendingMayHide("name-first", DEFAULT_FILTERS)).toBe(false)
+    expect(pendingMayHide("name-last", DEFAULT_FILTERS)).toBe(false)
     // Section + query don't reorder the snapshot spine, so a live-only owner is
     // still placeable — no hint.
     expect(
-      pendingMayHide(true, "name-first", {
+      pendingMayHide("name-first", {
         ...DEFAULT_FILTERS,
         section: "A",
       }),
@@ -2357,19 +2332,19 @@ describe("pendingMayHide", () => {
   })
 
   it("is true for a live time sort", () => {
-    expect(pendingMayHide(true, "recent", DEFAULT_FILTERS)).toBe(true)
-    expect(pendingMayHide(true, "oldest", DEFAULT_FILTERS)).toBe(true)
+    expect(pendingMayHide("recent", DEFAULT_FILTERS)).toBe(true)
+    expect(pendingMayHide("oldest", DEFAULT_FILTERS)).toBe(true)
   })
 
   it("is true for a live name sort with a grade-implying status/passing filter", () => {
     expect(
-      pendingMayHide(true, "name-first", {
+      pendingMayHide("name-first", {
         ...DEFAULT_FILTERS,
         submission: "submitted",
       }),
     ).toBe(true)
     expect(
-      pendingMayHide(true, "name-first", {
+      pendingMayHide("name-first", {
         ...DEFAULT_FILTERS,
         passing: "passing",
       }),
@@ -2714,33 +2689,39 @@ describe("showCheckingAccepted", () => {
       showCheckingAccepted({
         showSubmissionProgress: false,
         orgReposPending: true,
-        isEmptyRepoAssignment: false,
       }),
     ).toBe(true)
     expect(
       showCheckingAccepted({
         showSubmissionProgress: true,
         orgReposPending: true,
-        isEmptyRepoAssignment: false,
       }),
     ).toBe(false)
     expect(
       showCheckingAccepted({
         showSubmissionProgress: false,
         orgReposPending: false,
-        isEmptyRepoAssignment: false,
       }),
     ).toBe(false)
   })
+})
 
-  it("never shows for an empty_repo assignment", () => {
+describe("overlayCapabilities", () => {
+  it("detects every resolved shape; live only where releases exist", () => {
+    // empty_repo and no_autograder (skipsGrading) never produce submit/*
+    // releases, so detection is what makes their submissions visible (#950).
     expect(
-      showCheckingAccepted({
-        showSubmissionProgress: false,
-        orgReposPending: true,
-        isEmptyRepoAssignment: true,
-      }),
-    ).toBe(false)
+      overlayCapabilities({ assignmentResolved: true, skipsGrading: true }),
+    ).toEqual({ liveCapable: false, detectionCapable: true })
+    expect(
+      overlayCapabilities({ assignmentResolved: true, skipsGrading: false }),
+    ).toEqual({ liveCapable: true, detectionCapable: true })
+  })
+
+  it("holds detection until the entry resolves (mode unknown)", () => {
+    expect(
+      overlayCapabilities({ assignmentResolved: false, skipsGrading: false }),
+    ).toEqual({ liveCapable: true, detectionCapable: false })
   })
 })
 
@@ -2881,21 +2862,25 @@ describe("assignmentFunnelCounts", () => {
     })
   })
 
-  it("flags a no_autograder bucket no collect has walked, but not an autograded one", () => {
-    const skipping = assignment({ no_autograder: true })
-    expect(
-      assignmentFunnelCounts(skipping, scores({}), [], "cs", []).notCollected,
-    ).toBe(true)
-    // A `detected: []` means a collect walked it and found nobody.
-    expect(
-      assignmentFunnelCounts(
-        skipping,
-        scores({ detected: { hw1: [] } }),
-        [],
-        "cs",
-        [],
-      ).notCollected,
-    ).toBe(false)
+  it("flags a never-autograding bucket no collect has walked, but not an autograded one", () => {
+    for (const skipping of [
+      assignment({ no_autograder: true }),
+      assignment({ empty_repo: true }),
+    ]) {
+      expect(
+        assignmentFunnelCounts(skipping, scores({}), [], "cs", []).notCollected,
+      ).toBe(true)
+      // A `detected: []` means a collect walked it and found nobody.
+      expect(
+        assignmentFunnelCounts(
+          skipping,
+          scores({ detected: { hw1: [] } }),
+          [],
+          "cs",
+          [],
+        ).notCollected,
+      ).toBe(false)
+    }
     expect(
       assignmentFunnelCounts(assignment(), scores({}), [], "cs", [])
         .notCollected,

@@ -2702,23 +2702,59 @@ class TestDetectionReusesTheListing:
         self._stub_walk(monkeypatch, calls)
         got = cs.detect_repo_submissions(
             "https://api.github.com", "cs50", "cs-hw1-alice", "tok", "every-push", [],
-            facts=cs.RepoFacts(True, default_branch="main", size=12),
+            facts=cs.RepoFacts(True, default_branch="main"),
         )
         assert calls == ["baseline", "commits"]
         assert [d["sha"] for d in got] == ["s1"]
 
-    def test_commitless_repo_is_answered_without_a_request(self, monkeypatch):
+    def test_listing_size_is_never_a_commitless_verdict(self, monkeypatch):
+        # GitHub computes `size` lazily, so a bare repo a student just pushed to
+        # still lists as 0 for minutes (#544). The listing used to short-circuit
+        # such a repo to "no submissions" without a read, which recorded a real
+        # first push as nothing for that run (#950 review). repo_facts drops the
+        # field, so the reads always run.
         calls: list[str] = []
         self._stub_walk(monkeypatch, calls)
-        monkeypatch.setattr(
-            cs, "list_repo_tags", lambda *a, **k: calls.append("tags") or []
+        facts = cs.repo_facts(
+            {"name": "r", "private": True, "default_branch": "main", "size": 0}
         )
+        got = cs.detect_repo_submissions(
+            "https://api.github.com", "cs50", "cs-hw1-alice", "tok", "every-push", [],
+            facts=facts,
+        )
+        assert calls == ["baseline", "commits"]
+        assert [d["sha"] for d in got] == ["s1"]
+
+    def test_commitless_repo_reads_as_nothing_in_both_modes(self, monkeypatch):
+        # A repo with no commits answers 409 "Git Repository is empty" to every
+        # commit and tag read: no submissions, not a failed read.
+        def empty_repo(*a, **k):
+            raise http_error(409, {}, b'{"message":"Git Repository is empty."}')
+
+        monkeypatch.setattr(cs, "oldest_commit_sha_for_path", empty_repo)
+        monkeypatch.setattr(cs, "list_default_branch_commits", empty_repo)
+        monkeypatch.setattr(cs, "list_repo_tags", empty_repo)
         for mode in ("every-push", "tag"):
             assert cs.detect_repo_submissions(
                 "https://api.github.com", "cs50", "cs-hw1-alice", "tok", mode, [],
-                facts=cs.RepoFacts(True, default_branch="main", size=0),
+                facts=cs.RepoFacts(True, default_branch="main"),
             ) == []
-        assert calls == []
+
+    def test_non_409_read_errors_propagate(self, monkeypatch):
+        # Only the empty-repo 409 reads as "nothing"; anything else must reach
+        # SubmissionDetector.detect so classify() still decides skip vs abort
+        # (a swallowed 500 would delete the owner's prior record).
+        def boom(*a, **k):
+            raise http_error(500, {}, b"boom")
+
+        monkeypatch.setattr(cs, "oldest_commit_sha_for_path", lambda *a, **k: None)
+        monkeypatch.setattr(cs, "list_default_branch_commits", boom)
+        with pytest.raises(cs.urllib.error.HTTPError) as exc:
+            cs.detect_repo_submissions(
+                "https://api.github.com", "cs50", "cs-hw1-alice", "tok", "every-push", [],
+                facts=cs.RepoFacts(True, default_branch="main"),
+            )
+        assert exc.value.code == 500
 
     def test_no_facts_reads_the_repo_as_before(self, monkeypatch):
         calls: list[str] = []
@@ -2739,7 +2775,7 @@ class TestDetectionReusesTheListing:
         monkeypatch.setattr(
             cs, "list_org_repos",
             lambda *a, **k: {
-                "cs-hw1-alice": cs.RepoFacts(True, default_branch="trunk", size=3)
+                "cs-hw1-alice": cs.RepoFacts(True, default_branch="trunk")
             },
         )
         index = cs.RepoIndex("https://api.github.com", "cs50", "tok")
@@ -2749,16 +2785,16 @@ class TestDetectionReusesTheListing:
             due=None, repo_index=index,
         )
         detector.detect("alice", "cs-hw1-alice")
-        assert seen["facts"] == cs.RepoFacts(True, default_branch="trunk", size=3)
+        assert seen["facts"] == cs.RepoFacts(True, default_branch="trunk")
 
-    def test_listing_keeps_default_branch_and_size(self):
+    def test_listing_keeps_default_branch_only(self):
         facts = cs.repo_facts(
             {"name": "r", "private": True, "default_branch": "main", "size": 0}
         )
-        assert facts == cs.RepoFacts(True, "main", 0)
+        assert facts == cs.RepoFacts(True, "main")
         # Anything malformed is simply unknown; `private` stays strict.
-        assert cs.repo_facts({"name": "r", "private": "yes", "size": True}) == (
-            cs.RepoFacts(False, None, None)
+        assert cs.repo_facts({"name": "r", "private": "yes"}) == (
+            cs.RepoFacts(False, None)
         )
 
 
@@ -3339,7 +3375,7 @@ class TestCollectedAtStamp:
         assert collected == {}
 
     def test_collect_classroom_reports_only_walked_slugs(self, monkeypatch):
-        # The filtered-out sibling and the never-grading assignment are not
+        # The filtered-out siblings (graded and never-grading alike) are not
         # walked, so neither may be stamped; the group assignment reports its
         # mode so an absent bucket can be scaffolded with the right type.
         stub_team_members(monkeypatch, ["alice"])
@@ -3591,6 +3627,65 @@ def test_collect_classroom_detects_no_autograder_assignment(monkeypatch, capsys)
     assert collected["ci-lab"] == "individual"
 
 
+def test_collect_classroom_detects_empty_repo_assignment(monkeypatch, capsys):
+    # A bare empty_repo assignment used to be skipped outright, leaving every
+    # student "awaiting submission" no matter what they pushed (#950).
+    def fail_releases(*args, **kwargs):
+        raise AssertionError("empty_repo repos must not be polled for releases")
+
+    monkeypatch.setattr(cs, "all_submit_releases", fail_releases)
+    monkeypatch.setattr(
+        cs,
+        "detect_repo_submissions",
+        lambda *a, **k: [{"sha": "c1", "datetime": "2026-06-01T10:00:00Z"}],
+    )
+    stub_team_members(monkeypatch, ["alice"])
+
+    results, _, collected, detected = cs.collect_classroom(
+        api_url="https://api.github.com",
+        org="cs50",
+        classroom_short="cs-principles",
+        classroom_meta={},
+        assignments={"assignments": [{"slug": "scratch", "empty_repo": True}]},
+        service_token="token",
+    )
+
+    assert results == []
+    assert (
+        "empty_repo assignment: autograding is disabled; detected 1 submitter(s)"
+        in capsys.readouterr().out
+    )
+    atype, records, _visited = detected["scratch"]
+    assert atype == "individual"
+    assert records == [
+        {
+            "owner": "alice",
+            "count": 1,
+            "latest_datetime": "2026-06-01T10:00:00Z",
+            "kind": "commit",
+        }
+    ]
+    assert collected["scratch"] == "individual"
+
+
+def test_detect_repo_submissions_counts_every_commit_on_a_bare_repo(monkeypatch):
+    # No .classroom50.yaml marker means no baseline to trim.
+    monkeypatch.setattr(cs, "get_repo", lambda *a, **k: {"default_branch": "main"})
+    monkeypatch.setattr(cs, "oldest_commit_sha_for_path", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cs,
+        "list_default_branch_commits",
+        lambda *a, **k: [
+            {"sha": "c2", "commit": {"message": "more", "committer": {"date": "2026-06-02T10:00:00Z"}}},
+            {"sha": "c1", "commit": {"message": "first", "committer": {"date": "2026-06-01T10:00:00Z"}}},
+        ],
+    )
+    got = cs.detect_repo_submissions(
+        "https://api.github.com", "cs50", "cs-scratch-alice", "tok", "every-push", []
+    )
+    assert [d["sha"] for d in got] == ["c2", "c1"]
+
+
 def test_no_autograder_detection_records_no_score(monkeypatch):
     # Guard the contract that keeps grades uncontaminated: a detected record
     # carries presence/count only — never score, max-score, tests or a release.
@@ -3815,35 +3910,6 @@ def test_no_autograder_detection_reports_visited_owners(monkeypatch):
     assert "alice" in visited
     # bob's read failed, so he is NOT visited — his prior record must survive.
     assert "bob" not in visited
-
-
-def test_collect_classroom_skips_empty_repo_assignment(monkeypatch, capsys):
-    # An empty_repo assignment is skipped with a log line: its bare repos are
-    # never polled for releases, so no dead gradebook rows are produced. Unlike
-    # no_autograder it is not detected either — a bare repo carries no
-    # submission definition to detect against.
-    def fail_releases(*args, **kwargs):
-        raise AssertionError("empty_repo repos must not be polled for releases")
-
-    def fail_detect(*args, **kwargs):
-        raise AssertionError("empty_repo repos must not be detected")
-
-    monkeypatch.setattr(cs, "all_submit_releases", fail_releases)
-    monkeypatch.setattr(cs, "detect_repo_submissions", fail_detect)
-    stub_team_members(monkeypatch, ["alice"])
-
-    results, _, _, detected = cs.collect_classroom(
-        api_url="https://api.github.com",
-        org="cs50",
-        classroom_short="cs-principles",
-        classroom_meta={},
-        assignments={"assignments": [{"slug": "actions-lab", "empty_repo": True}]},
-        service_token="token",
-    )
-
-    assert results == []
-    assert detected == {}
-    assert "empty_repo" in capsys.readouterr().out
 
 
 # Autograded assignments: pushes without a graded release --------------------
@@ -5907,6 +5973,8 @@ class TestPollCandidateNames:
             "cs-hw1-bob",
             "cs-hw2-alice",
             "cs-hw2-bob",
+            "cs-warmup-alice",
+            "cs-warmup-bob",
             "cs-essay-alice",
             "cs-essay-bob",
         ]
