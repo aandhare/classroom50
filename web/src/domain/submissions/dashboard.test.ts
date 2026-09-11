@@ -24,6 +24,7 @@ import {
   existingGroupRepos,
   existingTeamRepos,
   filterAndSortRows,
+  filterDisplayList,
   filterNonSubmitters,
   hasAccepted,
   latestAssignmentPush,
@@ -54,8 +55,13 @@ import {
   assignmentRepoCandidateLogins,
   assignmentFunnelCounts,
   orgReposReadEnabled,
+  unsubmittedGroupRepos,
+  withSnapshotDetected,
+  type DisplayListInputs,
   type SubmissionFilters,
+  type SubmissionSort,
 } from "./dashboard"
+import type { DetectedSubmitter } from "./scores"
 import type { GroupTeamRef } from "@/domain/teams/groupTeams"
 
 // Minimal row factory — only the fields the dashboard logic reads.
@@ -2083,6 +2089,326 @@ describe("mergeDetectedSubmissions", () => {
   })
 })
 
+describe("withSnapshotDetected", () => {
+  const detected = (
+    over: Partial<DetectedSubmitter> = {},
+  ): DetectedSubmitter => ({
+    owner: "bob",
+    usernames: ["bob"],
+    count: 2,
+    datetime: "2026-06-21T10:00:00Z",
+    late: false,
+    ...over,
+  })
+
+  it("returns the rows untouched when the bucket carries no detected list", () => {
+    const rows = [row({ owner: "alice" })]
+    expect(withSnapshotDetected(rows, undefined)).toBe(rows)
+    expect(withSnapshotDetected(rows, [])).toBe(rows)
+  })
+
+  it("appends a pending, grade-free row per detected submitter", () => {
+    const graded = row({ owner: "alice", score: 8 })
+    const merged = withSnapshotDetected(
+      [graded],
+      [detected({ owner: "bob", count: 3, late: true })],
+    )
+    expect(merged.map((r) => r.owner)).toEqual(["alice", "bob"])
+    const bob = merged[1]
+    expect(bob.pending).toBe(true)
+    expect(bob.score).toBe(0)
+    expect(bob["max-score"]).toBe(0)
+    expect(bob.submissionCount).toBe(3)
+    expect(bob.datetime).toBe("2026-06-21T10:00:00Z")
+    expect(bob.late).toBe(true)
+    expect(merged[0]).toBe(graded)
+  })
+
+  it("credits every group member", () => {
+    const [team] = withSnapshotDetected(
+      [],
+      [detected({ owner: "group-1", usernames: ["bob", "cara"] })],
+    )
+    expect(team.usernames).toEqual(["bob", "cara"])
+  })
+
+  it("leaves datetime and late unknown when the collector recorded none", () => {
+    const [pending] = withSnapshotDetected(
+      [],
+      [detected({ datetime: undefined, late: undefined })],
+    )
+    expect(pending.datetime).toBe("")
+    expect(pending.late).toBeUndefined()
+  })
+
+  it("skips a zero count and an owner the graded entries already cover", () => {
+    const merged = withSnapshotDetected(
+      [row({ owner: "alice" })],
+      [
+        detected({ owner: "Alice", usernames: ["Alice"] }),
+        detected({ owner: "bob", count: 0 }),
+      ],
+    )
+    expect(merged.map((r) => r.owner)).toEqual(["alice"])
+  })
+
+  it("makes the snapshot credit push-mode submitters so they leave the non-submitter list", () => {
+    // The #954 shape: no graded entries, only the collector's detected list.
+    const students = [
+      student({ username: "alice" }),
+      student({ username: "bob" }),
+      student({ username: "cara" }),
+    ]
+    const snapshot = withSnapshotDetected(
+      [],
+      [
+        detected({ owner: "alice", usernames: ["alice"] }),
+        detected({ owner: "bob", usernames: ["bob"] }),
+      ],
+    )
+    expect(
+      reconcileNonSubmitters(students, snapshot, new Set()).map(
+        (s) => s.username,
+      ),
+    ).toEqual(["cara"])
+  })
+})
+
+describe("unsubmittedGroupRepos", () => {
+  it("drops repos a row credits, case-insensitively", () => {
+    const repos = [
+      { owner: "alice", repoName: "cs101-hw1-alice" },
+      { owner: "bob", repoName: "cs101-hw1-bob" },
+    ]
+    expect(
+      unsubmittedGroupRepos(repos, [row({ owner: "Alice" })]).map(
+        (r) => r.owner,
+      ),
+    ).toEqual(["bob"])
+  })
+})
+
+describe("filterDisplayList", () => {
+  const students = [
+    student({ username: "alice", first_name: "Alice", last_name: "Adams" }),
+    student({ username: "bob", first_name: "Bob", last_name: "Brown" }),
+    student({ username: "cara", first_name: "Cara", last_name: "Cole" }),
+    student({ username: "dan", first_name: "Dan", last_name: "Dean" }),
+  ]
+  // alice passed on time, bob failed late; cara accepted but never pushed; dan
+  // never accepted.
+  const rows = [
+    row({ owner: "alice", usernames: ["alice"], score: 9, late: false }),
+    row({ owner: "bob", usernames: ["bob"], score: 2, late: true }),
+  ]
+  const accepted = new Set(["alice", "bob", "cara"])
+  const groupRepos = [
+    { owner: "alice", repoName: "cs101-hw1-alice" },
+    { owner: "cara", repoName: "cs101-hw1-cara" },
+  ]
+  const teams: GroupTeamRef[] = [
+    { n: 1, id: 1, slug: "cs101-hw1-group-1", name: "Group 1" },
+    { n: 2, id: 2, slug: "cs101-hw1-group-2", name: "Night owls" },
+  ]
+  const base = {
+    rows,
+    nonSubmitters: reconcileNonSubmitters(students, rows, new Set()),
+    groupRepos,
+    teamsWithoutRepos: teams,
+    query: "",
+    filters: filters(),
+    sort: "name-first" as const,
+    students,
+    sectionByUsername: new Map<string, string>(),
+    thresholdFraction: 0.5,
+    acceptedSet: accepted,
+    groupDisplayNames: new Map([["group-2", "night owls"]]),
+  }
+  const owners = (out: { rows: { owner: string }[] }) =>
+    out.rows.map((r) => r.owner)
+  const logins = (out: { nonSubmitters: { username: string }[] }) =>
+    out.nonSubmitters.map((s) => s.username)
+
+  it("passes everything through unfiltered", () => {
+    const out = filterDisplayList(base)
+    expect(owners(out)).toEqual(["alice", "bob"])
+    expect(logins(out)).toEqual(["cara", "dan"])
+    expect(out.groupRepos).toBe(groupRepos)
+    expect(out.teamsWithoutRepos).toBe(teams)
+  })
+
+  it.each(["submitted", "on-time", "late"] as const)(
+    "hides every no-submission item under %s",
+    (submission) => {
+      const out = filterDisplayList({
+        ...base,
+        filters: filters({ submission }),
+      })
+      expect(out.nonSubmitters).toEqual([])
+      expect(out.groupRepos).toEqual([])
+      expect(out.teamsWithoutRepos).toEqual([])
+    },
+  )
+
+  it("applies the real passing threshold to rows and hides non-submitters", () => {
+    const passing = filterDisplayList({
+      ...base,
+      filters: filters({ passing: "passing" }),
+    })
+    expect(owners(passing)).toEqual(["alice"])
+    expect(passing.nonSubmitters).toEqual([])
+    const failing = filterDisplayList({
+      ...base,
+      filters: filters({ passing: "failing" }),
+    })
+    expect(owners(failing)).toEqual(["bob"])
+  })
+
+  it("hides every row under not-submitted and keeps both non-submitter kinds", () => {
+    const out = filterDisplayList({
+      ...base,
+      filters: filters({ submission: "not-submitted" }),
+    })
+    expect(out.rows).toEqual([])
+    expect(logins(out)).toEqual(["cara", "dan"])
+    expect(out.groupRepos).toBe(groupRepos)
+  })
+
+  it("splits non-submitters on the accepted axis", () => {
+    const acceptedOnly = filterDisplayList({
+      ...base,
+      filters: filters({ accepted: "accepted" }),
+    })
+    expect(owners(acceptedOnly)).toEqual(["alice", "bob"])
+    expect(logins(acceptedOnly)).toEqual(["cara"])
+    const notAccepted = filterDisplayList({
+      ...base,
+      filters: filters({ accepted: "not-accepted" }),
+    })
+    expect(notAccepted.rows).toEqual([])
+    expect(logins(notAccepted)).toEqual(["dan"])
+  })
+
+  it("matches group repos and repo-less teams against the search", () => {
+    const byName = filterDisplayList({ ...base, query: "cole" })
+    expect(byName.groupRepos.map((r) => r.owner)).toEqual(["cara"])
+    expect(byName.teamsWithoutRepos).toEqual([])
+    const byOwner = filterDisplayList({ ...base, query: "group-1" })
+    expect(byOwner.teamsWithoutRepos.map((t) => t.n)).toEqual([1])
+    const byTeamName = filterDisplayList({ ...base, query: "night" })
+    expect(byTeamName.teamsWithoutRepos.map((t) => t.n)).toEqual([2])
+    expect(byTeamName.groupRepos).toEqual([])
+  })
+
+  it("pages the spine and the table over the same owners on every axis", () => {
+    // The alignment property #954 depends on: given the same row source, the
+    // fan-out's page names exactly the owners the table renders, whatever the
+    // filter, so any drift between the two recipes is caught here.
+    const scenarios: Partial<SubmissionFilters>[] = [
+      {},
+      { submission: "submitted" },
+      { submission: "late" },
+      { submission: "on-time" },
+      { submission: "not-submitted" },
+      { accepted: "accepted" },
+      { accepted: "not-accepted" },
+      { passing: "passing" },
+      { passing: "failing" },
+    ]
+    for (const over of scenarios) {
+      for (const sort of ["name-first", "name-last", "recent"] as const) {
+        const args = { ...base, filters: filters(over), sort }
+        const spine = displayPageOwners({
+          ...filterDisplayList(args),
+          isGroup: false,
+          sort,
+          students,
+          page: 0,
+          pageSize: 10,
+        })
+        const table = tableOwners(
+          filterDisplayList(args),
+          false,
+          students,
+          sort,
+        )
+        expect(spine, JSON.stringify({ over, sort })).toEqual(table)
+      }
+    }
+  })
+
+  it("pages a group assignment the same way, with a submitted founder in one slot", () => {
+    // The page hands both sides the unsubmitted repos only; a founder who
+    // submitted must not also occupy a group-repo slot and shift the page.
+    const allRepos = [
+      { owner: "alice", repoName: "cs101-hw1-alice" },
+      { owner: "bob", repoName: "cs101-hw1-bob" },
+      { owner: "cara", repoName: "cs101-hw1-cara" },
+    ]
+    const groupRows = [row({ owner: "alice", usernames: ["alice", "dan"] })]
+    for (const over of [
+      {},
+      { submission: "submitted" as const },
+      { submission: "not-submitted" as const },
+    ]) {
+      for (const sort of ["name-first", "recent"] as const) {
+        const args = {
+          ...base,
+          rows: groupRows,
+          nonSubmitters: [],
+          groupRepos: unsubmittedGroupRepos(allRepos, groupRows),
+          filters: filters(over),
+          sort,
+        }
+        const spine = displayPageOwners({
+          ...filterDisplayList(args),
+          isGroup: true,
+          sort,
+          students,
+          page: 0,
+          pageSize: 10,
+        })
+        const table = tableOwners(filterDisplayList(args), true, students, sort)
+        expect(spine, JSON.stringify({ over, sort })).toEqual(table)
+        expect(spine.filter((o) => o === "alice").length).toBeLessThanOrEqual(1)
+      }
+    }
+  })
+})
+
+// The table's own display-list assembly (SubmissionsTable.displayItems), so the
+// property tests above compare against what the table actually renders rather
+// than against displayPageOwners' own builders.
+function tableOwners(
+  inputs: DisplayListInputs,
+  isGroup: boolean,
+  students: Student[],
+  sort: SubmissionSort,
+): string[] {
+  const nameSort = sort === "name-first" || sort === "name-last"
+  const items = isGroup
+    ? nameSort
+      ? buildGroupRosterDisplayItems(
+          inputs.rows,
+          inputs.groupRepos,
+          students,
+          sort === "name-last" ? "last" : "first",
+          inputs.teamsWithoutRepos,
+        )
+      : buildGroupDisplayItems(
+          inputs.rows,
+          inputs.groupRepos,
+          inputs.teamsWithoutRepos,
+        )
+    : nameSort
+      ? buildRosterDisplayItems(students, inputs.rows, inputs.nonSubmitters)
+      : buildSortedDisplayItems(inputs.rows, inputs.nonSubmitters)
+  return paginateDisplayItems(items, 10, 0)
+    .filter((item) => item.kind !== "teamNoRepo")
+    .map(displayItemOwner)
+    .filter(Boolean)
+}
+
 describe("displayPageOwners", () => {
   const students = [
     student({ username: "alice", first_name: "Alice", last_name: "Adams" }),
@@ -2104,6 +2430,40 @@ describe("displayPageOwners", () => {
     })
     // Name order: alice (non-sub), bob (row) — page of 2.
     expect(owners).toEqual(["alice", "bob"])
+  })
+
+  it("under the not-submitted filter, pages over the snapshot's non-submitters only", () => {
+    // #954: with every submitted row filtered out, the non-submitter pool alone
+    // decides the fan-out window, so it must exclude snapshot-credited students.
+    const snapshot = withSnapshotDetected(
+      [row({ owner: "alice", usernames: ["alice"] })],
+      [{ owner: "bob", usernames: ["bob"], count: 1 }],
+    )
+    const spine = filterDisplayList({
+      rows: snapshot,
+      nonSubmitters: reconcileNonSubmitters(students, snapshot, new Set()),
+      groupRepos: [],
+      teamsWithoutRepos: [],
+      query: "",
+      filters: filters({ submission: "not-submitted" }),
+      sort: "name-first",
+      students,
+      sectionByUsername: new Map(),
+      thresholdFraction: null,
+      acceptedSet: new Set(["alice", "bob", "cara"]),
+    })
+    expect(spine.rows).toEqual([])
+    const owners = displayPageOwners({
+      ...spine,
+      isGroup: false,
+      sort: "name-first",
+      students,
+      page: 0,
+      pageSize: 2,
+    })
+    // alice (graded) and bob (collector-detected) are credited; only cara's
+    // repo is read.
+    expect(owners).toEqual(["cara"])
   })
 
   it("only names owners from the (pre-filtered) non-submitter pool it is given", () => {

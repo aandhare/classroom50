@@ -72,8 +72,7 @@ import {
   distinctSections,
   existingGroupRepos,
   existingTeamRepos,
-  filterAndSortRows,
-  filterNonSubmitters,
+  filterDisplayList,
   latestAssignmentPush,
   effectiveCollectedAt,
   mergeDetectedSubmissions,
@@ -93,6 +92,8 @@ import {
   studentInSection,
   submissionRosterStudents,
   teamsWithoutRepos,
+  unsubmittedGroupRepos,
+  withSnapshotDetected,
   type SubmissionFilters,
   type SubmissionSort,
 } from "@/domain/submissions/dashboard"
@@ -103,7 +104,7 @@ import { useSubmissionAssignment } from "@/hooks/useSubmissionAssignment"
 import useGetClassroom from "@/hooks/useGetClassroom"
 import useGetStudents from "@/hooks/useGetStudents"
 import { useTeamRoster } from "@/hooks/useTeamRoster"
-import { getName, sortStudentsByName } from "@/util/students"
+import { sortStudentsByName } from "@/util/students"
 import { studentRepoName, GROUP_REPO_SEGMENT } from "@/util/studentRepo"
 import { groupDisplayName } from "@/util/groupTeam"
 import useGroupTeams from "@/hooks/useGroupTeams"
@@ -146,11 +147,6 @@ import { githubTemplateRepoUrl } from "@/util/orgUrl"
 import { acceptLinkCli, acceptLinkUrl } from "@/util/acceptLink"
 import { CONFIG_REPO } from "@/util/configRepo"
 import { GitHubLink } from "@/components/GitHubLink"
-
-// Stable empty set for the live non-submitter filter (accepted axis is "all"
-// when live, so no accepted-set membership is consulted). Module-level so its
-// identity is stable across renders and doesn't churn the memo.
-const EMPTY_SET: Set<string> = new Set()
 
 // Stable empty list for the disabled legacy collaborators fan-out (team mode).
 const EMPTY_GROUP_REPOS: { owner: string; repoName: string }[] = []
@@ -476,8 +472,16 @@ const SubmissionsPageContent = () => {
   // rather than blanking a populated gradebook (discussion #677: every row
   // filtered out against a roster the viewer couldn't read).
   const rosterReady = !rosterLoading && !rosterError && studentRosterKnown
+  // A background refetch keeps this true, so Refresh never blanks the table.
+  const scoresLoaded = scoresData !== undefined
+  // Graded entries plus the collector's detected submitters, so a push-mode
+  // submitter is credited on every page, not only the one being read (#954).
   const snapshotRows = useMemo(() => {
-    return scoresData?.submissions?.[assignment ?? ""] || []
+    const slug = assignment ?? ""
+    return withSnapshotDetected(
+      scoresData?.submissions?.[slug] ?? [],
+      scoresData?.detected?.[slug],
+    )
   }, [scoresData, assignment])
 
   // Dashboard controls — all client-side over already-loaded data. Declared
@@ -620,57 +624,95 @@ const SubmissionsPageContent = () => {
       new Set(snapshotScoped.map((row) => row.owner.toLowerCase())),
     )
   }, [teamsSettled, orgRepos, groupTeams, groupRepoList, snapshotScoped])
-  // Non-submitter pool for the fan-out's display list, filtered by the SAME
-  // query + section + submission axes the rendered table applies — so the
-  // fanned page lines up with the visible page. The ACCEPTED axis is neutralized
-  // here: this pool is deliberately snapshot-independent (empty accepted set) so
-  // it can't loop on live results, and `filterNonSubmitters` would otherwise
-  // test acceptance against that empty set and wrongly drop every owner. The
-  // rendered non-submitter list (visibleNonSubmitters) applies the real
-  // acceptedSet.
-  const liveNonSubmitterPool = useMemo(
+  // Deterministic acceptance from the org repo list (see acceptedUsernames);
+  // individual assignments only, so gated on acceptedAvailable.
+  const acceptedSet = useMemo(
     () =>
-      filterNonSubmitters(
-        students,
-        query,
-        { ...filters, accepted: "all" },
-        EMPTY_SET,
-      ),
-    [students, query, filters],
+      acceptedUsernames(orgRepos, classroom ?? "", assignment ?? "", students),
+    [orgRepos, classroom, assignment, students],
   )
-  const liveOwnerArgs = useMemo(
+  const acceptedAvailable = !isGroupFlavor && orgRepos != null
+  // The filters actually applied. When acceptance data isn't loaded, neutralize
+  // the accepted axis so a transient empty repo list can't flip the visible set.
+  const effectiveFilters = useMemo(
+    () =>
+      acceptedAvailable ? filters : { ...filters, accepted: "all" as const },
+    [acceptedAvailable, filters],
+  )
+  // Passing bar as a fraction of max, or null when the teacher didn't opt in
+  // (off by default) — then no Passing rollup/filter, neutral badges.
+  const passThresholdPct = assignmentInfo?.pass_threshold
+  const passingEnabled =
+    typeof passThresholdPct === "number" && Number.isFinite(passThresholdPct)
+  const thresholdFraction = passingEnabled ? passThresholdPct / 100 : null
+
+  // Everything the display list depends on besides its row source. Shared by
+  // the fan-out spine (snapshot rows) and the rendered table (live-merged rows)
+  // so the two can only differ in rows, never in how they're filtered.
+  const displayListArgs = useMemo(
     () => ({
-      isGroup: isGroupFlavor,
+      query,
+      filters: effectiveFilters,
       sort,
       students,
-      rows: filterAndSortRows(snapshotScoped, {
-        query,
-        filters,
-        sort,
-        students,
-        sectionByUsername,
-        thresholdFraction: null,
-      }),
-      nonSubmitters: liveNonSubmitterPool,
-      groupRepos: groupRepoList,
-      teamsWithoutRepos: missingRepoTeams,
+      sectionByUsername,
+      thresholdFraction,
+      acceptedSet,
+      groupDisplayNames,
     }),
     [
-      isGroupFlavor,
+      query,
+      effectiveFilters,
       sort,
       students,
-      snapshotScoped,
-      query,
-      filters,
       sectionByUsername,
+      thresholdFraction,
+      acceptedSet,
+      groupDisplayNames,
+    ],
+  )
+
+  // The fan-out spine: the snapshot's display list under the real filters, so
+  // the fanned page names exactly the students the table shows. Everything here
+  // is snapshot- or org-repo-derived, never live-derived, so it can't loop on
+  // the fan-out's own output.
+  const spineInputs = useMemo(
+    () =>
+      filterDisplayList({
+        ...displayListArgs,
+        rows: snapshotScoped,
+        nonSubmitters: reconcileNonSubmitters(
+          students,
+          snapshotScoped,
+          groupRepoFounders,
+        ),
+        groupRepos: unsubmittedGroupRepos(groupRepoList, snapshotScoped),
+        teamsWithoutRepos: missingRepoTeams,
+      }),
+    [
+      displayListArgs,
+      snapshotScoped,
+      students,
+      groupRepoFounders,
       groupRepoList,
-      liveNonSubmitterPool,
       missingRepoTeams,
     ],
   )
+  // The spine is the snapshot's display list, so paging it before the snapshot
+  // exists would read the first N roster repos and then the real page again.
   const livePageOwners = useMemo(
-    () => displayPageOwners({ ...liveOwnerArgs, page, pageSize }),
-    [liveOwnerArgs, page, pageSize],
+    () =>
+      scoresLoaded
+        ? displayPageOwners({
+            ...spineInputs,
+            isGroup: isGroupFlavor,
+            sort,
+            students,
+            page,
+            pageSize,
+          })
+        : [],
+    [scoresLoaded, spineInputs, isGroupFlavor, sort, students, page, pageSize],
   )
   const {
     submissions: liveSubmissions,
@@ -766,7 +808,6 @@ const SubmissionsPageContent = () => {
   // reconciliation) — else a submitter flashes "not submitted" before its row
   // resolves. detectedPending matters on its own for a no_autograder
   // assignment, where detection is the ONLY thing that can credit a submitter.
-  const scoresLoaded = scoresData !== undefined
   // Empty rows before the snapshot+roster land mean "loading", not "empty" —
   // gate the empty state on this so it doesn't flash on first paint. A
   // background refetch keeps scoresLoaded true, so Refresh never blanks the table.
@@ -815,15 +856,6 @@ const SubmissionsPageContent = () => {
   // time sort, or a grade-implying status/passing filter). We keep every control
   // live and surface this instead of hiding Sort + Status.
   const showPendingHiddenHint = pendingMayHide(sort, filters)
-
-  // Deterministic acceptance from the org repo list (see acceptedUsernames);
-  // individual assignments only, so gated on acceptedAvailable.
-  const acceptedSet = useMemo(
-    () =>
-      acceptedUsernames(orgRepos, classroom ?? "", assignment ?? "", students),
-    [orgRepos, classroom, assignment, students],
-  )
-  const acceptedAvailable = !isGroupFlavor && orgRepos != null
 
   // Every existing assignment repo name (individual + group), for the bulk
   // "Open all Feedback PRs" action. Derived from the already-loaded org repo
@@ -893,13 +925,9 @@ const SubmissionsPageContent = () => {
   // derived per student — instead surface every group repo from the org list
   // (#245) so teachers can see teams that formed before anyone pushes. Submitted
   // groups already show as score rows, so drop them here.
-  const submittedGroupOwners = useMemo(
-    () => new Set(scoresInfo.map((row) => row.owner.toLowerCase())),
-    [scoresInfo],
-  )
-  const unsubmittedGroupRepos = useMemo(
-    () => groupRepoList.filter((repo) => !submittedGroupOwners.has(repo.owner)),
-    [groupRepoList, submittedGroupOwners],
+  const liveUnsubmittedGroupRepos = useMemo(
+    () => unsubmittedGroupRepos(groupRepoList, scoresInfo),
+    [groupRepoList, scoresInfo],
   )
 
   // With a section filter active, scope roster and rows to it so the stat cards
@@ -932,13 +960,6 @@ const SubmissionsPageContent = () => {
   )
   const acceptedOwners = useMemo(() => [...acceptedSet], [acceptedSet])
 
-  // Passing bar as a fraction of max, or null when the teacher didn't opt in
-  // (off by default) — then no Passing rollup/filter, neutral badges.
-  const passThresholdPct = assignmentInfo?.pass_threshold
-  const passingEnabled =
-    typeof passThresholdPct === "number" && Number.isFinite(passThresholdPct)
-  const thresholdFraction = passingEnabled ? passThresholdPct / 100 : null
-
   // Top-line counts over the (section-scoped) submitted set + roster size.
   const stats = useMemo(
     () => computeStats(scopedScores, scopedStudents.length, thresholdFraction),
@@ -956,93 +977,45 @@ const SubmissionsPageContent = () => {
   // (KTD4-style) so a staff/extra repo can't push the share past 100%.
   const funnelTotal = stats.rostered
   const submittedShare = Math.min(submittedPresenceCount, funnelTotal)
-  const submittedGroups = groupRepoList.length - unsubmittedGroupRepos.length
+  const submittedGroups =
+    groupRepoList.length - liveUnsubmittedGroupRepos.length
   // Show the bar once its denominator is real: repo list resolved, and (for
   // groups) at least one group repo exists.
   const showSubmissionProgress = isGroupFlavor
     ? orgRepos != null && groupRepoList.length > 0
     : acceptedAvailable
 
-  // The progress bar's one-click jump to who hasn't submitted. On this page a
-  // "not submitted" row implies the student accepted (no repo, nothing to
-  // submit), so the set is just the not-submitted filter: a single axis the
-  // Status select represents exactly, so switching away from it never silently
-  // drops a hidden acceptance filter. The other axes reset so the surfaced set
-  // matches the label.
-  const showAcceptedNotSubmitted = () =>
+  // The progress bar's jump to everyone without a submission, never-accepted
+  // students included (their rows say "Not accepted"). One axis the Status
+  // select represents exactly, so switching away never leaves a hidden filter.
+  const showNotSubmitted = () =>
     setFilters({ ...DEFAULT_FILTERS, submission: "not-submitted" })
 
-  // Rows actually rendered. When acceptance data isn't loaded, neutralize the
-  // accepted axis so a transient empty repo list can't flip the visible set.
-  // This acceptance neutralization is independent of live mode — the sort and
-  // status/passing axes always reflect the user's real selection.
-  const effectiveFilters = useMemo(
+  // What the table renders: the live-merged rows and their companions under the
+  // same recipe as the fan-out spine (see displayListArgs). Non-submitters are
+  // gated on their readiness upstream, so they can't flash while sources settle.
+  const {
+    rows: visibleRows,
+    nonSubmitters: visibleNonSubmitters,
+    groupRepos: visibleGroupRepos,
+    teamsWithoutRepos: visibleMissingRepoTeams,
+  } = useMemo(
     () =>
-      acceptedAvailable ? filters : { ...filters, accepted: "all" as const },
-    [acceptedAvailable, filters],
-  )
-  const visibleRows = useMemo(
-    () =>
-      filterAndSortRows(scoresInfo, {
-        query,
-        filters: effectiveFilters,
-        sort,
-        students,
-        sectionByUsername,
-        thresholdFraction,
+      filterDisplayList({
+        ...displayListArgs,
+        rows: scoresInfo,
+        nonSubmitters,
+        groupRepos: liveUnsubmittedGroupRepos,
+        teamsWithoutRepos: missingRepoTeams,
       }),
     [
+      displayListArgs,
       scoresInfo,
-      query,
-      effectiveFilters,
-      sort,
-      students,
-      sectionByUsername,
-      thresholdFraction,
+      nonSubmitters,
+      liveUnsubmittedGroupRepos,
+      missingRepoTeams,
     ],
   )
-  const visibleNonSubmitters = useMemo(
-    () =>
-      showsNonSubmitters(effectiveFilters)
-        ? filterNonSubmitters(
-            nonSubmitters,
-            query,
-            effectiveFilters,
-            acceptedSet,
-          )
-        : [],
-    [effectiveFilters, nonSubmitters, query, acceptedSet],
-  )
-
-  // Group repos without a submission, gated like non-submitters (hidden while a
-  // narrowing filter other than "not submitted" is active) and matched against
-  // the search by founder login or roster name. Section isn't filtered — a group
-  // repo carries no single section.
-  const visibleGroupRepos = useMemo(() => {
-    if (!showsNonSubmitters(effectiveFilters)) return []
-    const q = query.trim().toLowerCase()
-    if (!q) return unsubmittedGroupRepos
-    return unsubmittedGroupRepos.filter((repo) => {
-      if (repo.owner.includes(q)) return true
-      const name = getName(repo.owner, students).toLowerCase()
-      return name.length > 0 && name.includes(q)
-    })
-  }, [effectiveFilters, query, unsubmittedGroupRepos, students])
-
-  // Repo-less teams, gated like the unsubmitted group repos (hidden while a
-  // narrowing filter other than "not submitted" is active) and matched against
-  // the search by display name or `group-<n>` owner segment.
-  const visibleMissingRepoTeams = useMemo(() => {
-    if (!showsNonSubmitters(effectiveFilters)) return []
-    const q = query.trim().toLowerCase()
-    if (!q) return missingRepoTeams
-    return missingRepoTeams.filter((team) => {
-      const owner = `${GROUP_REPO_SEGMENT}${team.n}`
-      if (owner.includes(q)) return true
-      const name = groupDisplayNames?.get(owner)?.toLowerCase() ?? ""
-      return name.includes(q)
-    })
-  }, [effectiveFilters, query, missingRepoTeams, groupDisplayNames])
 
   // The read-only Refresh's own re-reads, for its spinner and latch (a viewer
   // who dispatches is gated by the collect itself).
@@ -1259,7 +1232,7 @@ const SubmissionsPageContent = () => {
               showSubmissionProgress && (
                 <button
                   type="button"
-                  onClick={showAcceptedNotSubmitted}
+                  onClick={showNotSubmitted}
                   title={t("submissions.funnel.showNotSubmitted")}
                   className="-m-1 cursor-pointer rounded-btn p-1 hover:bg-base-200"
                 >
