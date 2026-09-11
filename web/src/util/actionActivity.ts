@@ -1,4 +1,5 @@
 import type { GitHubWorkflowRun } from "@/github-core/types"
+import { PUBLISH_PAGES_WORKFLOW } from "@/github-core/workflows"
 import { CONFIG_REPO } from "@/util/configRepo"
 
 // Pure helpers behind the activity banner, split out so run-attribution and
@@ -89,8 +90,10 @@ export function workflowFile(run: GitHubWorkflowRun): string | undefined {
 const NULL_BASELINE_SKEW_MS = 60_000
 
 // Whether a run is the one an op triggered. A push run matches by head_sha; a
-// dispatch run matches by workflow file + a run id past the pre-dispatch
-// baseline.
+// dispatch run matches by workflow file + event + a run id past the
+// pre-dispatch baseline. The event check matters for publish-pages, which also
+// runs on push: the baseline is read from dispatch runs only, so a push run
+// newer than it would otherwise be claimed as the dispatch.
 //
 // Null-baseline (no prior dispatch runs at dispatch time): an id comparison
 // alone would match ANY future run, mis-attributing a later cron/other run — so
@@ -104,6 +107,7 @@ export function runMatchesOp(
     return Boolean(run.head_sha && run.head_sha === op.anchor.sha)
   }
   if (workflowFile(run) !== op.anchor.workflow) return false
+  if (run.event !== "workflow_dispatch") return false
   if (op.anchor.sinceRunId !== null) return run.id > op.anchor.sinceRunId
 
   // Null baseline: accept any run of the workflow that started no earlier than
@@ -156,13 +160,44 @@ export function isFailureConclusion(
 }
 
 // A tracker's lifecycle phase, evaluated status-first: pending (no run bound),
-// running (in flight), failed / success (completed).
-export type TrackerPhase = "pending" | "running" | "success" | "failed"
+// running (in flight), superseded / failed / success (completed).
+export type TrackerPhase =
+  "pending" | "running" | "success" | "failed" | "superseded"
 
-export function trackerPhase(run: GitHubWorkflowRun | null): TrackerPhase {
+// A publish run GitHub cancelled because a newer publish run took its place
+// (skeletons before `queue: max` hold one pending run). The newer run carries
+// this run's change too, so it isn't a failure, as long as that run is still
+// going or succeeded: a failed successor leaves the change unpublished, and the
+// cancelled row must stay failed so Retry is offered. A cancelled publish with
+// no newer publish run is a real cancellation and stays failed.
+export function isSupersededPublish(
+  run: GitHubWorkflowRun,
+  runs: readonly GitHubWorkflowRun[],
+): boolean {
+  if (run.status !== "completed" || run.conclusion !== "cancelled") return false
+  if (workflowFile(run) !== PUBLISH_PAGES_WORKFLOW) return false
+  return runs.some(
+    (r) =>
+      r.id > run.id &&
+      workflowFile(r) === PUBLISH_PAGES_WORKFLOW &&
+      (isRunning(r) || !isFailureConclusion(r.conclusion)),
+  )
+}
+
+// Without `runs` (the polled window) a cancelled publish reads as failed.
+export function trackerPhase(
+  run: GitHubWorkflowRun | null,
+  runs?: readonly GitHubWorkflowRun[],
+): TrackerPhase {
   if (!run) return "pending"
   if (isRunning(run)) return "running"
+  if (runs && isSupersededPublish(run, runs)) return "superseded"
   return isFailureConclusion(run.conclusion) ? "failed" : "success"
+}
+
+// Whether a phase is final: the tracker is history, not something to wait on.
+export function isTerminalPhase(phase: TrackerPhase): boolean {
+  return phase === "success" || phase === "failed" || phase === "superseded"
 }
 
 // The i18n key that wraps a base action label for a given phase, so the banner
@@ -173,13 +208,54 @@ export const PHASE_LABEL_KEY: Record<TrackerPhase, string> = {
   running: "actionsBanner.state.running",
   success: "actionsBanner.state.success",
   failed: "actionsBanner.state.failed",
+  superseded: "actionsBanner.state.superseded",
 }
 
 // The i18n key for a workflow file's human label. Shared by the activity banner
 // (useActionActivity) and the org activity page so the mapping has one source.
 export const WORKFLOW_LABEL_KEY: Record<string, string> = {
-  "publish-pages.yaml": "actionsBanner.workflow.publishPages",
+  [PUBLISH_PAGES_WORKFLOW]: "actionsBanner.workflow.publishPages",
   "collect-scores.yaml": "actionsBanner.workflow.collectScores",
   "regrade.yaml": "actionsBanner.workflow.regrade",
   "probe-token.yaml": "actionsBanner.workflow.probeToken",
+}
+
+// Why a publish run's deploy failed, from the annotations actions/deploy-pages
+// emits. Each kind has a different next step:
+//  - deployLocked:  GitHub Pages runs one deployment at a time and an earlier
+//                   one (`blockerSha`) is still in progress. GitHub releases it
+//                   within about 10 minutes; it can also be cancelled.
+//  - pagesDisabled: the config repo's Pages site is off (404).
+//  - permission:    the workflow token lacks pages: write (403).
+//  - timeout:       the deployment never reported a final status.
+//  - outage:        GitHub returned a 5xx.
+export type PublishFailure =
+  | { kind: "deployLocked"; blockerSha: string }
+  | { kind: "pagesDisabled" }
+  | { kind: "permission" }
+  | { kind: "timeout" }
+  | { kind: "outage" }
+
+// deploy-pages appends GitHub's 400 body, which names the blocking sha.
+const DEPLOY_LOCKED_RE = /in progress deployment.*?cancel\s+([0-9a-f]{7,40})/i
+
+export function classifyPublishFailure(
+  annotations: readonly { level: string; message: string }[],
+): PublishFailure | undefined {
+  for (const { level, message } of annotations) {
+    if (level !== "failure") continue
+    const locked = DEPLOY_LOCKED_RE.exec(message)
+    if (locked) return { kind: "deployLocked", blockerSha: locked[1] }
+    if (/Ensure GitHub Pages has been enabled/i.test(message)) {
+      return { kind: "pagesDisabled" }
+    }
+    if (/permission "pages: write"/i.test(message)) {
+      return { kind: "permission" }
+    }
+    if (/Timeout reached/i.test(message)) return { kind: "timeout" }
+    if (/Server error, is githubstatus\.com/i.test(message)) {
+      return { kind: "outage" }
+    }
+  }
+  return undefined
 }

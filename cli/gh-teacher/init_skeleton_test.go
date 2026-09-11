@@ -96,6 +96,19 @@ func TestSkeletonFiles_Manifest(t *testing.T) {
 	if !strings.Contains(pubBody, `"active"`) {
 		t.Error("publish-pages.yaml classrooms index must include the \"active\" key so the student accept page can refuse archived classrooms")
 	}
+
+	// Publishes queue rather than cancel each other; see the comment in the
+	// workflow for why cancel-in-progress must stay false.
+	var pubDoc any
+	if err := yaml.Unmarshal([]byte(pubBody), &pubDoc); err != nil {
+		t.Fatalf("publish-pages.yaml: %v", err)
+	}
+	if got, ok := nested(pubDoc, "concurrency", "queue"); !ok || got != "max" {
+		t.Errorf("publish-pages.yaml concurrency.queue = %v, want \"max\"", got)
+	}
+	if got, ok := nested(pubDoc, "concurrency", "cancel-in-progress"); !ok || got != false {
+		t.Errorf("publish-pages.yaml concurrency.cancel-in-progress = %v, want false", got)
+	}
 }
 
 // TestSkeletonFiles_AutogradeRunner pins the runner workflow's

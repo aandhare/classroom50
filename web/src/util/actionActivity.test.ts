@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  classifyPublishFailure,
   isFailureConclusion,
   isRunning,
+  isSupersededPublish,
+  isTerminalPhase,
   orgFromPathname,
   PHASE_LABEL_KEY,
   resolveOpRun,
@@ -150,6 +153,27 @@ describe("runMatchesOp", () => {
     ).toBe(false)
   })
 
+  it("never matches a dispatch op to a push run of the same workflow (publish-pages runs on both)", () => {
+    const dispatchOp = op({
+      anchor: {
+        kind: "sinceRunId",
+        workflow: "publish-pages.yaml",
+        sinceRunId: 100,
+      },
+    })
+    // The baseline is read from dispatch runs only, so a push run newer than
+    // it is not the dispatched run even though its id is past the baseline.
+    expect(
+      runMatchesOp(
+        dispatchRun(101, "publish-pages.yaml", { event: "push" }),
+        dispatchOp,
+      ),
+    ).toBe(false)
+    expect(
+      runMatchesOp(dispatchRun(102, "publish-pages.yaml"), dispatchOp),
+    ).toBe(true)
+  })
+
   it("null baseline matches a run started at/after the dispatch time", () => {
     const started = Date.now()
     const r = dispatchRun(5, "regrade.yaml", {
@@ -228,6 +252,21 @@ describe("resolveOpRun", () => {
     // 101 is taken by an earlier op, so this op binds to 102.
     expect(resolveOpRun(dispatchOp, runs, claimed)?.id).toBe(102)
   })
+
+  it("skips a newer push publish and binds a Publish again op to the dispatch run", () => {
+    const dispatchOp = op({
+      anchor: {
+        kind: "sinceRunId",
+        workflow: "publish-pages.yaml",
+        sinceRunId: 100,
+      },
+    })
+    const runs = [
+      dispatchRun(103, "publish-pages.yaml"),
+      dispatchRun(101, "publish-pages.yaml", { event: "push" }),
+    ]
+    expect(resolveOpRun(dispatchOp, runs)?.id).toBe(103)
+  })
 })
 
 describe("trackerPhase", () => {
@@ -256,6 +295,160 @@ describe("trackerPhase", () => {
     expect(
       trackerPhase(run({ status: "completed", conclusion: "skipped" })),
     ).toBe("success")
+  })
+
+  it("is superseded for a cancelled publish when a newer publish run exists", () => {
+    const cancelled = publishRun(10, { conclusion: "cancelled" })
+    const newer = publishRun(11, { conclusion: "success" })
+    expect(trackerPhase(cancelled, [newer, cancelled])).toBe("superseded")
+  })
+
+  it("stays failed for a cancelled publish without the run window", () => {
+    const cancelled = publishRun(10, { conclusion: "cancelled" })
+    expect(trackerPhase(cancelled)).toBe("failed")
+  })
+})
+
+// A completed publish-pages run (push-triggered), by id.
+const publishRun = (
+  id: number,
+  over: Partial<GitHubWorkflowRun> = {},
+): GitHubWorkflowRun =>
+  run({
+    id,
+    status: "completed",
+    path: ".github/workflows/publish-pages.yaml",
+    ...over,
+  })
+
+describe("isSupersededPublish", () => {
+  it("is true only for a cancelled publish with a newer publish run in the window", () => {
+    const cancelled = publishRun(10, { conclusion: "cancelled" })
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(11, { conclusion: "success" }),
+      ]),
+    ).toBe(true)
+    // A newer run of ANOTHER workflow doesn't carry the publish.
+    expect(
+      isSupersededPublish(cancelled, [
+        dispatchRun(11, "collect-scores.yaml", {
+          status: "completed",
+          conclusion: "success",
+        }),
+      ]),
+    ).toBe(false)
+    // Only older publish runs: a real cancellation, not a superseded one.
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(9, { conclusion: "success" }),
+      ]),
+    ).toBe(false)
+  })
+
+  it("never applies to a failed (not cancelled) publish or a non-publish run", () => {
+    const newer = publishRun(11, { conclusion: "success" })
+    expect(
+      isSupersededPublish(publishRun(10, { conclusion: "failure" }), [newer]),
+    ).toBe(false)
+    expect(
+      isSupersededPublish(
+        dispatchRun(10, "regrade.yaml", {
+          status: "completed",
+          conclusion: "cancelled",
+        }),
+        [newer],
+      ),
+    ).toBe(false)
+  })
+
+  it("requires the newer publish to be running or to have succeeded", () => {
+    const cancelled = publishRun(10, { conclusion: "cancelled" })
+    // A successor that failed or was itself cancelled left the change
+    // unpublished, so the row stays failed and keeps Retry.
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(11, { conclusion: "failure" }),
+      ]),
+    ).toBe(false)
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(11, { conclusion: "cancelled" }),
+      ]),
+    ).toBe(false)
+    // Still running: it will carry the change, so the row reads superseded.
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(11, { status: "in_progress", conclusion: null }),
+      ]),
+    ).toBe(true)
+    // One failed and one succeeded: the successful one counts.
+    expect(
+      isSupersededPublish(cancelled, [
+        publishRun(11, { conclusion: "failure" }),
+        publishRun(12, { conclusion: "success" }),
+      ]),
+    ).toBe(true)
+  })
+})
+
+describe("isTerminalPhase", () => {
+  it("is true for success, failed, and superseded only", () => {
+    expect(isTerminalPhase("success")).toBe(true)
+    expect(isTerminalPhase("failed")).toBe(true)
+    expect(isTerminalPhase("superseded")).toBe(true)
+    expect(isTerminalPhase("pending")).toBe(false)
+    expect(isTerminalPhase("running")).toBe(false)
+  })
+})
+
+describe("classifyPublishFailure", () => {
+  // Verbatim from issue #949: deploy-pages appends GitHub's 400 body.
+  const lockMessage =
+    "Failed to create deployment (status: 400) with build version 8f002501dc9b122a62c6bbebfa810de786430a71. Request ID 1C00:D9342:6FA1D4:966BBD:6AA2954D Responded with: Deployment request failed for 8f002501dc9b122a62c6bbebfa810de786430a71 due to in progress deployment. Please cancel 656e8d140b36230c9ccfe14584b9a81fa8c9c8d0 first or wait for it to complete."
+
+  it("reads GitHub's in-progress lock and extracts the blocking sha", () => {
+    expect(
+      classifyPublishFailure([{ level: "failure", message: lockMessage }]),
+    ).toEqual({
+      kind: "deployLocked",
+      blockerSha: "656e8d140b36230c9ccfe14584b9a81fa8c9c8d0",
+    })
+  })
+
+  it("maps deploy-pages' other refusals to their kinds", () => {
+    const cases: [string, string][] = [
+      [
+        "Failed to create deployment (status: 404) with build version abc. Ensure GitHub Pages has been enabled: https://github.com/acme/classroom50/settings/pages",
+        "pagesDisabled",
+      ],
+      [
+        'Failed to create deployment (status: 403) with build version abc. Ensure GITHUB_TOKEN has permission "pages: write".',
+        "permission",
+      ],
+      ["Timeout reached, aborting!", "timeout"],
+      [
+        "Failed to create deployment (status: 502) with build version abc. Server error, is githubstatus.com reporting a Pages outage? Please re-run the deployment at a later time.",
+        "outage",
+      ],
+    ]
+    for (const [message, kind] of cases) {
+      expect(classifyPublishFailure([{ level: "failure", message }])).toEqual({
+        kind,
+      })
+    }
+  })
+
+  it("ignores warnings and notices, and is undefined for an unknown failure", () => {
+    expect(
+      classifyPublishFailure([{ level: "warning", message: lockMessage }]),
+    ).toBeUndefined()
+    expect(
+      classifyPublishFailure([
+        { level: "failure", message: "Process completed with exit code 1." },
+      ]),
+    ).toBeUndefined()
+    expect(classifyPublishFailure([])).toBeUndefined()
   })
 })
 
@@ -311,7 +504,13 @@ describe("PHASE_LABEL_KEY", () => {
   })
 
   it("resolves every phase key to an en.json template carrying {{label}}", () => {
-    for (const phase of ["pending", "running", "success", "failed"] as const) {
+    for (const phase of [
+      "pending",
+      "running",
+      "success",
+      "failed",
+      "superseded",
+    ] as const) {
       const key = PHASE_LABEL_KEY[phase]
       // Guards the dynamic t(PHASE_LABEL_KEY[phase], { label }) call site the
       // static key audit skips: a rename/removal in en.json must fail here,

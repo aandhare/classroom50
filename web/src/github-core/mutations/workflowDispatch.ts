@@ -5,6 +5,7 @@ import { getRepo } from "../repoReads"
 import {
   COLLECT_SCORES_WORKFLOW,
   PROBE_TOKEN_WORKFLOW,
+  PUBLISH_PAGES_WORKFLOW,
   REGRADE_WORKFLOW,
 } from "../workflows"
 import { CONFIG_REPO, DEFAULT_BRANCH } from "@/util/configRepo"
@@ -252,6 +253,29 @@ export async function triggerProbeToken(
   return { sinceRunId }
 }
 
+/**
+ * Dispatches the classroom50 repo's `publish-pages.yaml` workflow, redeploying
+ * the student site from the default branch without a commit: the recovery for
+ * a site that drifted from the repo. No inputs. Returns `sinceRunId` (see
+ * openDispatch).
+ */
+export async function triggerPublishPages(
+  client: GitHubClient,
+  org: string | undefined,
+): Promise<{ sinceRunId: number | null }> {
+  if (!org) throw new Error("org must be specified to publish the site")
+
+  const { sinceRunId, post } = await openDispatch(
+    client,
+    org,
+    PUBLISH_PAGES_WORKFLOW,
+  )
+  await post()
+
+  logWorkflows.info("dispatched publish-pages", { org, sinceRunId })
+  return { sinceRunId }
+}
+
 // Re-run the failed jobs of a run in <org>/classroom50 (the banner's retry).
 // Re-running only failed jobs preserves the run id, so the tracker re-binds to
 // the same run as it goes back in progress.
@@ -265,4 +289,25 @@ export async function rerunFailedRun(
     `/repos/${org}/${CONFIG_REPO}/actions/runs/${runId}/rerun-failed-jobs`,
     { method: "POST" },
   )
+}
+
+// Cancel a Pages deployment in <org>/classroom50 that GitHub still holds as in
+// progress. `deploymentId` is the commit SHA from GitHub's 400 refusal. A 404
+// means it already cleared, which is what the caller wanted.
+// https://docs.github.com/en/rest/pages/pages#cancel-a-github-pages-deployment
+export async function cancelPagesDeployment(
+  client: GitHubClient,
+  org: string,
+  deploymentId: string,
+): Promise<void> {
+  logWorkflows.info("cancelling stuck Pages deployment", { org, deploymentId })
+  try {
+    await client.request(
+      `/repos/${org}/${CONFIG_REPO}/pages/deployments/${encodeURIComponent(deploymentId)}/cancel`,
+      { method: "POST" },
+    )
+  } catch (err) {
+    if (err instanceof GitHubAPIError && err.isNotFound) return
+    throw err
+  }
 }
