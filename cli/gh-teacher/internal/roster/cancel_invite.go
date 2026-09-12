@@ -28,8 +28,10 @@ func rosterCancelInviteCmd() *cobra.Command {
 			"for the address this reports and changes nothing: an invitation the\n" +
 			"student already accepted looks exactly the same from here, and the\n" +
 			"metadata team holds the only record of which address their account\n" +
-			"came from. Run `gh teacher roster sync` in that case: it records the\n" +
-			"student, and cleans up a genuine leftover under its own checks.\n\n" +
+			"came from. Run `gh teacher roster sync` in that case to record the\n" +
+			"student. If the invitation expired instead (GitHub invitations last\n" +
+			"7 days), `gh teacher roster invite` sends a new one against the\n" +
+			"same row.\n\n" +
 			"For a student already on the roster with a username, use\n" +
 			"`gh teacher roster remove` (and `gh teacher remove` for the org).\n\n" +
 			"Exits 0 when nothing was pending; returns non-zero if the pending\n" +
@@ -76,8 +78,11 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 	invitationID, found := pendingEmailInvitationID(pending, email)
 	if !found {
 		_, _ = fmt.Fprintf(out, "%s: no pending invitation for %s, nothing was cancelled\n", org, email)
-		_, _ = fmt.Fprintf(errOut, "If they already accepted, run `gh teacher roster sync %s %s` to record their username and github_id. It also collects a genuine leftover invite team or pending row under its own checks, which this command deliberately won't do without a pending invitation to revoke.\n",
-			org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Nothing is touched without a pending invitation to revoke, since the metadata team may hold the only record of an accepted invitation's address.\n"+
+			"  - If they already accepted, run %s to record their username and github_id.\n"+
+			"  - If the invitation expired (GitHub invitations last 7 days), run `gh teacher roster invite %s %s %s` to send a new one against the same row.\n"+
+			"  - To drop the row instead, run `gh teacher roster remove %s %s %s`.\n",
+			syncWriteCommand(org, classroom), org, classroom, email, org, classroom, email)
 		return nil
 	}
 
@@ -106,8 +111,8 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 	if err := membership.CancelOrgInvitation(client, org, invitationID); err != nil {
 		if errors.Is(err, membership.ErrInvitationAlreadyGone) {
 			_, _ = fmt.Fprintf(out, "%s: the invitation for %s was already gone, nothing was cancelled\n", org, email)
-			_, _ = fmt.Fprintf(errOut, "Nothing else was touched: another invitation for %s may have replaced this one. Run `gh teacher roster sync %s %s` to refresh the roster.\n",
-				email, org, classroom)
+			_, _ = fmt.Fprintf(errOut, "Nothing else was touched: another invitation for %s may have replaced this one. Run %s to refresh the roster.\n",
+				email, syncWriteCommand(org, classroom))
 			return nil
 		}
 		return err
@@ -136,8 +141,8 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 
 	message := contract.PrefixCommit(fmt.Sprintf("roster: remove cancelled invite from %s (gh teacher roster cancel-invite)", classroom))
 	if _, err := configwrite.CommitTreeChange(client, org, configrepo.ConfigRepoName, branch, message, build); err != nil {
-		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was cancelled, but dropping its pending row from %s failed; run `gh teacher roster sync %s %s` to refresh the roster.\n",
-			email, configrepo.RosterFilePath(classroom), org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was cancelled, but dropping its pending row from %s failed; run `gh teacher roster remove %s %s %s` to drop it.\n",
+			email, configrepo.RosterFilePath(classroom), org, classroom, email)
 		return fmt.Errorf("invitation cancelled, but the pending roster row was not removed: %w", err)
 	}
 	if !removed {

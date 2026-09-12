@@ -334,9 +334,23 @@ Once the student accepts, `roster sync` fills in their username and `github_id`.
 
 A single address is non-zero on: a classroom with no usable team recorded in
 `classroom.json` (nothing is sent), an address the roster already lists **as a
-pending invitation**, or a failed invitation. An address that already belongs to an
+pending invitation** that GitHub still has open (or that was accepted but not yet
+synced), or a failed invitation. An address that already belongs to an
 organization member, or that already has a pending invitation, is reported as
 skipped and exits **0**.
+
+A pending row whose invitation has **expired** (GitHub invitations last 7 days)
+doesn't block: a new invitation is sent, the existing row is kept, and GitHub's
+expired record for the address is dismissed once the send is confirmed, the same
+as the web app's **Re-invite**. `roster invite` tells the cases apart by asking
+GitHub, never from the row's shape: an invitation still on the organization's
+pending list is live (whichever classroom sent it), an invite team that holds a
+valid record and a member was accepted, and neither means the invitation died.
+An invite team whose record was edited by hand and still holds a member is
+refused for you to check, the same anomaly `roster sync` reports. If GitHub
+answers the send with its daily invitation limit, nothing was sent: the row and
+GitHub's expired record are left as they were, and the command exits as it does
+for a rate limit.
 
 An address that some *other* row merely carries is a shared address (a parent, a
 lab contact), so the invitation is still sent and the command exits **0**: a note
@@ -369,7 +383,9 @@ those columns are yours, and are never derived from a GitHub profile.
 Exit codes follow [`roster sync`](#roster-sync): **0** all invited or cleanly
 skipped, **2** nothing failed but a rate limit left addresses uninvited, **1** an
 address failed or the roster write failed. An address the roster already lists as
-pending is a skip here, not a failure, so it doesn't change the exit code. On a
+pending (and GitHub still has open, or that was accepted but not yet synced) is a
+skip here, not a failure, so it doesn't change the exit code; an expired one is
+re-sent against its existing row. On a
 rate limit the run stops sending, waits out `Retry-After` before recording what it
 already sent, and reports the rest; re-running is safe, since already-invited
 addresses skip.
@@ -386,8 +402,10 @@ performs, so either tool can revoke either tool's invitation.
 
 Acts only on a **pending** invitation. With none for the address it reports and
 changes nothing, exiting 0: an invitation the student already accepted looks
-identical from here. Run `roster sync` in that case. It records the student, and
-collects a genuine leftover under its own checks. For a student already on the
+identical from here. Run `roster sync` in that case to record the student. If the
+invitation expired instead (GitHub invitations last 7 days), `roster invite` sends
+a new one against the same row, and `roster remove <email>` drops the row. For a
+student already on the
 roster with a username, use `roster remove` (and `gh teacher remove` for the
 organization).
 
@@ -411,8 +429,9 @@ gh teacher roster sync <org> <classroom> --write    # apply
 Catches `roster.csv` up with GitHub: records the students who accepted an email
 invitation (username and `github_id`, onto their own pending row), fills in a
 missing `github_id` from the classroom team's membership (and a blank or
-outdated username from the member's `github_id`), and deletes the
-invite teams that are done. If no row claims a recovered invitation (the
+outdated username from the member's `github_id`), deletes the
+invite teams that are done, and dismisses any expired-invitation record GitHub
+still keeps for an address that accepted a later one. If no row claims a recovered invitation (the
 pending row was deleted, or `roster invite`'s commit never landed), it appends
 a row so the address isn't lost. The web app runs this same sync when a teacher
 opens the roster; here it's explicit and script-callable. The web app's pass
@@ -422,8 +441,10 @@ missing.
 
 The sync **never removes a roster row**. An email-only row nothing backs (an
 expired or canceled invitation) stays on the roster for you to re-invite, link,
-or delete by hand; the web app shows it as unlinked with an **Invitation
-expired** badge and offers **Re-invite**. Its scope is the email-invite
+or remove; the web app shows it as unlinked with an **Invitation
+expired** badge and offers **Re-invite** and **Remove row**, and from the CLI
+[`roster invite`](#roster-invite) re-sends against the same row while
+[`roster remove <email>`](#roster-remove) drops it. Its scope is the email-invite
 lifecycle and `github_id`. It never rewrites a `role` already recorded on a
 row, and it doesn't add rows for organization members who were never invited
 through Classroom 50; see
@@ -435,7 +456,8 @@ rather than as a student. If no team names them, the stored role is left as it i
 
 **Dry run by default**: without `--write` it issues no write request at all. A dry
 run also reports an invite team whose address the roster *already* records, since
-that team is redundant and `--write` would retire it. It counts as changes
+that team is redundant and `--write` would retire it, and any expired-invitation
+record `--write` would dismiss. Both count as changes
 pending, so a pass with nothing to fold exits `2` rather than claiming the
 classroom is up to date. `--write` is refused outright on an **archived**
 classroom (`active: false` in `classroom.json`), whose roster is frozen; a dry run
@@ -473,10 +495,24 @@ required; an unknown username is an error.
 
 ```sh
 gh teacher roster remove <org> <classroom> <username>
+gh teacher roster remove <org> <classroom> <email>
 ```
 
 Drops the row (idempotent). Does **not** remove organization membership; use
 `gh teacher remove <org> <username>` for that.
+
+Passing an **email** drops the pending row a lapsed invitation left behind, the
+same as the web app's **Remove row**. It asks GitHub first and drops the row only
+when nothing backs it: an invitation still on the organization's pending list is
+refused and left for [`roster cancel-invite`](#roster-cancel-invite), a student
+who accepted but isn't recorded yet is refused and left for
+[`roster sync --write`](#roster-sync), and an invite team whose record was edited
+by hand and still holds a member is refused for you to check. Once the row is
+dropped, the invitation's leftover metadata team is deleted (after a fresh check,
+so a re-invitation sent meanwhile keeps its team) and GitHub's expired record for
+the address is dismissed, each as a warning if it fails. An address
+that sits on a row with an account is refused with the username form to run
+instead.
 
 ### `roster import`
 

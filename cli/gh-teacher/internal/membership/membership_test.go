@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/foundation50/gh-teacher/internal/cliutil"
 	"github.com/foundation50/gh-teacher/internal/githubtest"
 )
 
@@ -124,6 +125,14 @@ func TestClassifyOrgInviteError(t *testing.T) {
 // `/orgs/o/memberships/` and must never be attempted.
 func inviteByEmailServer(t *testing.T, status int, oauthScopes string, capture *map[string]any) *httptest.Server {
 	t.Helper()
+	return inviteByEmailServerWithBody(t, status, oauthScopes, `{"id":1}`, nil, capture)
+}
+
+// inviteByEmailServerWithBody is inviteByEmailServer with the response body and
+// extra headers chosen by the test: a 422's text and a throttle's Retry-After
+// are what the classifier reads.
+func inviteByEmailServerWithBody(t *testing.T, status int, oauthScopes, body string, headers map[string]string, capture *map[string]any) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/orgs/o/invitations", func(w http.ResponseWriter, r *http.Request) {
 		if capture != nil {
@@ -132,9 +141,12 @@ func inviteByEmailServer(t *testing.T, status int, oauthScopes string, capture *
 		if oauthScopes != "" {
 			w.Header().Set("X-OAuth-Scopes", oauthScopes)
 		}
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(`{"id":1}`))
+		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -182,10 +194,11 @@ func TestInviteOrgByEmail(t *testing.T) {
 		}
 	})
 
-	t.Run("422 → already-invited-or-member sentinel, no username follow-up", func(t *testing.T) {
+	t.Run("422 saying already → already-invited-or-member sentinel, no username follow-up", func(t *testing.T) {
 		// The mux fails the test on any non-/invitations route, so this also
 		// pins that ClassifyOrgInviteError's username-keyed 422 lookup is bypassed.
-		server := inviteByEmailServer(t, http.StatusUnprocessableEntity, "", nil)
+		server := inviteByEmailServerWithBody(t, http.StatusUnprocessableEntity, "",
+			`{"message":"Validation Failed","errors":[{"message":"Invitee is already a part of this org"}]}`, nil, nil)
 		client := githubtest.NewTestClient(t, server)
 
 		err := InviteOrgByEmail(client, "o", "alice@example.com", nil)
@@ -194,6 +207,50 @@ func TestInviteOrgByEmail(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "alice@example.com") {
 			t.Errorf("message = %q, want the invited address", err.Error())
+		}
+	})
+
+	t.Run("422 naming the invitation limit → limit sentinel, never a skip", func(t *testing.T) {
+		server := inviteByEmailServerWithBody(t, http.StatusUnprocessableEntity, "",
+			`{"message":"Over invitation rate limit. Try again later."}`, nil, nil)
+		client := githubtest.NewTestClient(t, server)
+
+		err := InviteOrgByEmail(client, "o", "alice@example.com", nil)
+		if !errors.Is(err, ErrInvitationLimit) {
+			t.Fatalf("err = %v, want ErrInvitationLimit", err)
+		}
+		if errors.Is(err, ErrEmailAlreadyInvitedOrMember) {
+			t.Errorf("a capped send must not read as already invited: %v", err)
+		}
+	})
+
+	t.Run("422 with any other text → failure carrying GitHub's reason", func(t *testing.T) {
+		server := inviteByEmailServerWithBody(t, http.StatusUnprocessableEntity, "",
+			`{"message":"Validation Failed","errors":[{"message":"Email is invalid"}]}`, nil, nil)
+		client := githubtest.NewTestClient(t, server)
+
+		err := InviteOrgByEmail(client, "o", "alice@example.com", nil)
+		if err == nil || errors.Is(err, ErrEmailAlreadyInvitedOrMember) || errors.Is(err, ErrInvitationLimit) {
+			t.Fatalf("err = %v, want a plain failure", err)
+		}
+		if !strings.Contains(err.Error(), "Email is invalid") {
+			t.Errorf("message = %q, want GitHub's reason", err.Error())
+		}
+	})
+
+	t.Run("403 shaped as a secondary rate limit → still a rate limit", func(t *testing.T) {
+		// GitHub sends secondary limits as a 403 too; the admin:org scope on the
+		// token would otherwise read it as "not an admin".
+		server := inviteByEmailServerWithBody(t, http.StatusForbidden, "repo, admin:org",
+			`{"message":"You have exceeded a secondary rate limit"}`, map[string]string{"Retry-After": "60"}, nil)
+		client := githubtest.NewTestClient(t, server)
+
+		err := InviteOrgByEmail(client, "o", "alice@example.com", nil)
+		if !cliutil.IsRateLimited(err) {
+			t.Fatalf("err = %v, want a rate limit IsRateLimited still recognizes", err)
+		}
+		if errors.Is(err, ErrMissingOrgAdminScope) || strings.Contains(err.Error(), "admin") {
+			t.Errorf("a throttle must not be reported as an admin problem: %v", err)
 		}
 	})
 

@@ -50,6 +50,11 @@ type syncMock struct {
 
 	pending       []map[string]any
 	pendingStatus int
+	// failed is served as GET /orgs/o/failed_invitations (nil → empty list):
+	// the expired records a recovered address gets dismissed. failedStatus
+	// overrides the read.
+	failed       []map[string]any
+	failedStatus int
 	// pendingFailAfterScan fails the invitation read only AFTER the scan's, so
 	// the teardown's delete-time liveness re-check is the read that degrades.
 	pendingFailAfterScan bool
@@ -84,6 +89,7 @@ type syncMock struct {
 
 	calls        []inviteCall
 	deletedTeams []string
+	dismissed    []string
 	committed    bool
 }
 
@@ -188,6 +194,21 @@ func (m *syncMock) handler(t *testing.T) http.Handler {
 			pending = []map[string]any{}
 		}
 		_ = json.NewEncoder(w).Encode(pending)
+	})
+	base.HandleFunc("/orgs/o/failed_invitations", func(w http.ResponseWriter, r *http.Request) {
+		if m.failedStatus != 0 {
+			w.WriteHeader(m.failedStatus)
+			return
+		}
+		failed := m.failed
+		if failed == nil {
+			failed = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(failed)
+	})
+	base.HandleFunc("/orgs/o/invitations/", func(w http.ResponseWriter, r *http.Request) {
+		m.dismissed = append(m.dismissed, strings.TrimPrefix(r.URL.Path, "/orgs/o/invitations/"))
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	// committed latches on the roster write so a same-email re-invite can be
@@ -341,6 +362,105 @@ func TestRunRosterSync_AcceptedInviteRecoveredThenClean(t *testing.T) {
 	}
 	if !strings.Contains(cleanOut, "up to date") {
 		t.Errorf("a clean pass should say so:\n%s", cleanOut)
+	}
+}
+
+// An accepted invitation whose address still carries an EXPIRED record (an
+// earlier invitation lapsed, and a re-invite from GitHub's UI or an older CLI
+// didn't dismiss it) is noise once they're in, so the sync clears it: the dry run
+// reports it as pending work, and --write dismisses it after the roster commit
+// lands (the web's dismiss-after-confirmation ordering).
+func TestRunRosterSync_RecoveredAddressDismissesExpiredRecords(t *testing.T) {
+	roster := storedRosterHeader + ",Ada,Lovelace," + inviteTestEmail + ",section-1,,student\n"
+	failed := []map[string]any{
+		{"id": 70, "email": inviteTestEmail},
+		{"id": 71, "email": "someone-else@uni.edu"},
+	}
+
+	dry := newSyncMock(t, roster)
+	dry.teams = []syncTeam{acceptedInviteTeam(t)}
+	dry.failed = failed
+	out, _, err := runSync(t, dry, false)
+	if got := exitCode(err); got != 2 {
+		t.Fatalf("dry-run exit code = %d (err %v), want 2", got, err)
+	}
+	if !strings.Contains(out, "dismiss 1 expired invitation record") {
+		t.Errorf("dry run should report the record it would dismiss:\n%s", out)
+	}
+	if writes := writeCalls(dry.calls); len(writes) != 0 {
+		t.Errorf("dry run issued %d write request(s): %#v", len(writes), writes)
+	}
+
+	apply := newSyncMock(t, roster)
+	apply.teams = []syncTeam{acceptedInviteTeam(t)}
+	apply.failed = failed
+	out, _, err = runSync(t, apply, true)
+	if err != nil {
+		t.Fatalf("--write: %v", err)
+	}
+	if len(apply.dismissed) != 1 || apply.dismissed[0] != "70" {
+		t.Errorf("dismissed = %v, want exactly record 70 (not someone else's 71)", apply.dismissed)
+	}
+	treeIdx := indexOfCall(apply.calls, http.MethodPost, "/repos/o/classroom50/git/trees")
+	dismissIdx := indexOfCall(apply.calls, http.MethodDelete, "/orgs/o/invitations/70")
+	if treeIdx < 0 || dismissIdx < treeIdx {
+		t.Errorf("the dismiss (call %d) must follow the roster commit (call %d)", dismissIdx, treeIdx)
+	}
+	if !strings.Contains(out, "dismissed 1 expired invitation record") {
+		t.Errorf("--write should report the dismissed record:\n%s", out)
+	}
+}
+
+// A recovery can leave the roster untouched and its team standing (the row
+// already names the account under a different address, so there is nothing to
+// fold and the team is not proven redundant) while an expired record for the
+// address still waits to be dismissed. That dismissal is work --write would do,
+// so the dry run must count it as pending rather than report "up to date".
+func TestRunRosterSync_DismissalAloneCountsAsPending(t *testing.T) {
+	roster := storedRosterHeader + syncTestAcceptedLogin + ",Ada,Lovelace,ada.personal@uni.edu,section-1,101,student\n"
+	mock := newSyncMock(t, roster)
+	mock.teams = []syncTeam{acceptedInviteTeam(t)}
+	mock.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+
+	out, _, err := runSync(t, mock, false)
+	if got := exitCode(err); got != 2 {
+		t.Fatalf("dry-run exit code = %d (err %v), want 2 for a planned dismissal", got, err)
+	}
+	if strings.Contains(out, "up to date") {
+		t.Errorf("dry run claimed up to date while planning a dismissal:\n%s", out)
+	}
+	if !strings.Contains(out, "dismiss 1 expired invitation record") {
+		t.Errorf("dry run should report the record it would dismiss:\n%s", out)
+	}
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("dry run issued %d write request(s): %#v", len(writes), writes)
+	}
+}
+
+// The failed list is owner-only bookkeeping: a pass with nothing recovered never
+// reads it, and an unreadable list (403) neither warns nor changes the outcome.
+func TestRunRosterSync_FailedListIsReadOnlyForRecoveries(t *testing.T) {
+	quiet := newSyncMock(t, storedRosterHeader+",,,gone@uni.edu,,,student\n")
+	quiet.failedStatus = http.StatusInternalServerError // would warn if read
+	if _, errOut, err := runSync(t, quiet, true); err != nil {
+		t.Fatalf("--write with nothing to recover: %v", err)
+	} else if strings.Contains(errOut, "failed invitations") {
+		t.Errorf("read the failed list with nothing recovered:\n%s", errOut)
+	}
+	if n := countCalls(quiet.calls, http.MethodGet, "/orgs/o/failed_invitations"); n != 0 {
+		t.Errorf("failed-list reads = %d, want 0 with nothing recovered", n)
+	}
+
+	forbidden := newSyncMock(t, storedRosterHeader+",Ada,Lovelace,"+inviteTestEmail+",section-1,,student\n")
+	forbidden.teams = []syncTeam{acceptedInviteTeam(t)}
+	forbidden.failedStatus = http.StatusForbidden
+	if _, errOut, err := runSync(t, forbidden, true); err != nil {
+		t.Fatalf("an owner-only 403 on the failed list must not fail the sync: %v", err)
+	} else if strings.Contains(errOut, "Warning") {
+		t.Errorf("a 403 on the owner-only list should be silent:\n%s", errOut)
+	}
+	if len(forbidden.dismissed) != 0 {
+		t.Errorf("dismissed %v with an unreadable list", forbidden.dismissed)
 	}
 }
 

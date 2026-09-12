@@ -362,12 +362,18 @@ argument.
 
 ```sh
 gh teacher roster remove <org> <classroom> <username>
+gh teacher roster remove <org> <classroom> <email>     # drop a dead pending row
 ```
 
 > [!NOTE]
 > This does **not** remove organization membership; use `gh teacher remove`
 > (step 8) for that. Splitting the two is deliberate: a roster edit shouldn't be
 > able to revoke a student's access to every repo in the organization.
+
+The email form is for the pending row a lapsed invitation leaves behind (see
+[Syncing the roster](#syncing-the-roster-with-github)). It refuses while GitHub
+still lists the invitation (use `roster cancel-invite`) or while an accepted
+student is waiting to be synced (use `roster sync --write`).
 
 Roster writes retry on top of each other, so two teachers editing at once can't
 lose each other's work. If you see `lost the rebase race`, retry.
@@ -396,8 +402,12 @@ pending invitation, is reported as skipped and the command exits 0.
 
 It refuses to send in two cases: the classroom has no usable team recorded in
 `classroom.json`, or the roster already lists the address as a **pending
-invitation**. (With `--file` that second case is a skip rather than a refusal, so
-one already-invited address doesn't stop the batch.) An address some *other* row
+invitation** that GitHub still has open (or that someone accepted but you haven't
+synced yet). (With `--file` that second case is a skip rather than a refusal, so
+one already-invited address doesn't stop the batch.) A pending row whose
+invitation has since **expired** (GitHub invitations last 7 days) doesn't block:
+a new invitation is sent and the existing row is kept, the same as the web app's
+**Re-invite**. An address some *other* row
 merely carries is a shared address (a
 parent, a lab contact), so the real person still gets invited: the invitation is
 sent, a note on stderr names that row, and **no second row is written**. If the
@@ -482,7 +492,9 @@ gh teacher roster sync <org> <classroom> --write    # apply it
 It records the students who accepted an email invitation (username and
 `github_id`, onto their own pending row), fills in a missing `github_id` from the
 classroom team's membership (and a blank or outdated username from the member's
-`github_id`), and deletes the invite teams that are done. If no
+`github_id`), deletes the invite teams that are done, and dismisses any
+expired-invitation record GitHub still keeps for an address that accepted a later
+one. If no
 row claims an accepted invitation (the pending row was deleted, or the invite's
 roster commit never landed), it appends one so the address isn't lost; that row
 records the role of the classroom team the account was found on, so a staff
@@ -490,10 +502,13 @@ member who accepted an email invitation is recorded with their staff role rather
 than as a student. A role already recorded is never rewritten.
 
 The sync **never removes a row**. A pending row whose invitation expired or was
-canceled stays on the roster for you to re-invite, link, or delete by hand: the
+canceled stays on the roster for you to re-invite, link, or remove: the
 web app shows it as unlinked with an **Invitation expired** badge and offers
-**Re-invite**, **Link account**, and **Remove row**; from the CLI, drop it by
-editing `roster.csv`.
+**Re-invite**, **Link account**, and **Remove row**; from the CLI, re-invite it
+with [`roster invite`](#inviting-a-student-by-email), which sends a new
+invitation against the same row, or drop it with `roster remove <org> <classroom>
+<email>`, which checks with GitHub first so it never drops a row an invitation
+someone could still accept is backing.
 
 The web app runs this same sync when a teacher opens the roster, and
 additionally refreshes each row's recorded `role` from live team membership; this
@@ -502,7 +517,8 @@ is the rest of that work without a browser. For every trigger, see
 
 **Dry run unless you pass `--write`**: without it, no write request is issued at
 all. A dry run also flags an invite team whose address the roster *already*
-records, since `--write` would retire it. That counts as changes pending, so the
+records, since `--write` would retire it, and any expired-invitation record it
+would dismiss. Both count as changes pending, so the
 run exits `2` rather than reporting the classroom up to date. On an **archived**
 classroom `--write` is refused (the roster is frozen), while a dry run still
 reports what's outstanding.

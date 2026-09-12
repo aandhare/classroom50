@@ -215,34 +215,60 @@ func rosterUpdateCmd() *cobra.Command {
 
 func rosterRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "remove <org> <classroom> <username>",
-		Short: "Remove one student from roster.csv",
-		Long: "Drop the row whose username matches <username> (case-insensitive)\n" +
+		Use:   "remove <org> <classroom> <username-or-email>",
+		Short: "Remove one student or one dead pending row from roster.csv",
+		Long: "Pass a username to drop that student's row (matched case-insensitively)\n" +
 			"from <org>/classroom50/<classroom>/roster.csv.\n\n" +
 			"Does not remove the student from the org. Use\n" +
 			"`gh teacher remove <org> <username>` for that: it's a\n" +
 			"deliberate two-step process so an off-by-one roster edit\n" +
 			"can't accidentally revoke a student's access to every repo\n" +
 			"in the org.\n\n" +
+			"Pass an email address instead to drop the pending row a lapsed\n" +
+			"invitation left behind (GitHub invitations expire after 7 days),\n" +
+			"the same as the web app's Remove row. The row is dropped only once\n" +
+			"GitHub confirms nothing backs it: an invitation still pending is\n" +
+			"left for `gh teacher roster cancel-invite`, and a student who\n" +
+			"accepted but isn't recorded yet is left for `gh teacher roster\n" +
+			"sync --write`, so a row can never be dropped out from under an\n" +
+			"invitation someone could still accept. The invitation's leftover\n" +
+			"metadata team and GitHub's expired record for the address are\n" +
+			"cleared too.\n\n" +
 			"Idempotent: if the row is absent, exits 0 with a note.",
-		Example: "  gh teacher roster remove cs50-fall-2026 cs-principles alice",
-		Args:    cobra.ExactArgs(3),
+		Example: "  gh teacher roster remove cs50-fall-2026 cs-principles alice\n" +
+			"  gh teacher roster remove cs50-fall-2026 cs-principles ada@example.edu",
+		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
 			org := strings.TrimSpace(args[0])
 			classroom := strings.TrimSpace(args[1])
-			username := strings.TrimSpace(args[2])
-			if org == "" || classroom == "" || username == "" {
-				return errors.New("org, classroom, and username must all be non-empty")
+			subject := strings.TrimSpace(args[2])
+			if org == "" || classroom == "" || subject == "" {
+				return errors.New("org, classroom, and username or email must all be non-empty")
 			}
 			if err := validate.ShortName(classroom, "classroom"); err != nil {
 				return err
+			}
+			// A username can't contain @, so the argument's shape picks the path.
+			// The address is canonicalized before auth, as the invite paths do, so
+			// a form GitHub rejects (`<a@b.edu>`, `@handle`) fails here instead of
+			// matching no row and exiting 0.
+			email := ""
+			if strings.Contains(subject, "@") {
+				canonical, err := configrepo.CanonicalRosterEmail(subject)
+				if err != nil {
+					return err
+				}
+				email = canonical
 			}
 			client, err := githubapi.RequireAuthClient(cmd)
 			if err != nil {
 				return err
 			}
-			return runRosterRemove(client, cmd.OutOrStdout(), org, classroom, username)
+			if email != "" {
+				return runRosterRemovePendingRow(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, classroom, email)
+			}
+			return runRosterRemove(client, cmd.OutOrStdout(), org, classroom, subject)
 		},
 	}
 	return cmd

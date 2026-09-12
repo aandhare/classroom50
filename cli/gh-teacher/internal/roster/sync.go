@@ -95,7 +95,9 @@ func rosterSyncCmd() *cobra.Command {
 			"per-invite `secret` metadata team holds the only record of which\n" +
 			"address the new account came from. This folds that mapping onto the\n" +
 			"pending row and then retires the team, in that order, so a failed\n" +
-			"cleanup never loses the address.\n\n" +
+			"cleanup never loses the address. Any expired-invitation record\n" +
+			"GitHub still keeps for that address is dismissed too, since they\n" +
+			"got in.\n\n" +
 			"The sync never REMOVES a roster row. An email row nothing backs\n" +
 			"stays on the roster for the teacher to link or delete by hand (the\n" +
 			"web app shows it as \"unlinked\").\n\n" +
@@ -664,9 +666,10 @@ func runRosterSync(client githubapi.Client, out, errOut io.Writer, org, classroo
 		scan.staleSlugs = nil
 		retirable = nil
 	}
-	reportSyncPlan(out, errOut, org, classroom, scan, plan, retirable)
+	failed := &failedInviteRecords{client: client, org: org}
+	dismissals := reportSyncPlan(out, errOut, org, classroom, scan, plan, retirable, failed)
 
-	pending := !plan.empty() || len(scan.staleSlugs) > 0 || len(retirable) > 0
+	pending := !plan.empty() || len(scan.staleSlugs) > 0 || len(retirable) > 0 || dismissals > 0
 	if !write {
 		if pending {
 			_, _ = fmt.Fprintf(errOut, "Nothing was changed. Re-run with --write to apply this.\n")
@@ -686,6 +689,11 @@ func runRosterSync(client githubapi.Client, out, errOut io.Writer, org, classroo
 	retired, err := applyRosterSync(client, out, org, classroom, branch, scan, idx)
 	if err != nil {
 		return err
+	}
+	// Runs before the trust check: a recovery is proven per team, and this
+	// touches no metadata team.
+	for _, rec := range scan.recovered {
+		failed.dismiss(out, errOut, rec.Email)
 	}
 	if !scan.trusted {
 		_, _ = fmt.Fprintf(errOut, "Note: %s: no metadata team was deleted; this pass could not read enough to prove one is redundant.\n", org)
@@ -746,11 +754,17 @@ func syncDegradedError(org, classroom string) error {
 
 // reportSyncPlan prints the planned edits on stdout (the result a script reads)
 // and the report-only findings needing a human on stderr. `retirable` is the
-// recovered metadata teams a --write pass would delete: reported here so a dry
-// run whose roster plan is empty still says so rather than "up to date".
-func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteScan, plan rosterPlan, retirable []string) {
+// recovered metadata teams a --write pass would delete, and the returned count
+// is the expired records it would dismiss: both are reported here so a dry run
+// whose roster plan is empty still says so rather than "up to date". The failed
+// list is read only when there is a recovery to dismiss for.
+func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteScan, plan rosterPlan, retirable []string, failed *failedInviteRecords) int {
 	path := fmt.Sprintf("%s/%s/%s", org, configrepo.ConfigRepoName, configrepo.RosterFilePath(classroom))
-	if plan.empty() && len(scan.staleSlugs) == 0 && len(retirable) == 0 {
+	dismissals := 0
+	for _, rec := range scan.recovered {
+		dismissals += len(failed.idsFor(errOut, rec.Email))
+	}
+	if plan.empty() && len(scan.staleSlugs) == 0 && len(retirable) == 0 && dismissals == 0 {
 		_, _ = fmt.Fprintf(out, "%s: up to date (no invites to record, no ids to fill)\n", path)
 	}
 	for _, rec := range plan.folds {
@@ -774,6 +788,11 @@ func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteSca
 	for _, slug := range retirable {
 		_, _ = fmt.Fprintf(out, "%s: retire the metadata team %s (the roster already records its address)\n", org, slug)
 	}
+	for _, rec := range scan.recovered {
+		if ids := failed.idsFor(errOut, rec.Email); len(ids) > 0 {
+			_, _ = fmt.Fprintf(out, "%s: dismiss %d expired invitation record(s) for %s (they accepted a later one)\n", org, len(ids), rec.Email)
+		}
+	}
 	for _, username := range plan.findings.dupLogins {
 		_, _ = fmt.Fprintf(errOut, "Warning: %s: left a second row for %q alone: more than one row carries that username, and only the first can be filled in, so which student the id belongs to is not this pass's guess. Remove the duplicate row (or give it its own username) to let the sync finish it.\n",
 			path, username)
@@ -785,6 +804,7 @@ func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteSca
 	for _, anomaly := range scan.anomalies {
 		_, _ = fmt.Fprintf(errOut, "Warning: %s: kept %s\n", org, anomaly)
 	}
+	return dismissals
 }
 
 // applyRosterSync is phase 3: ONE rebase-retried commit that folds every
