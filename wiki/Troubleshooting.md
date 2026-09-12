@@ -296,7 +296,9 @@ and the **Members** page shows the same badge. To recover:
   written, and GitHub's expired record for the address is dismissed once the
   new invitation is confirmed. An address whose invitation is still open, or
   that was accepted but not yet synced, is refused with a message saying which
-  (with `--file` it is skipped instead and the rest of the list still goes).
+  (with `--file` it is skipped instead and the rest of the list still goes). To
+  drop the row instead of re-inviting, run `gh teacher roster remove <org>
+  <classroom> <email>`; it applies the same checks before removing anything.
 
 A failed invitation whose roster row was already removed shows up on the
 **Members** page as a **failed invitation that isn't on any roster**. Nothing
@@ -542,8 +544,10 @@ cs-principles --write` in that case. If the invitation expired instead, run
 `gh teacher roster invite` for the address again: it sends a new invitation
 against the same row (see
 [A student's invitation expired before they accepted](#a-students-invitation-expired-before-they-accepted)).
-To drop the row without re-inviting, edit `roster.csv`; neither `cancel-invite`
-nor the sync removes a row nothing backs.
+To drop the row without re-inviting, run `gh teacher roster remove cs50-fall-2026
+cs-principles ada@example.edu`: it drops the row only once GitHub confirms
+nothing backs it, and clears the leftover metadata team and expired record with
+it. Neither `cancel-invite` nor the sync removes a row nothing backs.
 
 ### A pending row shows a `github_id` that can't be an account
 

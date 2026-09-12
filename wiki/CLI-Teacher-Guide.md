@@ -362,12 +362,18 @@ argument.
 
 ```sh
 gh teacher roster remove <org> <classroom> <username>
+gh teacher roster remove <org> <classroom> <email>     # drop a dead pending row
 ```
 
 > [!NOTE]
 > This does **not** remove organization membership; use `gh teacher remove`
 > (step 8) for that. Splitting the two is deliberate: a roster edit shouldn't be
 > able to revoke a student's access to every repo in the organization.
+
+The email form is for the pending row a lapsed invitation leaves behind (see
+[Syncing the roster](#syncing-the-roster-with-github)). It refuses while GitHub
+still lists the invitation (use `roster cancel-invite`) or while an accepted
+student is waiting to be synced (use `roster sync --write`).
 
 Roster writes retry on top of each other, so two teachers editing at once can't
 lose each other's work. If you see `lost the rebase race`, retry.
@@ -496,11 +502,13 @@ member who accepted an email invitation is recorded with their staff role rather
 than as a student. A role already recorded is never rewritten.
 
 The sync **never removes a row**. A pending row whose invitation expired or was
-canceled stays on the roster for you to re-invite, link, or delete by hand: the
+canceled stays on the roster for you to re-invite, link, or remove: the
 web app shows it as unlinked with an **Invitation expired** badge and offers
 **Re-invite**, **Link account**, and **Remove row**; from the CLI, re-invite it
 with [`roster invite`](#inviting-a-student-by-email), which sends a new
-invitation against the same row, or drop it by editing `roster.csv`.
+invitation against the same row, or drop it with `roster remove <org> <classroom>
+<email>`, which checks with GitHub first so it never drops a row an invitation
+someone could still accept is backing.
 
 The web app runs this same sync when a teacher opens the roster, and
 additionally refreshes each row's recorded `role` from live team membership; this

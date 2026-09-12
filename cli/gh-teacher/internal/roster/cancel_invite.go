@@ -81,8 +81,8 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 		_, _ = fmt.Fprintf(errOut, "Nothing is touched without a pending invitation to revoke, since the metadata team may hold the only record of an accepted invitation's address.\n"+
 			"  - If they already accepted, run %s to record their username and github_id.\n"+
 			"  - If the invitation expired (GitHub invitations last 7 days), run `gh teacher roster invite %s %s %s` to send a new one against the same row.\n"+
-			"  - To drop the row instead, edit %s.\n",
-			syncWriteCommand(org, classroom), org, classroom, email, configrepo.RosterFilePath(classroom))
+			"  - To drop the row instead, run `gh teacher roster remove %s %s %s`.\n",
+			syncWriteCommand(org, classroom), org, classroom, email, org, classroom, email)
 		return nil
 	}
 
@@ -141,8 +141,8 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 
 	message := contract.PrefixCommit(fmt.Sprintf("roster: remove cancelled invite from %s (gh teacher roster cancel-invite)", classroom))
 	if _, err := configwrite.CommitTreeChange(client, org, configrepo.ConfigRepoName, branch, message, build); err != nil {
-		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was cancelled, but dropping its pending row from %s failed; the sync never removes a row, so edit the file to drop it.\n",
-			email, configrepo.RosterFilePath(classroom))
+		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was cancelled, but dropping its pending row from %s failed; run `gh teacher roster remove %s %s %s` to drop it.\n",
+			email, configrepo.RosterFilePath(classroom), org, classroom, email)
 		return fmt.Errorf("invitation cancelled, but the pending roster row was not removed: %w", err)
 	}
 	if !removed {

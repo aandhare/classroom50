@@ -316,7 +316,7 @@ func classifyPendingRow(client githubapi.Client, org, classroom, email string, l
 	case team.Provisional:
 		return pendingDead, nil
 	default:
-		return 0, fmt.Errorf("the invite team %s for %s has a member but its description is no longer a readable invite record, so nothing was sent. Check the team at https://github.com/orgs/%s/teams/%s before re-inviting, and delete it by hand if the member is not the invitee",
+		return 0, fmt.Errorf("the invite team %s for %s has a member but its description is no longer a readable invite record, so nothing was changed. Check the team at https://github.com/orgs/%s/teams/%s first, and delete it by hand if the member is not the invitee",
 			slug, email, org, slug)
 	}
 }
