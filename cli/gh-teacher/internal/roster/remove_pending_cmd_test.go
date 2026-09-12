@@ -115,7 +115,7 @@ func TestRunRosterRemovePendingRow_BackedRowRefused(t *testing.T) {
 	}{
 		{"live invitation", func(m *inviteMock) {
 			m.pending = []map[string]any{{"id": 42, "email": inviteTestEmail, "role": "direct_member"}}
-		}, []string{"still lists a pending invitation", "cancel-invite"}},
+		}, []string{"still lists a pending invitation", "another classroom's", "cancel-invite"}},
 		{"accepted but unsynced", func(m *inviteMock) {
 			m.pending = nil
 			m.inviteTeamDescription = inviteTestRecord(t)
@@ -175,5 +175,139 @@ func TestRunRosterRemovePendingRow_NoPendingRow(t *testing.T) {
 	}
 	if writes := writeCalls(onAccount.calls); len(writes) != 0 {
 		t.Errorf("refusal issued %d write(s): %#v", len(writes), writes)
+	}
+}
+
+// Two pending rows can carry one address (an import re-run, a hand edit); they
+// are indistinguishable by construction, so the drop takes both in one commit
+// and reports once.
+func TestRunRosterRemovePendingRow_DuplicateRowsDroppedTogether(t *testing.T) {
+	roster := storedRosterHeader +
+		",Ada,Lovelace," + inviteTestEmail + ",section-1,,student\n" +
+		",Ada,L.," + strings.ToUpper(inviteTestEmail) + ",section-2,,student\n" +
+		"bea,Bea,Byte,bea@uni.edu,section-1,202,student\n"
+	mock := newInviteMock(t, roster)
+	mock.pending = nil
+	mock.inviteTeamStatus = http.StatusNotFound
+
+	out, _, err := runRemovePending(t, mock, inviteTestEmail)
+	if err != nil {
+		t.Fatalf("runRosterRemovePendingRow: %v", err)
+	}
+	if len(mock.blobs) != 1 {
+		t.Fatalf("want one roster commit, got %d blobs", len(mock.blobs))
+	}
+	rows, err := configrepo.ParseRoster([]byte(mock.blobs[0]))
+	if err != nil {
+		t.Fatalf("parse committed roster: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Username != "bea" {
+		t.Errorf("committed rows = %#v, want only bea's", rows)
+	}
+	if n := strings.Count(out, "removed the pending row"); n != 1 {
+		t.Errorf("removal reported %d times, want once:\n%s", n, out)
+	}
+}
+
+// The roster commit is a round-trip in which the web's Re-invite can adopt the
+// same team for a fresh invitation, or a student can accept one. The team is
+// deleted only on a fresh proof taken after the commit, so either event keeps
+// it; the row is already gone, and the sync appends one when they accept.
+func TestRunRosterRemovePendingRow_TeamKeptWhenBackedAgainAfterCommit(t *testing.T) {
+	cases := []struct {
+		name string
+		flip func(*inviteMock)
+	}{
+		{"re-invited from the web", func(m *inviteMock) {
+			m.pending = []map[string]any{{"id": 43, "email": inviteTestEmail, "role": "direct_member"}}
+		}},
+		{"accepted", func(m *inviteMock) {
+			m.inviteTeamMembers = []map[string]any{{"login": "ada", "id": 99}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newInviteMock(t, removeTestPendingRoster)
+			mock.pending = nil
+			mock.inviteTeamDescription = inviteTestRecord(t)
+			mock.afterCommit = func() { tc.flip(mock) }
+
+			_, errOut, err := runRemovePending(t, mock, inviteTestEmail)
+			if err != nil {
+				t.Fatalf("a re-backed team is a note, not a failure: %v", err)
+			}
+			if len(mock.blobs) != 1 {
+				t.Errorf("want the row commit to have landed, got %d blobs", len(mock.blobs))
+			}
+			if mock.deletedTeamSlug != "" {
+				t.Errorf("deleted team %q that a fresh invitation or member now maps to", mock.deletedTeamSlug)
+			}
+			if !strings.Contains(errOut, "kept metadata team") {
+				t.Errorf("stderr should say the team was kept and why:\n%s", errOut)
+			}
+			// The two pending-list reads prove the delete decision was fresh.
+			if n := countCalls(mock.calls, http.MethodGet, "/orgs/o/invitations"); n != 2 {
+				t.Errorf("pending-list reads = %d, want 2 (classify, then re-check at delete time)", n)
+			}
+		})
+	}
+}
+
+// Once the row is gone, a team or record that can't be cleared is a warning,
+// never a failure: the sync's GC and the People page are the backstops.
+func TestRunRosterRemovePendingRow_TeardownProblemsOnlyWarn(t *testing.T) {
+	cases := []struct {
+		name     string
+		apply    func(*inviteMock)
+		wantWarn string
+	}{
+		{"team DELETE 500", func(m *inviteMock) {
+			m.inviteTeamDescription = inviteTestRecord(t)
+			m.inviteTeamDeleteStatus = http.StatusInternalServerError
+		}, "the row was removed, but deleting"},
+		{"team re-check 500 after the commit", func(m *inviteMock) {
+			m.inviteTeamDescription = inviteTestRecord(t)
+			m.afterCommit = func() { m.inviteTeamStatus = http.StatusInternalServerError }
+		}, "the row was removed, but re-checking"},
+		{"record names another address", func(m *inviteMock) {
+			record, err := configrepo.MarshalInviteDescription(inviteTestClassroom, "someone-else@uni.edu")
+			if err != nil {
+				t.Fatalf("marshal record: %v", err)
+			}
+			m.inviteTeamDescription = record
+		}, "left the metadata team"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newInviteMock(t, removeTestPendingRoster)
+			mock.pending = nil
+			tc.apply(mock)
+
+			_, errOut, err := runRemovePending(t, mock, inviteTestEmail)
+			if err != nil {
+				t.Fatalf("teardown trouble must not fail a drop that landed: %v", err)
+			}
+			if len(mock.blobs) != 1 {
+				t.Errorf("want one roster commit, got %d", len(mock.blobs))
+			}
+			if mock.deletedTeamSlug != "" {
+				t.Errorf("deleted team %q", mock.deletedTeamSlug)
+			}
+			if !strings.Contains(errOut, tc.wantWarn) {
+				t.Errorf("stderr should contain %q:\n%s", tc.wantWarn, errOut)
+			}
+		})
+	}
+}
+
+// The email form is chosen by the @ in the argument and canonicalized before
+// auth, like the invite paths: a form GitHub rejects must fail here rather than
+// match no row and exit 0.
+func TestRosterRemoveCmd_EmailFormValidated(t *testing.T) {
+	for _, arg := range []string{"<ada@uni.edu>", "@alice", "Ada <ada@uni.edu>"} {
+		err := runRosterSubcommand(t, rosterRemoveCmd(), "o", "cs-principles", arg)
+		if err == nil {
+			t.Errorf("%q: err = nil, want the address rejected before any auth or network", arg)
+		}
 	}
 }

@@ -73,9 +73,15 @@ type inviteMock struct {
 	failedRateLimited bool
 	// dismissStatus is the status of DELETE /orgs/o/invitations/{id} (0 → 204).
 	dismissStatus int
+	// inviteTeamDeleteStatus is the status of the invite team's DELETE (0 → 204).
+	inviteTeamDeleteStatus int
 	// commitFails fails the tree POST, simulating a roster write failure after a
 	// successful send.
 	commitFails bool
+	// afterCommit runs once the roster tree POST has been served, so a test can
+	// change what GitHub reports in the window between a commit and the
+	// teardown that follows it.
+	afterCommit func()
 
 	calls           []inviteCall
 	invitationBody  map[string]any
@@ -109,6 +115,10 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 
 	base.HandleFunc(teamPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
+			if status := m.inviteTeamDeleteStatus; status != 0 && status != http.StatusNoContent {
+				w.WriteHeader(status)
+				return
+			}
 			m.deletedTeamSlug = m.inviteTeamSlug
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -234,15 +244,20 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	// commitFails intercepts before the mux so the tree POST never reaches it.
+	// commitFails intercepts before the mux so the tree POST never reaches it;
+	// afterCommit runs once the mux has served it.
 	failing := http.Handler(base)
-	if m.commitFails {
+	if m.commitFails || m.afterCommit != nil {
 		failing = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method == http.MethodPost && r.URL.Path == "/repos/o/classroom50/git/trees" {
+			isTreePost := r.Method == http.MethodPost && r.URL.Path == "/repos/o/classroom50/git/trees"
+			if isTreePost && m.commitFails {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			base.ServeHTTP(w, r)
+			if isTreePost && m.afterCommit != nil {
+				m.afterCommit()
+			}
 		})
 	}
 	return recordCalls(&m.calls, failing)

@@ -508,8 +508,9 @@ refused and left for [`roster cancel-invite`](#roster-cancel-invite), a student
 who accepted but isn't recorded yet is refused and left for
 [`roster sync --write`](#roster-sync), and an invite team whose record was edited
 by hand and still holds a member is refused for you to check. Once the row is
-dropped, the invitation's leftover metadata team is deleted and GitHub's expired
-record for the address is dismissed, each as a warning if it fails. An address
+dropped, the invitation's leftover metadata team is deleted (after a fresh check,
+so a re-invitation sent meanwhile keeps its team) and GitHub's expired record for
+the address is dismissed, each as a warning if it fails. An address
 that sits on a row with an account is refused with the username form to run
 instead.
 

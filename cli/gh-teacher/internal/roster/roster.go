@@ -217,7 +217,7 @@ func rosterRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove <org> <classroom> <username-or-email>",
 		Short: "Remove one student or one dead pending row from roster.csv",
-		Long: "Drop the row whose username matches <username> (case-insensitive)\n" +
+		Long: "Pass a username to drop that student's row (matched case-insensitively)\n" +
 			"from <org>/classroom50/<classroom>/roster.csv.\n\n" +
 			"Does not remove the student from the org. Use\n" +
 			"`gh teacher remove <org> <username>` for that: it's a\n" +
@@ -249,13 +249,24 @@ func rosterRemoveCmd() *cobra.Command {
 			if err := validate.ShortName(classroom, "classroom"); err != nil {
 				return err
 			}
+			// A username can't contain @, so the argument's shape picks the path.
+			// The address is canonicalized before auth, as the invite paths do, so
+			// a form GitHub rejects (`<a@b.edu>`, `@handle`) fails here instead of
+			// matching no row and exiting 0.
+			email := ""
+			if strings.Contains(subject, "@") {
+				canonical, err := configrepo.CanonicalRosterEmail(subject)
+				if err != nil {
+					return err
+				}
+				email = canonical
+			}
 			client, err := githubapi.RequireAuthClient(cmd)
 			if err != nil {
 				return err
 			}
-			// A username can't contain @, so the argument's shape picks the path.
-			if strings.Contains(subject, "@") {
-				return runRosterRemovePendingRow(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, classroom, subject)
+			if email != "" {
+				return runRosterRemovePendingRow(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, classroom, email)
 			}
 			return runRosterRemove(client, cmd.OutOrStdout(), org, classroom, subject)
 		},

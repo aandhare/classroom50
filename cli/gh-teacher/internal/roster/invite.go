@@ -281,42 +281,59 @@ const (
 	pendingDead
 )
 
-// classifyPendingRow resolves a pending row's state from GitHub's pending list
+// pendingRowInspection is what inspectPendingRow learned about a pending row:
+// its state, and the invite team it read to decide it (unread while the
+// invitation is live, so teamFound is false there).
+type pendingRowInspection struct {
+	state     pendingRowState
+	team      configrepo.InviteTeamState
+	teamFound bool
+}
+
+// classifyPendingRow is inspectPendingRow for callers that only need the state.
+func classifyPendingRow(client githubapi.Client, org, classroom, email string, live *liveInvitations) (pendingRowState, error) {
+	insp, err := inspectPendingRow(client, org, classroom, email, live)
+	return insp.state, err
+}
+
+// inspectPendingRow resolves a pending row's state from GitHub's pending list
 // and, only when the invitation is gone, the invite team. The team's record
 // decides what a member on it means: a valid record makes them the invitee; a
 // provisional description (an interrupted run) makes them the stranded teacher
 // the re-send's EnsureInviteTeam drops; any other unreadable record is the same
 // trust failure the sync reports, so the row is refused for a human to check.
-func classifyPendingRow(client githubapi.Client, org, classroom, email string, live *liveInvitations) (pendingRowState, error) {
+func inspectPendingRow(client githubapi.Client, org, classroom, email string, live *liveInvitations) (pendingRowInspection, error) {
 	isLive, err := live.has(email)
 	if err != nil {
-		return 0, err
+		return pendingRowInspection{}, err
 	}
 	if isLive {
-		return pendingLive, nil
+		return pendingRowInspection{state: pendingLive}, nil
 	}
 	slug := configrepo.InviteTeamName(classroom, email)
 	team, found, err := configrepo.ReadInviteTeam(client, org, slug)
 	if err != nil {
-		return 0, err
+		return pendingRowInspection{}, err
 	}
+	insp := pendingRowInspection{state: pendingDead, team: team, teamFound: found}
 	if !found {
-		return pendingDead, nil
+		return insp, nil
 	}
 	members, found, err := configrepo.FindTeamMembersWithIDs(client, org, slug)
 	if err != nil {
-		return 0, err
+		return pendingRowInspection{}, err
 	}
 	if !found || len(members) == 0 {
-		return pendingDead, nil
+		return insp, nil
 	}
 	switch {
 	case team.Record != nil:
-		return pendingAccepted, nil
+		insp.state = pendingAccepted
+		return insp, nil
 	case team.Provisional:
-		return pendingDead, nil
+		return insp, nil
 	default:
-		return 0, fmt.Errorf("the invite team %s for %s has a member but its description is no longer a readable invite record, so nothing was changed. Check the team at https://github.com/orgs/%s/teams/%s first, and delete it by hand if the member is not the invitee",
+		return pendingRowInspection{}, fmt.Errorf("the invite team %s for %s has a member but its description is no longer a readable invite record, so nothing was changed. Check the team at https://github.com/orgs/%s/teams/%s first, and delete it by hand if the member is not the invitee",
 			slug, email, org, slug)
 	}
 }
