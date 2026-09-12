@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -34,8 +35,11 @@ type inviteMock struct {
 	// createStatus is the invite-team create status; 422 drives the adopt path
 	// (a pre-existing team a failed run must NOT delete).
 	createStatus int
-	// invitationStatus is the org-invitation POST status (0 → 201).
-	invitationStatus int
+	// invitationStatus is the org-invitation POST status (0 → 201). A 422 body
+	// says what GitHub rejected: invitation422Message, or the "already" text
+	// when empty.
+	invitationStatus     int
+	invitation422Message string
 	// invitationRateLimited makes the POST fail as a secondary rate limit, which
 	// the web deliberately treats differently from a hard failure.
 	invitationRateLimited bool
@@ -51,8 +55,12 @@ type inviteMock struct {
 	inviteTeamMembers []map[string]any
 	// inviteTeamStatus is the status of the invite team's GET and members read
 	// (0 → 200); 404 is a team the sync already garbage-collected, and lasts
-	// until this run recreates it.
-	inviteTeamStatus int
+	// until this run recreates it. inviteTeamMembersStatus overrides the members
+	// read alone, and inviteTeamRateLimited fails the team GET as a 403-shaped
+	// secondary rate limit.
+	inviteTeamStatus        int
+	inviteTeamMembersStatus int
+	inviteTeamRateLimited   bool
 	// inviteTeamDescription is what the team's GET reports before this run
 	// PATCHes it (empty → a plain record-less description).
 	inviteTeamDescription string
@@ -106,6 +114,10 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 			return
 		}
 		if r.Method == http.MethodGet {
+			if m.inviteTeamRateLimited {
+				writeSecondaryRateLimit403(w)
+				return
+			}
 			if status := m.teamStatus(); status != http.StatusOK {
 				w.WriteHeader(status)
 				return
@@ -129,14 +141,21 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		})
 	})
 	base.HandleFunc(teamPath+"/memberships/"+inviteTestActor, func(w http.ResponseWriter, r *http.Request) {
-		// The drop is what removes a stranded teacher from an adopted team.
+		// The drop removes the acting teacher and nobody else, so a team that
+		// holds someone else stays not-empty.
 		if r.Method == http.MethodDelete {
-			m.inviteTeamMembers = nil
+			m.inviteTeamMembers = slices.DeleteFunc(m.inviteTeamMembers, func(member map[string]any) bool {
+				return member["login"] == inviteTestActor
+			})
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	base.HandleFunc(teamPath+"/members", func(w http.ResponseWriter, r *http.Request) {
-		if status := m.teamStatus(); status != http.StatusOK {
+		status := m.teamStatus()
+		if m.inviteTeamMembersStatus != 0 {
+			status = m.inviteTeamMembersStatus
+		}
+		if status != http.StatusOK {
 			w.WriteHeader(status)
 			return
 		}
@@ -175,6 +194,17 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		status := m.invitationStatus
 		if status == 0 {
 			status = http.StatusCreated
+		}
+		if status == http.StatusUnprocessableEntity {
+			message := m.invitation422Message
+			if message == "" {
+				message = "Invitee is already a part of this org"
+			}
+			// go-gh only reads the message off a JSON content type.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": message})
+			return
 		}
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
@@ -631,6 +661,31 @@ func TestRunRosterInvite_ReinviteAlreadyCoveredStillDismisses(t *testing.T) {
 	}
 }
 
+// GitHub uses the same 422 for its invitation cap. Nothing covers the address
+// after a capped send, so the expired record must stay, the fresh team must
+// stay for a retry to adopt, and the outcome is a deferral, not a skip.
+func TestRunRosterInvite_InvitationCapKeepsRecordAndTeam(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pending = nil
+	mock.invitationStatus = http.StatusUnprocessableEntity
+	mock.invitation422Message = "Over invitation rate limit. Try again later."
+	mock.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+
+	_, _, err := runInvite(t, mock)
+	if err == nil || !strings.Contains(err.Error(), "invitation limit") {
+		t.Fatalf("err = %v, want the invitation limit reported", err)
+	}
+	if len(mock.dismissed) != 0 {
+		t.Errorf("dismissed %v although nothing covers the address", mock.dismissed)
+	}
+	if mock.deletedTeamSlug != "" {
+		t.Errorf("deleted the fresh team %q; a retry should adopt it", mock.deletedTeamSlug)
+	}
+	if len(mock.blobs) != 0 {
+		t.Errorf("wrote a roster row for an address that was not invited: %#v", mock.blobs)
+	}
+}
+
 // A GC'd team is the common expired shape, but a team the sync hasn't reaped yet
 // (younger than the GC age) is the same case: no invitation, no member. The send
 // must adopt that team rather than trip over the name collision.
@@ -675,6 +730,70 @@ func TestRunRosterInvite_StrandedProvisionalTeamIsReinvited(t *testing.T) {
 	}
 	if indexOfCall(mock.calls, http.MethodDelete, "/orgs/o/teams/"+mock.inviteTeamSlug+"/memberships/"+inviteTestActor) < 0 {
 		t.Errorf("the stranded teacher was not dropped from the adopted team; calls = %#v", mock.calls)
+	}
+}
+
+// A record-less team that is NOT provisional was edited by hand (the accepted
+// invitee owns their own team's description), so its member may well be the
+// student. The sync reports that shape as an anomaly and leaves it alone; the
+// re-invite must refuse the same way rather than adopt the team and tell the
+// teacher to remove the member.
+func TestRunRosterInvite_HandEditedTeamWithMemberRefused(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pending = nil
+	mock.inviteTeamDescription = "not an invite record"
+	mock.inviteTeamMembers = []map[string]any{{"login": "ada", "id": 99}}
+
+	_, _, err := runInvite(t, mock)
+	if err == nil {
+		t.Fatal("err = nil, want a refusal naming the unreadable record")
+	}
+	for _, want := range []string{"readable invite record", mock.inviteTeamSlug} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "remove them") {
+		t.Errorf("must not tell the teacher to strip a member who may be the student: %v", err)
+	}
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("wrote %d request(s) for a team a human must check: %#v", len(writes), writes)
+	}
+}
+
+// A degraded read of the invite team (its GET or its members) refuses like a
+// degraded pending-list read: neither "dead" nor "accepted" can be proven, and
+// a rate limit must keep its shape so a bulk run defers instead of failing.
+func TestRunRosterInvite_DegradedTeamReadRefuses(t *testing.T) {
+	cases := []struct {
+		name          string
+		apply         func(*inviteMock)
+		wantRateLimit bool
+	}{
+		{"team GET 500", func(m *inviteMock) { m.inviteTeamStatus = http.StatusInternalServerError }, false},
+		{"team GET rate limited", func(m *inviteMock) { m.inviteTeamRateLimited = true }, true},
+		{"members GET 500 on a recorded team", func(m *inviteMock) {
+			m.inviteTeamDescription = inviteTestRecord(t)
+			m.inviteTeamMembersStatus = http.StatusInternalServerError
+		}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+			mock.pending = nil
+			tc.apply(mock)
+
+			_, _, err := runInvite(t, mock)
+			if err == nil {
+				t.Fatal("err = nil, want the degraded read to refuse")
+			}
+			if got := cliutil.IsRateLimited(err); got != tc.wantRateLimit {
+				t.Errorf("IsRateLimited = %v, want %v: %v", got, tc.wantRateLimit, err)
+			}
+			if writes := writeCalls(mock.calls); len(writes) != 0 {
+				t.Errorf("wrote %d request(s) after a degraded read: %#v", len(writes), writes)
+			}
+		})
 	}
 }
 

@@ -346,6 +346,11 @@ as the web app's **Re-invite**. `roster invite` tells the cases apart by asking
 GitHub, never from the row's shape: an invitation still on the organization's
 pending list is live (whichever classroom sent it), an invite team that holds a
 valid record and a member was accepted, and neither means the invitation died.
+An invite team whose record was edited by hand and still holds a member is
+refused for you to check, the same anomaly `roster sync` reports. If GitHub
+answers the send with its daily invitation limit, nothing was sent: the row and
+GitHub's expired record are left as they were, and the command exits as it does
+for a rate limit.
 
 An address that some *other* row merely carries is a shared address (a parent, a
 lab contact), so the invitation is still sent and the command exits **0**: a note
@@ -449,7 +454,8 @@ rather than as a student. If no team names them, the stored role is left as it i
 
 **Dry run by default**: without `--write` it issues no write request at all. A dry
 run also reports an invite team whose address the roster *already* records, since
-that team is redundant and `--write` would retire it. It counts as changes
+that team is redundant and `--write` would retire it, and any expired-invitation
+record `--write` would dismiss. Both count as changes
 pending, so a pass with nothing to fold exits `2` rather than claiming the
 classroom is up to date. `--write` is refused outright on an **archived**
 classroom (`active: false` in `classroom.json`), whose roster is frozen; a dry run

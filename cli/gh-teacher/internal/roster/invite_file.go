@@ -201,8 +201,8 @@ func runRosterInviteFile(client githubapi.Client, out, errOut io.Writer, org, cl
 		len(invited), appended, len(skipped), len(pendingBlocked)+len(acceptedBlocked), len(failedErrs), len(deferredList))
 
 	for _, entry := range skipped {
-		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): already a member of the org or already invited. Run `gh teacher roster sync %s %s` if they accepted an earlier invitation.\n",
-			entry.email, entry.line, org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): already a member of the org or already invited. Run %s if they accepted an earlier invitation.\n",
+			entry.email, entry.line, syncWriteCommand(org, classroom))
 	}
 	for _, entry := range pendingBlocked {
 		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): GitHub still lists a pending invitation for the address (this classroom's, or another classroom's in %s). Advise them to accept it, then run %s to record them.\n",
@@ -223,15 +223,15 @@ func runRosterInviteFile(client githubapi.Client, out, errOut io.Writer, org, cl
 			rateLimitErr, joinEntryEmails(deferredList))
 	}
 	if len(invited) > 0 {
-		_, _ = fmt.Fprintf(errOut, "Advise the newly-invited students to accept the emailed invitation, then run `gh teacher roster sync %s %s` to record their username and github_id.\n", org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Advise the newly-invited students to accept the emailed invitation, then run %s to record their username and github_id.\n", syncWriteCommand(org, classroom))
 	}
 
 	if commitErr != nil {
 		// Never a rollback: the invitations are the source of truth and each
 		// metadata team retains its address, so a sync heals the rows once the
 		// students accept.
-		_, _ = fmt.Fprintf(errOut, "Warning: %d invitation(s) were sent, but recording them in %s failed; the invitations are unaffected. Re-run this command to record them, or `gh teacher roster sync %s %s` once the students accept.\n",
-			len(invited), configrepo.RosterFilePath(classroom), org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Warning: %d invitation(s) were sent, but recording them in %s failed; the invitations are unaffected. Re-run this command to record them, or run %s once the students accept.\n",
+			len(invited), configrepo.RosterFilePath(classroom), syncWriteCommand(org, classroom))
 		return fmt.Errorf("invitations sent, but the roster rows were not written: %w", commitErr)
 	}
 	if len(failedErrs) > 0 {

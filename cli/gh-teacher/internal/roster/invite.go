@@ -257,9 +257,9 @@ func newOrgInvitationLists(client githubapi.Client, org string) *orgInvitationLi
 	}
 }
 
-// syncWriteCommand is the command every "they accepted, now record them" hint
-// names. The sync is a dry run by default, so a hint that omits --write sends
-// the teacher to a command that records nothing.
+// syncWriteCommand is the command every "now record them" hint names. The sync
+// is a dry run by default, so a hint that omits --write sends the teacher to a
+// command that records nothing.
 func syncWriteCommand(org, classroom string) string {
 	return fmt.Sprintf("`gh teacher roster sync %s %s --write`", org, classroom)
 }
@@ -282,10 +282,11 @@ const (
 )
 
 // classifyPendingRow resolves a pending row's state from GitHub's pending list
-// and, only when the invitation is gone, the invite team. A team without a
-// valid record (gone, or still provisional from an interrupted run) holds no
-// address, so any member on it is a stranded teacher, not an invitee: that row
-// is dead, and the re-send's EnsureInviteTeam adopts and heals the team.
+// and, only when the invitation is gone, the invite team. The team's record
+// decides what a member on it means: a valid record makes them the invitee; a
+// provisional description (an interrupted run) makes them the stranded teacher
+// the re-send's EnsureInviteTeam drops; any other unreadable record is the same
+// trust failure the sync reports, so the row is refused for a human to check.
 func classifyPendingRow(client githubapi.Client, org, classroom, email string, live *liveInvitations) (pendingRowState, error) {
 	isLive, err := live.has(email)
 	if err != nil {
@@ -299,17 +300,25 @@ func classifyPendingRow(client githubapi.Client, org, classroom, email string, l
 	if err != nil {
 		return 0, err
 	}
-	if !found || team.Record == nil {
+	if !found {
 		return pendingDead, nil
 	}
 	members, found, err := configrepo.FindTeamMembersWithIDs(client, org, slug)
 	if err != nil {
 		return 0, err
 	}
-	if found && len(members) > 0 {
-		return pendingAccepted, nil
+	if !found || len(members) == 0 {
+		return pendingDead, nil
 	}
-	return pendingDead, nil
+	switch {
+	case team.Record != nil:
+		return pendingAccepted, nil
+	case team.Provisional:
+		return pendingDead, nil
+	default:
+		return 0, fmt.Errorf("the invite team %s for %s has a member but its description is no longer a readable invite record, so nothing was sent. Check the team at https://github.com/orgs/%s/teams/%s before re-inviting, and delete it by hand if the member is not the invitee",
+			slug, email, org, slug)
+	}
 }
 
 // sendOneEmailInvite is the per-address invite sequence shared by `roster
@@ -365,14 +374,16 @@ func sendOneEmailInvite(client githubapi.Client, out, errOut io.Writer, org, cla
 		// A doomed invitation must not leave a fresh, member-less metadata team
 		// behind for the GC to reap — but an ADOPTED team may hold an earlier
 		// invite's still-unrecovered record, so only delete what this run made.
-		// A rate limit is not doomed: the team stays so a retry adopts it rather
-		// than re-creating one against the same limit (as the web does).
-		if created && !cliutil.IsRateLimited(err) {
+		// A rate limit or GitHub's invitation cap is not doomed: the team stays
+		// so a retry adopts it rather than re-creating one against the same
+		// limit (as the web does).
+		limited := cliutil.IsRateLimited(err) || errors.Is(err, membership.ErrInvitationLimit)
+		if created && !limited {
 			if delErr := configrepo.DeleteInviteTeam(client, org, inviteTeam.Slug); delErr != nil {
 				warnStrandedInviteTeam(errOut, "nothing was invited, but cleaning up", org, inviteTeam.Slug, delErr)
 			}
 		}
-		if cliutil.IsRateLimited(err) {
+		if limited {
 			return outcomeRateLimited, configrepo.TeamRef{}, err
 		}
 		if errors.Is(err, membership.ErrEmailAlreadyInvitedOrMember) {
@@ -430,7 +441,7 @@ func runRosterInvite(client githubapi.Client, out, errOut io.Writer, org, classr
 			org, email, classroomTeam.Slug, inviteTeam.Slug)
 	case outcomeSkippedAlready:
 		_, _ = fmt.Fprintf(out, "%s: skipped %s (already a member of the org or already invited)\n", org, email)
-		_, _ = fmt.Fprintf(errOut, "If they accepted an earlier invitation, run `gh teacher roster sync %s %s` to record them on the roster.\n", org, classroom)
+		_, _ = fmt.Fprintf(errOut, "If they accepted an earlier invitation, run %s to record them on the roster.\n", syncWriteCommand(org, classroom))
 		return nil
 	case outcomePendingBlocked:
 		return fmt.Errorf("GitHub still lists a pending invitation for %s (this classroom's, or another classroom's in %s), so nothing was sent. Advise them to accept it, then run %s to record them. To revoke this classroom's invitation, run `gh teacher roster cancel-invite %s %s %s`",
@@ -475,21 +486,21 @@ func runRosterInvite(client githubapi.Client, out, errOut io.Writer, org, classr
 		// Never a rollback: the invitation is the source of truth and the
 		// metadata team retains the address, so `roster sync` heals the row.
 		// Still non-zero, so a script sees the partial state.
-		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was sent, but recording it in %s failed; run `gh teacher roster sync %s %s` to add the pending row (the invitation itself is unaffected).\n",
-			email, configrepo.RosterFilePath(classroom), org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Warning: the invitation to %s was sent, but recording it in %s failed; run %s to add the pending row (the invitation itself is unaffected).\n",
+			email, configrepo.RosterFilePath(classroom), syncWriteCommand(org, classroom))
 		return fmt.Errorf("invitation sent, but the roster row was not written: %w", err)
 	}
 	if !appended {
 		_, _ = fmt.Fprintf(out, "%s/%s/%s: %s is already on a row, roster unchanged (no second pending row)\n",
 			org, configrepo.ConfigRepoName, configrepo.RosterFilePath(classroom), email)
-		_, _ = fmt.Fprintf(errOut, "Advise %s to accept the emailed invitation, then run `gh teacher roster sync %s %s` to record their username and github_id on the row that carries the address.\n",
-			email, org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Advise %s to accept the emailed invitation, then run %s to record their username and github_id on the row that carries the address.\n",
+			email, syncWriteCommand(org, classroom))
 		return nil
 	}
 	_, _ = fmt.Fprintf(out, "%s/%s/%s: added pending row for %s\n",
 		org, configrepo.ConfigRepoName, configrepo.RosterFilePath(classroom), email)
-	_, _ = fmt.Fprintf(errOut, "Advise %s to accept the emailed invitation, then run `gh teacher roster sync %s %s` to record their username and github_id.\n",
-		email, org, classroom)
+	_, _ = fmt.Fprintf(errOut, "Advise %s to accept the emailed invitation, then run %s to record their username and github_id.\n",
+		email, syncWriteCommand(org, classroom))
 	return nil
 }
 

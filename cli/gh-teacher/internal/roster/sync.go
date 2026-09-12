@@ -667,11 +667,9 @@ func runRosterSync(client githubapi.Client, out, errOut io.Writer, org, classroo
 		retirable = nil
 	}
 	failed := &failedInviteRecords{client: client, org: org}
-	reportSyncPlan(out, errOut, org, classroom, scan, plan, retirable, failed)
+	dismissals := reportSyncPlan(out, errOut, org, classroom, scan, plan, retirable, failed)
 
-	// Dismissals are not counted: a recovery already counts through its fold or
-	// its team.
-	pending := !plan.empty() || len(scan.staleSlugs) > 0 || len(retirable) > 0
+	pending := !plan.empty() || len(scan.staleSlugs) > 0 || len(retirable) > 0 || dismissals > 0
 	if !write {
 		if pending {
 			_, _ = fmt.Fprintf(errOut, "Nothing was changed. Re-run with --write to apply this.\n")
@@ -756,11 +754,17 @@ func syncDegradedError(org, classroom string) error {
 
 // reportSyncPlan prints the planned edits on stdout (the result a script reads)
 // and the report-only findings needing a human on stderr. `retirable` is the
-// recovered metadata teams a --write pass would delete: reported here so a dry
-// run whose roster plan is empty still says so rather than "up to date".
-func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteScan, plan rosterPlan, retirable []string, failed *failedInviteRecords) {
+// recovered metadata teams a --write pass would delete, and the returned count
+// is the expired records it would dismiss: both are reported here so a dry run
+// whose roster plan is empty still says so rather than "up to date". The failed
+// list is read only when there is a recovery to dismiss for.
+func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteScan, plan rosterPlan, retirable []string, failed *failedInviteRecords) int {
 	path := fmt.Sprintf("%s/%s/%s", org, configrepo.ConfigRepoName, configrepo.RosterFilePath(classroom))
-	if plan.empty() && len(scan.staleSlugs) == 0 && len(retirable) == 0 {
+	dismissals := 0
+	for _, rec := range scan.recovered {
+		dismissals += len(failed.idsFor(errOut, rec.Email))
+	}
+	if plan.empty() && len(scan.staleSlugs) == 0 && len(retirable) == 0 && dismissals == 0 {
 		_, _ = fmt.Fprintf(out, "%s: up to date (no invites to record, no ids to fill)\n", path)
 	}
 	for _, rec := range plan.folds {
@@ -800,6 +804,7 @@ func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteSca
 	for _, anomaly := range scan.anomalies {
 		_, _ = fmt.Fprintf(errOut, "Warning: %s: kept %s\n", org, anomaly)
 	}
+	return dismissals
 }
 
 // applyRosterSync is phase 3: ONE rebase-retried commit that folds every

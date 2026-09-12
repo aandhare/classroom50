@@ -150,8 +150,9 @@ func (m *bulkInviteMock) handler(t *testing.T) http.Handler {
 			return
 		}
 		if m.status422[body.Email] {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
-			_, _ = w.Write([]byte(`{"message":"already a member"}`))
+			_, _ = w.Write([]byte(`{"message":"Invitee is already a part of this org"}`))
 			return
 		}
 		m.invitedEmails = append(m.invitedEmails, body.Email)

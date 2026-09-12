@@ -509,7 +509,8 @@ is the rest of that work without a browser. For every trigger, see
 
 **Dry run unless you pass `--write`**: without it, no write request is issued at
 all. A dry run also flags an invite team whose address the roster *already*
-records, since `--write` would retire it. That counts as changes pending, so the
+records, since `--write` would retire it, and any expired-invitation record it
+would dismiss. Both count as changes pending, so the
 run exits `2` rather than reporting the classroom up to date. On an **archived**
 classroom `--write` is refused (the roster is frozen), while a dry run still
 reports what's outstanding.

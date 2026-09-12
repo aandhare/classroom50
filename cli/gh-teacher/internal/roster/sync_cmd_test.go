@@ -411,6 +411,32 @@ func TestRunRosterSync_RecoveredAddressDismissesExpiredRecords(t *testing.T) {
 	}
 }
 
+// A recovery can leave the roster untouched and its team standing (the row
+// already names the account under a different address, so there is nothing to
+// fold and the team is not proven redundant) while an expired record for the
+// address still waits to be dismissed. That dismissal is work --write would do,
+// so the dry run must count it as pending rather than report "up to date".
+func TestRunRosterSync_DismissalAloneCountsAsPending(t *testing.T) {
+	roster := storedRosterHeader + syncTestAcceptedLogin + ",Ada,Lovelace,ada.personal@uni.edu,section-1,101,student\n"
+	mock := newSyncMock(t, roster)
+	mock.teams = []syncTeam{acceptedInviteTeam(t)}
+	mock.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+
+	out, _, err := runSync(t, mock, false)
+	if got := exitCode(err); got != 2 {
+		t.Fatalf("dry-run exit code = %d (err %v), want 2 for a planned dismissal", got, err)
+	}
+	if strings.Contains(out, "up to date") {
+		t.Errorf("dry run claimed up to date while planning a dismissal:\n%s", out)
+	}
+	if !strings.Contains(out, "dismiss 1 expired invitation record") {
+		t.Errorf("dry run should report the record it would dismiss:\n%s", out)
+	}
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("dry run issued %d write request(s): %#v", len(writes), writes)
+	}
+}
+
 // The failed list is owner-only bookkeeping: a pass with nothing recovered never
 // reads it, and an unreadable list (403) neither warns nor changes the outcome.
 func TestRunRosterSync_FailedListIsReadOnlyForRecoveries(t *testing.T) {

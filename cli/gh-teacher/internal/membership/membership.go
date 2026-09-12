@@ -19,6 +19,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
 
 	"github.com/foundation50/gh-teacher/internal/cliutil"
 	"github.com/foundation50/gh-teacher/internal/githubapi"
@@ -46,9 +48,41 @@ func InviteOrgByID(client githubapi.Client, org, username string, userID int64, 
 // ErrEmailAlreadyInvitedOrMember is the 422 GitHub returns when the address is
 // already a member or already has a pending invitation. The username path
 // confirms which via a membership lookup; an email has no
-// `/orgs/{org}/memberships/{user}` to read, so the 422 itself is the answer —
+// `/orgs/{org}/memberships/{user}` to read, so the 422's text is the answer —
 // callers treat it as a skip, not a failed invite.
 var ErrEmailAlreadyInvitedOrMember = errors.New("already a member of the organization or already invited")
+
+// ErrInvitationLimit is the 422 GitHub returns when the org's invitation cap
+// (50 per day for a new or free org, 500 otherwise) or its spam throttle is hit.
+// Nothing covers the address afterwards, so callers treat it like a rate limit,
+// never as "already invited".
+var ErrInvitationLimit = errors.New("GitHub's invitation limit for the organization was reached; try again later")
+
+var (
+	invitation422Limit   = regexp.MustCompile(`(?i)rate limit|invitation limit|too many`)
+	invitation422Already = regexp.MustCompile(`(?i)already`)
+)
+
+// classifyInvitation422 reads a POST /orgs/{org}/invitations 422, which GitHub
+// uses for three answers ("Validation failed, or the endpoint has been
+// spammed"): already invited or a member, the invitation cap, or any other
+// validation failure. Mirrors the web's classifyInvitation422 so both tools
+// skip, defer, and fail on the same bodies.
+func classifyInvitation422(email string, httpErr *githubapi.HTTPError) error {
+	texts := []string{httpErr.Message}
+	for _, item := range httpErr.Errors {
+		texts = append(texts, item.Message)
+	}
+	joined := strings.TrimSpace(strings.Join(texts, " "))
+	switch {
+	case invitation422Limit.MatchString(joined):
+		return fmt.Errorf("%s: %w (%s)", email, ErrInvitationLimit, joined)
+	case invitation422Already.MatchString(joined):
+		return fmt.Errorf("%s: %w", email, ErrEmailAlreadyInvitedOrMember)
+	default:
+		return fmt.Errorf("%s: GitHub rejected the invitation (%s); check the address and try again", email, joined)
+	}
+}
 
 // InviteOrgByEmail posts an org invitation to an email address (the invitee has
 // no GitHub account to look up yet). teamIDs auto-add the invitee to those teams
@@ -71,8 +105,8 @@ func InviteOrgByEmail(client githubapi.Client, org, email string, teamIDs []int6
 	if err := client.Post(path, bytes.NewReader(body), nil); err != nil {
 		// Intercepted before ClassifyOrgInviteError, whose 422 branch issues a
 		// username-keyed membership GET this path has no username for.
-		if cliutil.IsHTTPStatus(err, http.StatusUnprocessableEntity) {
-			return fmt.Errorf("%s: %w", email, ErrEmailAlreadyInvitedOrMember)
+		if httpErr, ok := errors.AsType[*githubapi.HTTPError](err); ok && httpErr.StatusCode == http.StatusUnprocessableEntity {
+			return classifyInvitation422(email, httpErr)
 		}
 		return ClassifyOrgInviteError(client, org, "", path, err)
 	}
