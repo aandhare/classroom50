@@ -41,15 +41,20 @@ export const AssignmentSidebarMenu = ({
   const matchRoute = useMatchRoute()
   const { user } = useGithubAuth()
 
-  // A protected classroom's public Pages fetch needs the capability secret. A
-  // student reads it from their own repo's .classroom50.yaml (their only
-  // source); a teacher gets it from classroom.json. Gate the classroom.json read
-  // on the viewer's ACTUAL role (not the preview) so a teacher previewing as
-  // a student still resolves the secret for a working accept link — a real
-  // student's read stays disabled (guaranteed 404).
-  const studentRepoNameForSecret = user?.login
-    ? studentRepoName(classroom, assignment, user.login)
-    : ""
+  // Protected-classroom secret: the student team's record first. The
+  // individual repo's .classroom50.yaml covers only pre-schema teams and is
+  // skipped once the record answers (the username formula can't name a team
+  // repo). classroom.json is read only for actual staff (not the preview role)
+  // so a teacher previewing as a student still gets a working accept link.
+  const {
+    secret: teamSecret,
+    pagesBaseUrl: teamPagesBaseUrl,
+    isLoading: loadingBootstrap,
+  } = useClassroomSecret(org, classroom)
+  const studentRepoNameForSecret =
+    !teamSecret && user?.login
+      ? studentRepoName(classroom, assignment, user.login)
+      : ""
   const { secret: studentSecret } = useDotClassroom50(
     org,
     studentRepoNameForSecret,
@@ -60,11 +65,8 @@ export const AssignmentSidebarMenu = ({
   const { data: classroomMeta } = useGetClassroom(org, classroom, {
     enabled: isActuallyStaff,
   })
-  const secret = studentSecret || classroomMeta?.secret
-  // Custom Pages base URL: team record for a real student, classroom.json for
-  // actual staff (same dual sourcing as the secret above).
-  const { pagesBaseUrl: teamPagesBaseUrl, isLoading: loadingBootstrap } =
-    useClassroomSecret(org, classroom)
+  const secret = teamSecret || studentSecret || classroomMeta?.secret
+  // Same sources for a custom Pages base URL.
   const pagesBaseUrl = teamPagesBaseUrl || classroomMeta?.pages_base_url
   const { assignment: publicAssignment } = usePagesAssignments(
     org,

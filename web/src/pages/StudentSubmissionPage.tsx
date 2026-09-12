@@ -547,26 +547,24 @@ const StudentSubmissionPage = () => {
   const { t } = useTranslation()
   const { org, classroom, assignment } = useParams({ strict: false })
   const { user } = useGithubAuth()
-  // Resolve the capability-URL secret (protected classrooms) from two sources
-  // in order: (1) the student's accepted repo's .classroom50.yaml — the only
-  // source a real student can read; (2) the private classroom.json — staff-only
-  // (incl. a teacher previewing as a student), so a not-yet-accepted
-  // preview still gets a working link. Empty when unprotected.
+  // Protected-classroom secret: the student team's record first. The
+  // individual repo's .classroom50.yaml covers only pre-schema teams and is
+  // skipped once the record answers (the username formula can't name a team
+  // repo); the staff-only classroom.json covers a teacher preview.
+  const {
+    secret: teamSecret,
+    pagesBaseUrl: teamPagesBaseUrl,
+    isLoading: loadingBootstrap,
+  } = useClassroomSecret(org, classroom)
   const repoName =
-    classroom && assignment && user?.login
+    !teamSecret && classroom && assignment && user?.login
       ? studentRepoName(classroom, assignment, user.login)
       : ""
   const { secret: repoSecret } = useDotClassroom50(org ?? "", repoName)
-  // classroom.json 404s for a real student (private) — fine, just yields no
-  // secret; the repo secret covers the post-accept case.
   const { data: classroomMeta } = useGetClassroom(org, classroom)
-  const secret = repoSecret || classroomMeta?.secret || undefined
-  // Custom Pages base URL: the team-description bootstrap record for a real
-  // student, classroom.json for a staff preview (mirrors the secret sourcing).
-  // The pages read is gated on the team read settling, so a custom-domain
-  // classroom never fires a doomed github.io fetch that flashes an error.
-  const { pagesBaseUrl: teamPagesBaseUrl, isLoading: loadingBootstrap } =
-    useClassroomSecret(org, classroom)
+  const secret = teamSecret || repoSecret || classroomMeta?.secret || undefined
+  // Same sources for a custom Pages base URL. The Pages read waits for the
+  // team read so a custom-domain classroom never fires a doomed github.io fetch.
   const pagesBaseUrl =
     teamPagesBaseUrl || classroomMeta?.pages_base_url || undefined
 
