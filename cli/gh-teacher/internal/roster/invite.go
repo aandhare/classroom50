@@ -67,12 +67,15 @@ func rosterInviteCmd() *cobra.Command {
 			"     are skipped)\n" +
 			"  1  an address genuinely failed or the roster write failed\n\n" +
 			"A single address returns non-zero on: classroom missing a GitHub team,\n" +
-			"an address the roster already lists as invited, or a failed\n" +
-			"invitation. With --file that same already-listed address is reported\n" +
-			"as skipped instead, and does not affect the exit code. An address\n" +
-			"that already belongs to a member (or already has a pending\n" +
-			"invitation) is reported as skipped and exits 0. An address some other\n" +
-			"row already carries is still invited, but gets no second row.",
+			"an address whose invitation is still outstanding, or a failed\n" +
+			"invitation. When the roster still lists an invite GitHub has since\n" +
+			"expired (they lapse after 7 days), the invitation is re-sent rather\n" +
+			"than refused, and the pending row is kept. With --file that same\n" +
+			"already-listed address is reported as skipped instead, and does not\n" +
+			"affect the exit code. An address that already belongs to a member (or\n" +
+			"already has a pending invitation) is reported as skipped and exits 0.\n" +
+			"An address some other row already carries is still invited, but gets\n" +
+			"no second row.",
 		Example: "  gh teacher roster invite cs50-fall-2026 cs-principles ada@example.edu\n" +
 			"  gh teacher roster invite cs50-fall-2026 cs-principles ada@example.edu --first-name Ada --last-name Lovelace --section section-1\n" +
 			"  gh teacher roster invite cs50-fall-2026 cs-principles --file ./section-1-emails.txt",
@@ -223,9 +226,14 @@ const (
 // every read that could refuse the send happens before the first write, and the
 // invite team's record is written before the invitation exists, so an accepted
 // invitation always has an address to recover.
-func sendOneEmailInvite(client githubapi.Client, errOut io.Writer, org, classroom, email string, classroomTeam configrepo.TeamRef, actor string, rows []configrepo.RosterRow) (emailInviteOutcome, configrepo.TeamRef, error) {
+// reissue overrides the pending-row block: the caller has confirmed GitHub holds
+// no live invitation for the address, so the pending row is a leftover from one
+// that expired and re-sending is the recovery, not a duplicate. The bulk path
+// passes false: it never reads the live-invitation list, so it can't tell an
+// expired invite from a live one and stays conservative.
+func sendOneEmailInvite(client githubapi.Client, errOut io.Writer, org, classroom, email string, classroomTeam configrepo.TeamRef, actor string, rows []configrepo.RosterRow, reissue bool) (emailInviteOutcome, configrepo.TeamRef, error) {
 	holder, pending := rosterEmailClaim(rows, email)
-	if pending {
+	if pending && !reissue {
 		return outcomePendingBlocked, configrepo.TeamRef{}, nil
 	}
 	if holder != "" {
@@ -292,12 +300,29 @@ func runRosterInvite(client githubapi.Client, out, errOut io.Writer, org, classr
 	if err != nil {
 		return err
 	}
+	// A pending row usually means an invitation is still out, and re-sending would
+	// only duplicate it. But GitHub expires an org invitation after 7 days and
+	// drops it while the row lives on, and cancel-invite won't clear a row it has
+	// no live invitation to revoke. So a pending row alone can't decide this: check
+	// whether GitHub still holds the invitation, and only refuse when it does.
 	// Refuse here rather than off outcomePendingBlocked so this path's error can
 	// name the sync/cancel-invite remedies; the helper's own check stays
 	// authoritative for the bulk path.
+	var reissue bool
 	if _, pending := rosterEmailClaim(rows, email); pending {
-		return fmt.Errorf("%s is already invited to %s and nothing was sent. Run `gh teacher roster sync %s %s` if they accepted, or `gh teacher roster cancel-invite %s %s %s` to revoke it",
-			email, classroom, org, classroom, org, classroom, email)
+		live, err := pendingEmailInvitations(client, org)
+		if err != nil {
+			return err
+		}
+		if live[email] {
+			return fmt.Errorf("%s is already invited to %s and nothing was sent. Run `gh teacher roster sync %s %s` if they accepted, or `gh teacher roster cancel-invite %s %s %s` to revoke it",
+				email, classroom, org, classroom, org, classroom, email)
+		}
+		// The row outlived its invitation, so re-issue rather than leave the
+		// teacher wedged: invite refuses off the row, cancel-invite refuses off the
+		// absent invitation, and neither can act.
+		reissue = true
+		_, _ = fmt.Fprintf(errOut, "The earlier invitation to %s had expired; sending a fresh one and keeping its pending row.\n", email)
 	}
 
 	// EnsureInviteTeam drops the creator GitHub silently adds, so it needs to
@@ -307,7 +332,7 @@ func runRosterInvite(client githubapi.Client, out, errOut io.Writer, org, classr
 		return fmt.Errorf("resolving your GitHub login (needed to keep the invite team free of teachers): %w", err)
 	}
 
-	outcome, inviteTeam, sendErr := sendOneEmailInvite(client, errOut, org, classroom, email, classroomTeam, actor, rows)
+	outcome, inviteTeam, sendErr := sendOneEmailInvite(client, errOut, org, classroom, email, classroomTeam, actor, rows, reissue)
 	switch outcome {
 	case outcomeInvited:
 		_, _ = fmt.Fprintf(out, "%s: invited %s as direct_member (teams %s, %s)\n",

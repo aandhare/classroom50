@@ -40,6 +40,14 @@ type inviteMock struct {
 	// commitFails fails the tree POST, simulating a roster write failure after a
 	// successful send.
 	commitFails bool
+	// livePendingEmails is served as the GET /orgs/o/invitations liveness list:
+	// the addresses GitHub still holds an outstanding invitation for. Only read
+	// when a pending roster row makes the invite path check whether the invitation
+	// lapsed, so the happy path never touches it.
+	livePendingEmails []string
+	// listInvitationsStatus is the GET /orgs/o/invitations status (0 → 200 with the
+	// livePendingEmails list); a 5xx drives the liveness read failure.
+	listInvitationsStatus int
 
 	calls           []inviteCall
 	invitationBody  map[string]any
@@ -91,6 +99,18 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 	})
 
 	base.HandleFunc("/orgs/o/invitations", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if s := m.listInvitationsStatus; s != 0 && s != http.StatusOK {
+				w.WriteHeader(s)
+				return
+			}
+			list := make([]map[string]any, 0, len(m.livePendingEmails))
+			for i, email := range m.livePendingEmails {
+				list = append(list, map[string]any{"id": 100 + i, "email": email})
+			}
+			_ = json.NewEncoder(w).Encode(list)
+			return
+		}
 		_ = json.NewDecoder(r.Body).Decode(&m.invitationBody)
 		if m.invitationRateLimited {
 			w.Header().Set("Retry-After", "60")
@@ -368,10 +388,11 @@ func TestRunRosterInvite_AddressOnAnAccountRowWarnsAndSends(t *testing.T) {
 	}
 }
 
-// A pending row already claims this address: re-sending would duplicate the row
-// (or resurrect one sync is about to fold), so refuse before any API write.
-func TestRunRosterInvite_ExistingPendingRowRefusedUpFront(t *testing.T) {
+// A pending row whose invitation GitHub still holds means re-sending would only
+// duplicate a live invite, so refuse before any API write.
+func TestRunRosterInvite_ExistingPendingRowWithLiveInvitationRefusedUpFront(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.livePendingEmails = []string{inviteTestEmail} // GitHub still holds it
 
 	_, _, err := runInvite(t, mock)
 	if err == nil {
@@ -387,6 +408,55 @@ func TestRunRosterInvite_ExistingPendingRowRefusedUpFront(t *testing.T) {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
 			t.Errorf("wrote %s %s before the refusal", c.Method, c.Path)
 		}
+	}
+}
+
+// A pending row GitHub no longer backs is the expired-invitation deadlock (issue
+// #970): invite refused off the row, cancel-invite refused off the absent
+// invitation, and neither could act. Now the send is re-issued instead, and the
+// existing pending row is kept rather than duplicated.
+func TestRunRosterInvite_ExpiredPendingRowIsReissued(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.livePendingEmails = nil // the invitation lapsed; GitHub holds nothing
+
+	out, errOut, err := runInvite(t, mock)
+	if err != nil {
+		t.Fatalf("an expired pending row must re-issue, not fail: %v", err)
+	}
+	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
+		t.Fatalf("the fresh invitation was never sent; calls = %#v", mock.calls)
+	}
+	if !strings.Contains(errOut, "expired") {
+		t.Errorf("stderr should explain the invitation was re-issued:\n%s", errOut)
+	}
+	// The row already carries the address, so no second row is written.
+	if len(mock.blobs) != 0 {
+		t.Errorf("re-issuing must not duplicate the pending row, got %d blob(s): %#v", len(mock.blobs), mock.blobs)
+	}
+	if !strings.Contains(out, "roster unchanged") {
+		t.Errorf("stdout should report the pending row was kept:\n%s", out)
+	}
+}
+
+// A degraded liveness read must not be mistaken for "no live invitation": if the
+// pending row can't be checked against GitHub, the send is refused with the read
+// error intact rather than re-issuing blind.
+func TestRunRosterInvite_LivenessReadFailureRefusesUntouched(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.listInvitationsStatus = http.StatusInternalServerError
+
+	_, _, err := runInvite(t, mock)
+	if err == nil {
+		t.Fatal("err = nil, want the liveness read failure to propagate")
+	}
+	for _, c := range mock.calls {
+		switch c.Method {
+		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
+			t.Errorf("wrote %s %s despite an unreadable invitation list", c.Method, c.Path)
+		}
+	}
+	if len(mock.blobs) != 0 {
+		t.Errorf("a failed liveness read must write no roster row, got %d blob(s)", len(mock.blobs))
 	}
 }
 

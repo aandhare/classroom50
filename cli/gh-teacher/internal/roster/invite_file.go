@@ -153,7 +153,7 @@ func runRosterInviteFile(client githubapi.Client, out, errOut io.Writer, org, cl
 			deferredList = append(deferredList, entry)
 			continue
 		}
-		outcome, _, sendErr := sendOneEmailInvite(client, errOut, org, classroom, entry.email, classroomTeam, actor, rows)
+		outcome, _, sendErr := sendOneEmailInvite(client, errOut, org, classroom, entry.email, classroomTeam, actor, rows, false)
 		// Report each address as it resolves: a few hundred addresses take
 		// minutes, and a silent run is indistinguishable from a hang.
 		switch outcome {
