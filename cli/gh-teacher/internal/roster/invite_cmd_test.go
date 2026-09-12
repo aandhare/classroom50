@@ -25,8 +25,8 @@ const (
 
 // inviteMock is the roster-write mock plus every endpoint `roster invite`
 // touches: /user (the acting teacher), the invite team
-// create/patch/membership/members/delete, and the org invitation. classroom.json
-// is served from rosterWriteMock.files.
+// create/patch/membership/members/delete, the org pending-invitation list, and
+// the org invitation POST. classroom.json is served from rosterWriteMock.files.
 type inviteMock struct {
 	*rosterWriteMock
 	// createStatus is the invite-team create status; 422 drives the adopt path
@@ -37,30 +37,34 @@ type inviteMock struct {
 	// invitationRateLimited makes the POST fail as a secondary rate limit, which
 	// the web deliberately treats differently from a hard failure.
 	invitationRateLimited bool
+	// pending is served as GET /orgs/o/invitations (nil → empty list), the
+	// liveness signal for a pending roster row.
+	pending []map[string]any
+	// pendingStatus is that GET's status (0 → 200).
+	pendingStatus int
+	// inviteTeamMembers is served as the invite team's members list; a member
+	// means someone accepted an earlier invitation.
+	inviteTeamMembers []map[string]any
+	// inviteTeamMembersStatus is that GET's status (0 → 200); 404 is a team the
+	// sync already garbage-collected, and lasts until this run recreates it.
+	inviteTeamMembersStatus int
+	// failed is served as GET /orgs/o/failed_invitations (nil → empty list),
+	// the expired records a re-invite dismisses; failedStatus overrides the
+	// read (403 is the owner-only refusal, tolerated silently).
+	failed       []map[string]any
+	failedStatus int
+	// dismissStatus is the status of DELETE /orgs/o/invitations/{id} (0 → 204).
+	dismissStatus int
 	// commitFails fails the tree POST, simulating a roster write failure after a
 	// successful send.
 	commitFails bool
-	// livePendingEmails is served as the GET /orgs/o/invitations liveness list:
-	// the addresses GitHub still holds an outstanding invitation for. Only read
-	// when a pending roster row makes the invite path check whether the invitation
-	// lapsed, so the happy path never touches it.
-	livePendingEmails []string
-	// inviteTeamDescription is what a GET of the metadata team serves. Empty (the
-	// default) reads as a record-less team, so classroomInvitedByEmail treats the
-	// address as not invited here; set it to a marshaled record to prove this
-	// classroom invited the address.
-	inviteTeamDescription string
-	// listInvitationsStatus is the GET /orgs/o/invitations status (0 → 200 with the
-	// livePendingEmails list); a 5xx drives the liveness read failure.
-	listInvitationsStatus int
-	// getInviteTeamStatus is the metadata-team GET status (0 → 200); a 5xx drives a
-	// degraded read that classroomInvitedByEmail must propagate, not read as absent.
-	getInviteTeamStatus int
 
 	calls           []inviteCall
 	invitationBody  map[string]any
 	inviteTeamSlug  string
 	deletedTeamSlug string
+	teamCreated     bool
+	dismissed       []string
 }
 
 func (m *inviteMock) handler(t *testing.T) http.Handler {
@@ -79,6 +83,7 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 			_, _ = w.Write([]byte(`{"message":"Name must be unique for this org"}`))
 			return
 		}
+		m.teamCreated = true
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": inviteTestInviteTeamID, "slug": m.inviteTeamSlug, "privacy": "secret",
 		})
@@ -88,17 +93,6 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		if r.Method == http.MethodDelete {
 			m.deletedTeamSlug = m.inviteTeamSlug
 			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if r.Method == http.MethodGet {
-			if s := m.getInviteTeamStatus; s != 0 && s != http.StatusOK {
-				w.WriteHeader(s)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"id": inviteTestInviteTeamID, "slug": m.inviteTeamSlug,
-				"privacy": "secret", "description": m.inviteTeamDescription,
-			})
 			return
 		}
 		var body struct {
@@ -114,20 +108,32 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	base.HandleFunc(teamPath+"/members", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode([]map[string]any{})
+		status := m.inviteTeamMembersStatus
+		if status == http.StatusNotFound && m.teamCreated {
+			status = http.StatusOK
+		}
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		members := m.inviteTeamMembers
+		if members == nil {
+			members = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(members)
 	})
 
 	base.HandleFunc("/orgs/o/invitations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			if s := m.listInvitationsStatus; s != 0 && s != http.StatusOK {
-				w.WriteHeader(s)
+			if status := m.pendingStatus; status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
 				return
 			}
-			list := make([]map[string]any, 0, len(m.livePendingEmails))
-			for i, email := range m.livePendingEmails {
-				list = append(list, map[string]any{"id": 100 + i, "email": email})
+			pending := m.pending
+			if pending == nil {
+				pending = []map[string]any{}
 			}
-			_ = json.NewEncoder(w).Encode(list)
+			_ = json.NewEncoder(w).Encode(pending)
 			return
 		}
 		_ = json.NewDecoder(r.Body).Decode(&m.invitationBody)
@@ -144,6 +150,26 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		}
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	base.HandleFunc("/orgs/o/failed_invitations", func(w http.ResponseWriter, r *http.Request) {
+		if status := m.failedStatus; status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		failed := m.failed
+		if failed == nil {
+			failed = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(failed)
+	})
+	base.HandleFunc("/orgs/o/invitations/", func(w http.ResponseWriter, r *http.Request) {
+		if status := m.dismissStatus; status != 0 && status != http.StatusNoContent {
+			w.WriteHeader(status)
+			return
+		}
+		m.dismissed = append(m.dismissed, strings.TrimPrefix(r.URL.Path, "/orgs/o/invitations/"))
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	// commitFails intercepts before the mux so the tree POST never reaches it.
@@ -396,12 +422,6 @@ func TestRunRosterInvite_AddressOnAnAccountRowWarnsAndSends(t *testing.T) {
 	if !strings.Contains(errOut, "sibling") {
 		t.Errorf("stderr should name the account already holding the address:\n%s", errOut)
 	}
-	// No metadata team records this classroom invited the address (the mock serves
-	// a record-less team), so it reads as a genuinely shared address and keeps the
-	// parent/lab-contact note, the contrast with the expired-reissue case below.
-	if !strings.Contains(errOut, "parent or a lab contact") {
-		t.Errorf("a shared address should keep the shared-address note:\n%s", errOut)
-	}
 	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
 		t.Fatalf("the invitation was never sent; calls = %#v", mock.calls)
 	}
@@ -413,160 +433,204 @@ func TestRunRosterInvite_AddressOnAnAccountRowWarnsAndSends(t *testing.T) {
 	}
 }
 
-// A username-bearing row whose invitation lapsed is NOT the parent/lab-contact
-// case: the metadata team proves this classroom invited the address, so with no
-// live invitation the re-issue says so plainly rather than warning about a
-// shared address. This is the common real-world shape: the roster already knows
-// the student, their invite just expired.
-func TestRunRosterInvite_ExpiredInvitationOnUsernameRowIsReissued(t *testing.T) {
-	mock := newInviteMock(t, storedRosterHeader+"hopper,Grace,Hopper,"+inviteTestEmail+",,101,student\n")
-	desc, err := configrepo.MarshalInviteDescription(inviteTestClassroom, inviteTestEmail)
-	if err != nil {
-		t.Fatalf("MarshalInviteDescription: %v", err)
-	}
-	mock.inviteTeamDescription = desc // the metadata team still records the invite
-	mock.livePendingEmails = nil      // but GitHub no longer holds the invitation
-
-	out, errOut, err := runInvite(t, mock)
-	if err != nil {
-		t.Fatalf("an expired invitation on a username row must re-issue, not fail: %v", err)
-	}
-	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
-		t.Fatalf("the fresh invitation was never sent; calls = %#v", mock.calls)
-	}
-	if !strings.Contains(errOut, "expired") || !strings.Contains(errOut, "hopper") {
-		t.Errorf("stderr should say hopper's invitation expired and was re-issued:\n%s", errOut)
-	}
-	if strings.Contains(errOut, "parent or a lab contact") {
-		t.Errorf("the shared-address note must be suppressed for a proven re-issue:\n%s", errOut)
-	}
-	if len(mock.blobs) != 0 {
-		t.Errorf("re-issuing must not write a second row, got %d blob(s): %#v", len(mock.blobs), mock.blobs)
-	}
-	if !strings.Contains(out, "roster unchanged") {
-		t.Errorf("stdout should report the existing row was kept:\n%s", out)
-	}
-}
-
-// A pending row whose invitation GitHub still holds means re-sending would only
-// duplicate a live invite, so refuse before any API write.
-func TestRunRosterInvite_ExistingPendingRowWithLiveInvitationRefusedUpFront(t *testing.T) {
+// A pending row is only a reason to refuse while GitHub still lists its
+// invitation: then a second send would be a no-op on GitHub and a duplicate on
+// the roster, so refuse before any API write and name both remedies.
+func TestRunRosterInvite_PendingRowWithLiveInvitationRefused(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
-	mock.livePendingEmails = []string{inviteTestEmail} // GitHub still holds it
+	mock.pending = []map[string]any{{"id": 42, "email": inviteTestEmail, "role": "direct_member"}}
 
 	_, _, err := runInvite(t, mock)
 	if err == nil {
 		t.Fatal("err = nil, want a refusal naming the existing pending invitation")
 	}
-	for _, want := range []string{"already invited", "roster sync", "cancel-invite"} {
+	for _, want := range []string{"pending invitation", "roster sync", "cancel-invite"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %q: %v", want, err)
 		}
 	}
-	for _, c := range mock.calls {
-		switch c.Method {
-		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
-			t.Errorf("wrote %s %s before the refusal", c.Method, c.Path)
-		}
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("wrote %d request(s) before the refusal: %#v", len(writes), writes)
 	}
 }
 
-// A pending row GitHub no longer backs is the expired-invitation deadlock (issue
-// #970): invite refused off the row, cancel-invite refused off the absent
-// invitation, and neither could act. Now the send is re-issued instead, and the
-// existing pending row is kept rather than duplicated.
-func TestRunRosterInvite_ExpiredPendingRowIsReissued(t *testing.T) {
-	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
-	mock.livePendingEmails = nil // the invitation lapsed; GitHub holds nothing
+// The issue #970 deadlock: an org invitation expires after 7 days, GitHub drops
+// it from the pending list, the sync reaps the empty invite team, and the
+// pending row is left with nothing backing it. The web offers Re-invite for
+// exactly this row, so `roster invite` sends again against the same row: a
+// fresh team, a fresh invitation, NO second row, and GitHub's expired record
+// dismissed once the new invitation is confirmed (the web's
+// dismissFailedInvitation ordering).
+func TestRunRosterInvite_ExpiredInvitationIsReinvitedOnTheSameRow(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",Ada,Lovelace,"+inviteTestEmail+",section-1,,student\n")
+	mock.pending = nil
+	mock.inviteTeamMembersStatus = http.StatusNotFound // the sync already GC'd the team
+	mock.failed = []map[string]any{
+		{"id": 70, "email": inviteTestEmail, "failed_reason": "Invitation expired. User did not accept this invite for 7 days"},
+		{"id": 71, "email": "someone-else@uni.edu", "failed_reason": "Invitation expired."},
+	}
 
 	out, errOut, err := runInvite(t, mock)
 	if err != nil {
-		t.Fatalf("an expired pending row must re-issue, not fail: %v", err)
+		t.Fatalf("an expired invitation must be re-sent, not refused: %v", err)
 	}
-	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
-		t.Fatalf("the fresh invitation was never sent; calls = %#v", mock.calls)
+	inviteIdx := indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations")
+	if inviteIdx < 0 {
+		t.Fatalf("no invitation was sent; calls = %#v", mock.calls)
 	}
-	if !strings.Contains(errOut, "expired") {
-		t.Errorf("stderr should explain the invitation was re-issued:\n%s", errOut)
+	if got := mock.invitationBody["email"]; got != inviteTestEmail {
+		t.Errorf("invitation email = %v, want %s", got, inviteTestEmail)
 	}
-	// The row already carries the address, so no second row is written.
 	if len(mock.blobs) != 0 {
-		t.Errorf("re-issuing must not duplicate the pending row, got %d blob(s): %#v", len(mock.blobs), mock.blobs)
+		t.Errorf("wrote a second row for an address the pending row already carries: %#v", mock.blobs)
+	}
+	if !strings.Contains(errOut, "expire") {
+		t.Errorf("stderr should explain that the earlier invitation expired:\n%s", errOut)
 	}
 	if !strings.Contains(out, "roster unchanged") {
-		t.Errorf("stdout should report the pending row was kept:\n%s", out)
+		t.Errorf("stdout should report the existing row was kept:\n%s", out)
+	}
+	// Only this address's record goes, and only after the send is confirmed.
+	if len(mock.dismissed) != 1 || mock.dismissed[0] != "70" {
+		t.Errorf("dismissed = %v, want exactly record 70 (not someone else's 71)", mock.dismissed)
+	}
+	if dismissIdx := indexOfCall(mock.calls, http.MethodDelete, "/orgs/o/invitations/70"); dismissIdx < inviteIdx {
+		t.Errorf("record dismissed (call %d) before the new invitation was sent (call %d)", dismissIdx, inviteIdx)
+	}
+	if !strings.Contains(out, "dismissed 1 expired invitation record") {
+		t.Errorf("stdout should report the dismissed record:\n%s", out)
 	}
 }
 
-// A degraded liveness read must not be mistaken for "no live invitation": if the
-// pending row can't be checked against GitHub, the send is refused with the read
-// error intact rather than re-issuing blind.
-func TestRunRosterInvite_LivenessReadFailureRefusesUntouched(t *testing.T) {
+// The failed list is owner-only and the record is bookkeeping, so an unreadable
+// list or a failed DELETE can never fail a send that already went out: 403/404
+// are silent, anything else warns, and the exit code stays 0.
+func TestRunRosterInvite_FailedRecordProblemsNeverFailTheSend(t *testing.T) {
+	cases := []struct {
+		name     string
+		apply    func(*inviteMock)
+		wantWarn bool
+	}{
+		{"failed list 403 is silent", func(m *inviteMock) { m.failedStatus = http.StatusForbidden }, false},
+		{"failed list 500 warns", func(m *inviteMock) { m.failedStatus = http.StatusInternalServerError }, true},
+		{"dismiss 500 warns", func(m *inviteMock) {
+			m.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+			m.dismissStatus = http.StatusInternalServerError
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+			mock.pending = nil
+			tc.apply(mock)
+
+			_, errOut, err := runInvite(t, mock)
+			if err != nil {
+				t.Fatalf("bookkeeping must not fail the send: %v", err)
+			}
+			if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
+				t.Fatal("the invitation itself was never sent")
+			}
+			if got := strings.Contains(errOut, "failed_invitations"); got != tc.wantWarn {
+				t.Errorf("warning pointing at GitHub's failed-invitations page = %v, want %v:\n%s", got, tc.wantWarn, errOut)
+			}
+		})
+	}
+}
+
+// GitHub's "already invited or a member" 422 on a re-invite means something live
+// now covers the address, so the expired record is noise here too.
+func TestRunRosterInvite_ReinviteAlreadyCoveredStillDismisses(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
-	mock.listInvitationsStatus = http.StatusInternalServerError
+	mock.pending = nil
+	mock.invitationStatus = http.StatusUnprocessableEntity
+	mock.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+
+	if _, _, err := runInvite(t, mock); err != nil {
+		t.Fatalf("a 422 is a skip: %v", err)
+	}
+	if len(mock.dismissed) != 1 || mock.dismissed[0] != "70" {
+		t.Errorf("dismissed = %v, want record 70", mock.dismissed)
+	}
+}
+
+// A GC'd team is the common expired shape, but a team the sync hasn't reaped yet
+// (younger than the GC age) is the same case: no invitation, no member. The send
+// must adopt that team rather than trip over the name collision.
+func TestRunRosterInvite_ExpiredInvitationAdoptsSurvivingTeam(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pending = nil
+	mock.createStatus = http.StatusUnprocessableEntity // name taken → adopt
+
+	_, _, err := runInvite(t, mock)
+	if err != nil {
+		t.Fatalf("a surviving empty team must be adopted: %v", err)
+	}
+	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
+		t.Fatalf("no invitation was sent; calls = %#v", mock.calls)
+	}
+	if mock.deletedTeamSlug != "" {
+		t.Errorf("deleted the adopted team %q", mock.deletedTeamSlug)
+	}
+}
+
+// No pending invitation plus a member on the invite team means the student
+// ACCEPTED and only the sync is missing (common in the CLI, where the sync is
+// manual). Sending again would only trip EnsureInviteTeam's not-empty check with
+// a message telling the teacher to remove the invitee from the team, which would
+// destroy the only email→account mapping. Refuse, and point at the sync.
+func TestRunRosterInvite_AcceptedButUnsyncedRefused(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pending = nil
+	mock.inviteTeamMembers = []map[string]any{{"login": "ada", "id": 99}}
 
 	_, _, err := runInvite(t, mock)
 	if err == nil {
-		t.Fatal("err = nil, want the liveness read failure to propagate")
+		t.Fatal("err = nil, want a refusal pointing at `roster sync`")
 	}
-	for _, c := range mock.calls {
-		switch c.Method {
-		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
-			t.Errorf("wrote %s %s despite an unreadable invitation list", c.Method, c.Path)
+	for _, want := range []string{"accepted", "roster sync"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
 		}
 	}
-	if len(mock.blobs) != 0 {
-		t.Errorf("a failed liveness read must write no roster row, got %d blob(s)", len(mock.blobs))
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("wrote %d request(s) for an accepted invitation: %#v", len(writes), writes)
 	}
 }
 
-// A degraded metadata-team read on the username-bearing path must propagate too:
-// reading it as absent would drop to the shared-address note and could re-send
-// against a team that actually proves this classroom's invite.
-func TestRunRosterInvite_MetadataTeamReadFailurePropagates(t *testing.T) {
-	mock := newInviteMock(t, storedRosterHeader+"hopper,Grace,Hopper,"+inviteTestEmail+",,101,student\n")
-	mock.getInviteTeamStatus = http.StatusInternalServerError
+// Liveness is only knowable from GitHub, so a failed pending-list read refuses
+// rather than guessing either way: re-sending could duplicate a live invitation,
+// and refusing forever is the deadlock this path exists to break.
+func TestRunRosterInvite_PendingListReadFailureRefuses(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pendingStatus = http.StatusInternalServerError
 
 	_, _, err := runInvite(t, mock)
 	if err == nil {
-		t.Fatal("err = nil, want the metadata-team read failure to propagate")
+		t.Fatal("err = nil, want the pending-list read failure to propagate")
 	}
-	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") >= 0 {
-		t.Errorf("sent an invitation despite an unreadable metadata team; calls = %#v", mock.calls)
-	}
-	if len(mock.blobs) != 0 {
-		t.Errorf("a failed metadata-team read must write no roster row, got %d blob(s)", len(mock.blobs))
+	if writes := writeCalls(mock.calls); len(writes) != 0 {
+		t.Errorf("wrote %d request(s) after a degraded read: %#v", len(writes), writes)
 	}
 }
 
-// A username-bearing row whose invitation GitHub still holds is not a re-issue:
-// with a live invitation the address keeps the shared-address note and the send
-// is left to skip on GitHub's 422, exactly as before this path existed.
-func TestRunRosterInvite_LiveInvitationOnUsernameRowKeepsSharedAddressNote(t *testing.T) {
-	mock := newInviteMock(t, storedRosterHeader+"hopper,Grace,Hopper,"+inviteTestEmail+",,101,student\n")
-	desc, err := configrepo.MarshalInviteDescription(inviteTestClassroom, inviteTestEmail)
-	if err != nil {
-		t.Fatalf("MarshalInviteDescription: %v", err)
-	}
-	mock.inviteTeamDescription = desc                      // this classroom did invite the address
-	mock.livePendingEmails = []string{inviteTestEmail}     // and GitHub still holds it
-	mock.invitationStatus = http.StatusUnprocessableEntity // so a resend 422-skips
+// A fresh address never needs either invitation list, so it must read neither:
+// both are owner-scoped and paginated, and a fresh invite must not gain a new way
+// to fail.
+func TestRunRosterInvite_FreshAddressSkipsTheInvitationListReads(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader)
+	mock.pendingStatus = http.StatusInternalServerError // would fail if read
+	mock.failedStatus = http.StatusInternalServerError  // would warn if read
 
-	out, errOut, err := runInvite(t, mock)
-	if err != nil {
-		t.Fatalf("a live invitation on a username row must skip, not fail: %v", err)
+	if _, errOut, err := runInvite(t, mock); err != nil {
+		t.Fatalf("a fresh address must not depend on the invitation lists: %v", err)
+	} else if strings.Contains(errOut, "Warning") {
+		t.Errorf("a fresh address read the failed list:\n%s", errOut)
 	}
-	if !strings.Contains(errOut, "parent or a lab contact") {
-		t.Errorf("a live invitation must keep the shared-address note, not claim expiry:\n%s", errOut)
-	}
-	if strings.Contains(errOut, "expired") {
-		t.Errorf("nothing expired here, so the re-issue message must not appear:\n%s", errOut)
-	}
-	if !strings.Contains(out, "skipped") {
-		t.Errorf("stdout should report the 422 skip:\n%s", out)
-	}
-	if len(mock.blobs) != 0 {
-		t.Errorf("a skipped send must write no roster row, got %d blob(s)", len(mock.blobs))
+	for _, path := range []string{"/orgs/o/invitations", "/orgs/o/failed_invitations"} {
+		if n := countCalls(mock.calls, http.MethodGet, path); n != 0 {
+			t.Errorf("read %s %d time(s) for a fresh address", path, n)
+		}
 	}
 }
 

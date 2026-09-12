@@ -395,12 +395,13 @@ account. An address that's already an organization member, or that already has a
 pending invitation, is reported as skipped and the command exits 0.
 
 It refuses to send in two cases: the classroom has no usable team recorded in
-`classroom.json`, or the roster lists the address as a **pending invitation** that
-GitHub still holds. If that invitation has since **expired** (GitHub drops one
-after 7 days), a single `roster invite` re-sends it and keeps the row instead of
-refusing, the same re-invite the web app offers on an expired row. (With `--file`
-a pending address is always a skip rather than a refusal or a re-send, so one
-already-listed address doesn't stop the batch.) An address some *other* row
+`classroom.json`, or the roster already lists the address as a **pending
+invitation** that GitHub still has open (or that someone accepted but you haven't
+synced yet). (With `--file` that second case is a skip rather than a refusal, so
+one already-invited address doesn't stop the batch.) A pending row whose
+invitation has since **expired** (GitHub invitations last 7 days) doesn't block:
+a new invitation is sent and the existing row is kept, the same as the web app's
+**Re-invite**. An address some *other* row
 merely carries is a shared address (a
 parent, a lab contact), so the real person still gets invited: the invitation is
 sent, a note on stderr names that row, and **no second row is written**. If the
@@ -485,7 +486,9 @@ gh teacher roster sync <org> <classroom> --write    # apply it
 It records the students who accepted an email invitation (username and
 `github_id`, onto their own pending row), fills in a missing `github_id` from the
 classroom team's membership (and a blank or outdated username from the member's
-`github_id`), and deletes the invite teams that are done. If no
+`github_id`), deletes the invite teams that are done, and dismisses any
+expired-invitation record GitHub still keeps for an address that accepted a later
+one. If no
 row claims an accepted invitation (the pending row was deleted, or the invite's
 roster commit never landed), it appends one so the address isn't lost; that row
 records the role of the classroom team the account was found on, so a staff
@@ -495,10 +498,9 @@ than as a student. A role already recorded is never rewritten.
 The sync **never removes a row**. A pending row whose invitation expired or was
 canceled stays on the roster for you to re-invite, link, or delete by hand: the
 web app shows it as unlinked with an **Invitation expired** badge and offers
-**Re-invite**, **Link account**, and **Remove row**. From the CLI, re-invite with
-`roster invite <org> <classroom> <email>`: it notices the invitation is gone and
-re-sends it, leaving the row in place. To remove it instead, drop the row by
-editing `roster.csv`.
+**Re-invite**, **Link account**, and **Remove row**; from the CLI, re-invite it
+with [`roster invite`](#inviting-a-student-by-email), which sends a new
+invitation against the same row, or drop it by editing `roster.csv`.
 
 The web app runs this same sync when a teacher opens the roster, and
 additionally refreshes each row's recorded `role` from live team membership; this
