@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/foundation50/classroom50-cli-shared/contract"
+	"github.com/foundation50/gh-teacher/internal/cliutil"
 	"github.com/foundation50/gh-teacher/internal/configrepo"
 	"github.com/foundation50/gh-teacher/internal/githubtest"
 )
@@ -40,19 +42,27 @@ type inviteMock struct {
 	// pending is served as GET /orgs/o/invitations (nil → empty list), the
 	// liveness signal for a pending roster row.
 	pending []map[string]any
-	// pendingStatus is that GET's status (0 → 200).
-	pendingStatus int
+	// pendingStatus is that GET's status (0 → 200); pendingRateLimited makes it
+	// fail as a 403-shaped secondary rate limit instead.
+	pendingStatus      int
+	pendingRateLimited bool
 	// inviteTeamMembers is served as the invite team's members list; a member
 	// means someone accepted an earlier invitation.
 	inviteTeamMembers []map[string]any
-	// inviteTeamMembersStatus is that GET's status (0 → 200); 404 is a team the
-	// sync already garbage-collected, and lasts until this run recreates it.
-	inviteTeamMembersStatus int
+	// inviteTeamStatus is the status of the invite team's GET and members read
+	// (0 → 200); 404 is a team the sync already garbage-collected, and lasts
+	// until this run recreates it.
+	inviteTeamStatus int
+	// inviteTeamDescription is what the team's GET reports before this run
+	// PATCHes it (empty → a plain record-less description).
+	inviteTeamDescription string
 	// failed is served as GET /orgs/o/failed_invitations (nil → empty list),
 	// the expired records a re-invite dismisses; failedStatus overrides the
-	// read (403 is the owner-only refusal, tolerated silently).
-	failed       []map[string]any
-	failedStatus int
+	// read (403 is the owner-only refusal, tolerated silently) and
+	// failedRateLimited fails it as a 403-shaped secondary rate limit.
+	failed            []map[string]any
+	failedStatus      int
+	failedRateLimited bool
 	// dismissStatus is the status of DELETE /orgs/o/invitations/{id} (0 → 204).
 	dismissStatus int
 	// commitFails fails the tree POST, simulating a roster write failure after a
@@ -95,24 +105,38 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if r.Method == http.MethodGet {
+			if status := m.teamStatus(); status != http.StatusOK {
+				w.WriteHeader(status)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": inviteTestInviteTeamID, "slug": m.inviteTeamSlug,
+				"privacy": "secret", "description": m.inviteTeamDescription,
+			})
+			return
+		}
 		var body struct {
 			Description string `json:"description"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Description != "" {
+			m.inviteTeamDescription = body.Description
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": inviteTestInviteTeamID, "slug": m.inviteTeamSlug,
 			"privacy": "secret", "description": body.Description,
 		})
 	})
 	base.HandleFunc(teamPath+"/memberships/"+inviteTestActor, func(w http.ResponseWriter, r *http.Request) {
+		// The drop is what removes a stranded teacher from an adopted team.
+		if r.Method == http.MethodDelete {
+			m.inviteTeamMembers = nil
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	base.HandleFunc(teamPath+"/members", func(w http.ResponseWriter, r *http.Request) {
-		status := m.inviteTeamMembersStatus
-		if status == http.StatusNotFound && m.teamCreated {
-			status = http.StatusOK
-		}
-		if status != 0 && status != http.StatusOK {
+		if status := m.teamStatus(); status != http.StatusOK {
 			w.WriteHeader(status)
 			return
 		}
@@ -125,6 +149,10 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 
 	base.HandleFunc("/orgs/o/invitations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
+			if m.pendingRateLimited {
+				writeSecondaryRateLimit403(w)
+				return
+			}
 			if status := m.pendingStatus; status != 0 && status != http.StatusOK {
 				w.WriteHeader(status)
 				return
@@ -153,6 +181,10 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 	})
 
 	base.HandleFunc("/orgs/o/failed_invitations", func(w http.ResponseWriter, r *http.Request) {
+		if m.failedRateLimited {
+			writeSecondaryRateLimit403(w)
+			return
+		}
 		if status := m.failedStatus; status != 0 && status != http.StatusOK {
 			w.WriteHeader(status)
 			return
@@ -184,6 +216,35 @@ func (m *inviteMock) handler(t *testing.T) http.Handler {
 		})
 	}
 	return recordCalls(&m.calls, failing)
+}
+
+// teamStatus is the invite team's current status: a 404 lasts only until this
+// run recreates the team.
+func (m *inviteMock) teamStatus() int {
+	if m.inviteTeamStatus == 0 || (m.inviteTeamStatus == http.StatusNotFound && m.teamCreated) {
+		return http.StatusOK
+	}
+	return m.inviteTeamStatus
+}
+
+// writeSecondaryRateLimit403 answers as GitHub does when a secondary limit
+// trips: a 403 that only Retry-After and the body distinguish from a denial.
+func writeSecondaryRateLimit403(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "60")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit"}`))
+}
+
+// inviteTestRecord is the valid v1 record an earlier run wrote onto the invite
+// team for inviteTestEmail.
+func inviteTestRecord(t *testing.T) string {
+	t.Helper()
+	record, err := configrepo.MarshalInviteDescription(inviteTestClassroom, inviteTestEmail)
+	if err != nil {
+		t.Fatalf("marshal invite record: %v", err)
+	}
+	return record
 }
 
 // inviteTestClassroomJSON records the classroom team the invitation must carry.
@@ -464,10 +525,10 @@ func TestRunRosterInvite_PendingRowWithLiveInvitationRefused(t *testing.T) {
 func TestRunRosterInvite_ExpiredInvitationIsReinvitedOnTheSameRow(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",Ada,Lovelace,"+inviteTestEmail+",section-1,,student\n")
 	mock.pending = nil
-	mock.inviteTeamMembersStatus = http.StatusNotFound // the sync already GC'd the team
+	mock.inviteTeamStatus = http.StatusNotFound // the sync already GC'd the team
 	mock.failed = []map[string]any{
-		{"id": 70, "email": inviteTestEmail, "failed_reason": "Invitation expired. User did not accept this invite for 7 days"},
-		{"id": 71, "email": "someone-else@uni.edu", "failed_reason": "Invitation expired."},
+		{"id": 70, "email": inviteTestEmail},
+		{"id": 71, "email": "someone-else@uni.edu"},
 	}
 
 	out, errOut, err := runInvite(t, mock)
@@ -503,20 +564,29 @@ func TestRunRosterInvite_ExpiredInvitationIsReinvitedOnTheSameRow(t *testing.T) 
 }
 
 // The failed list is owner-only and the record is bookkeeping, so an unreadable
-// list or a failed DELETE can never fail a send that already went out: 403/404
-// are silent, anything else warns, and the exit code stays 0.
+// list or a failed DELETE can never fail a send that already went out: a plain
+// 403 or a 404 is silent, anything else (including a rate limit, which GitHub
+// also sends as a 403) warns, a record already gone counts as dismissed, and the
+// exit code stays 0.
 func TestRunRosterInvite_FailedRecordProblemsNeverFailTheSend(t *testing.T) {
 	cases := []struct {
-		name     string
-		apply    func(*inviteMock)
-		wantWarn bool
+		name          string
+		apply         func(*inviteMock)
+		wantWarn      bool
+		wantDismissed bool
 	}{
-		{"failed list 403 is silent", func(m *inviteMock) { m.failedStatus = http.StatusForbidden }, false},
-		{"failed list 500 warns", func(m *inviteMock) { m.failedStatus = http.StatusInternalServerError }, true},
+		{"failed list 403 is silent", func(m *inviteMock) { m.failedStatus = http.StatusForbidden }, false, false},
+		{"failed list 404 is silent", func(m *inviteMock) { m.failedStatus = http.StatusNotFound }, false, false},
+		{"failed list rate limit warns", func(m *inviteMock) { m.failedRateLimited = true }, true, false},
+		{"failed list 500 warns", func(m *inviteMock) { m.failedStatus = http.StatusInternalServerError }, true, false},
 		{"dismiss 500 warns", func(m *inviteMock) {
 			m.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
 			m.dismissStatus = http.StatusInternalServerError
-		}, true},
+		}, true, false},
+		{"dismiss 404 counts as dismissed", func(m *inviteMock) {
+			m.failed = []map[string]any{{"id": 70, "email": inviteTestEmail}}
+			m.dismissStatus = http.StatusNotFound
+		}, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -524,15 +594,22 @@ func TestRunRosterInvite_FailedRecordProblemsNeverFailTheSend(t *testing.T) {
 			mock.pending = nil
 			tc.apply(mock)
 
-			_, errOut, err := runInvite(t, mock)
+			out, errOut, err := runInvite(t, mock)
 			if err != nil {
 				t.Fatalf("bookkeeping must not fail the send: %v", err)
 			}
 			if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
 				t.Fatal("the invitation itself was never sent")
 			}
+			// Silence must come from tolerating the read, not from skipping it.
+			if n := countCalls(mock.calls, http.MethodGet, "/orgs/o/failed_invitations"); n != 1 {
+				t.Errorf("failed-list reads = %d, want 1", n)
+			}
 			if got := strings.Contains(errOut, "failed_invitations"); got != tc.wantWarn {
 				t.Errorf("warning pointing at GitHub's failed-invitations page = %v, want %v:\n%s", got, tc.wantWarn, errOut)
+			}
+			if got := strings.Contains(out, "dismissed 1 expired invitation record"); got != tc.wantDismissed {
+				t.Errorf("dismissed report = %v, want %v:\n%s", got, tc.wantDismissed, out)
 			}
 		})
 	}
@@ -560,6 +637,7 @@ func TestRunRosterInvite_ReinviteAlreadyCoveredStillDismisses(t *testing.T) {
 func TestRunRosterInvite_ExpiredInvitationAdoptsSurvivingTeam(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
 	mock.pending = nil
+	mock.inviteTeamDescription = inviteTestRecord(t)
 	mock.createStatus = http.StatusUnprocessableEntity // name taken → adopt
 
 	_, _, err := runInvite(t, mock)
@@ -574,21 +652,49 @@ func TestRunRosterInvite_ExpiredInvitationAdoptsSurvivingTeam(t *testing.T) {
 	}
 }
 
-// No pending invitation plus a member on the invite team means the student
-// ACCEPTED and only the sync is missing (common in the CLI, where the sync is
-// manual). Sending again would only trip EnsureInviteTeam's not-empty check with
-// a message telling the teacher to remove the invitee from the team, which would
-// destroy the only email→account mapping. Refuse, and point at the sync.
+// A re-invite interrupted after the team create (a rate limit, a 5xx) strands a
+// provisional team with the acting teacher on it: GitHub adds the creator, and
+// the drop is a later request. That member is not an invitee (the team holds no
+// record, so no invitation ever carried it), and the sync skips a provisional
+// team rather than repairing it. Reading it as "accepted" would refuse this
+// row forever; it must be re-sent, with EnsureInviteTeam adopting and healing
+// the team.
+func TestRunRosterInvite_StrandedProvisionalTeamIsReinvited(t *testing.T) {
+	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	mock.pending = nil
+	mock.inviteTeamDescription = contract.InviteProvisionalDescription
+	mock.inviteTeamMembers = []map[string]any{{"login": inviteTestActor, "id": 1}}
+	mock.createStatus = http.StatusUnprocessableEntity // the stranded team's name
+
+	_, _, err := runInvite(t, mock)
+	if err != nil {
+		t.Fatalf("a stranded provisional team must be adopted, not read as accepted: %v", err)
+	}
+	if indexOfCall(mock.calls, http.MethodPost, "/orgs/o/invitations") < 0 {
+		t.Fatalf("no invitation was sent; calls = %#v", mock.calls)
+	}
+	if indexOfCall(mock.calls, http.MethodDelete, "/orgs/o/teams/"+mock.inviteTeamSlug+"/memberships/"+inviteTestActor) < 0 {
+		t.Errorf("the stranded teacher was not dropped from the adopted team; calls = %#v", mock.calls)
+	}
+}
+
+// No pending invitation plus a member on a recorded invite team means the
+// student ACCEPTED and only the sync is missing (common in the CLI, where the
+// sync is manual). Sending again would only trip EnsureInviteTeam's not-empty
+// check with a message telling the teacher to remove the invitee from the team,
+// which would destroy the only email→account mapping. Refuse, and point at the
+// sync with --write, since a dry run records nothing.
 func TestRunRosterInvite_AcceptedButUnsyncedRefused(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
 	mock.pending = nil
+	mock.inviteTeamDescription = inviteTestRecord(t)
 	mock.inviteTeamMembers = []map[string]any{{"login": "ada", "id": 99}}
 
 	_, _, err := runInvite(t, mock)
 	if err == nil {
 		t.Fatal("err = nil, want a refusal pointing at `roster sync`")
 	}
-	for _, want := range []string{"accepted", "roster sync"} {
+	for _, want := range []string{"accepted", "roster sync", "--write"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %q: %v", want, err)
 		}
@@ -600,7 +706,10 @@ func TestRunRosterInvite_AcceptedButUnsyncedRefused(t *testing.T) {
 
 // Liveness is only knowable from GitHub, so a failed pending-list read refuses
 // rather than guessing either way: re-sending could duplicate a live invitation,
-// and refusing forever is the deadlock this path exists to break.
+// and refusing forever is the deadlock this path exists to break. A rate limit
+// on that read is the one failure that must keep its shape: GitHub sends
+// secondary limits as a 403, and the classifier's admin-access message for a
+// 403 would send the teacher to `gh teacher login` for a throttle.
 func TestRunRosterInvite_PendingListReadFailureRefuses(t *testing.T) {
 	mock := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
 	mock.pendingStatus = http.StatusInternalServerError
@@ -611,6 +720,19 @@ func TestRunRosterInvite_PendingListReadFailureRefuses(t *testing.T) {
 	}
 	if writes := writeCalls(mock.calls); len(writes) != 0 {
 		t.Errorf("wrote %d request(s) after a degraded read: %#v", len(writes), writes)
+	}
+
+	throttled := newInviteMock(t, storedRosterHeader+",,,"+inviteTestEmail+",,,student\n")
+	throttled.pendingRateLimited = true
+	_, _, err = runInvite(t, throttled)
+	if err == nil {
+		t.Fatal("err = nil, want the rate limit to propagate")
+	}
+	if !cliutil.IsRateLimited(err) {
+		t.Errorf("a throttled pending-list read must still read as a rate limit, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "admin") {
+		t.Errorf("a throttle must not be reported as an admin-access problem: %v", err)
 	}
 }
 

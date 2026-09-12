@@ -343,9 +343,9 @@ A pending row whose invitation has **expired** (GitHub invitations last 7 days)
 doesn't block: a new invitation is sent, the existing row is kept, and GitHub's
 expired record for the address is dismissed once the send is confirmed, the same
 as the web app's **Re-invite**. `roster invite` tells the cases apart by asking
-GitHub, never from the row's shape: an invitation still on the pending list is
-live, an invite team that already holds a member was accepted, and neither means
-the invitation died.
+GitHub, never from the row's shape: an invitation still on the organization's
+pending list is live (whichever classroom sent it), an invite team that holds a
+valid record and a member was accepted, and neither means the invitation died.
 
 An address that some *other* row merely carries is a shared address (a parent, a
 lab contact), so the invitation is still sent and the command exits **0**: a note

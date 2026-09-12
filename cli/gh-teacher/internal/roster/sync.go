@@ -669,6 +669,8 @@ func runRosterSync(client githubapi.Client, out, errOut io.Writer, org, classroo
 	failed := &failedInviteRecords{client: client, org: org}
 	reportSyncPlan(out, errOut, org, classroom, scan, plan, retirable, failed)
 
+	// Dismissals are not counted: a recovery already counts through its fold or
+	// its team.
 	pending := !plan.empty() || len(scan.staleSlugs) > 0 || len(retirable) > 0
 	if !write {
 		if pending {
@@ -690,10 +692,8 @@ func runRosterSync(client githubapi.Client, out, errOut io.Writer, org, classroo
 	if err != nil {
 		return err
 	}
-	// Every recovered address belongs to someone now enrolled, so any expired
-	// record GitHub still keeps for it is noise (the web drops it from view for
-	// a member). Dismissed after the commit, and regardless of trust: a
-	// recovery is proven per team, and this touches no metadata team.
+	// Runs before the trust check: a recovery is proven per team, and this
+	// touches no metadata team.
 	for _, rec := range scan.recovered {
 		failed.dismiss(out, errOut, rec.Email)
 	}
@@ -757,10 +757,7 @@ func syncDegradedError(org, classroom string) error {
 // reportSyncPlan prints the planned edits on stdout (the result a script reads)
 // and the report-only findings needing a human on stderr. `retirable` is the
 // recovered metadata teams a --write pass would delete: reported here so a dry
-// run whose roster plan is empty still says so rather than "up to date". The
-// expired records a --write pass would dismiss are read only when there is a
-// recovery to dismiss them for, and never decide the exit code on their own: a
-// recovery always already counts as pending through its fold or its team.
+// run whose roster plan is empty still says so rather than "up to date".
 func reportSyncPlan(out, errOut io.Writer, org, classroom string, scan inviteScan, plan rosterPlan, retirable []string, failed *failedInviteRecords) {
 	path := fmt.Sprintf("%s/%s/%s", org, configrepo.ConfigRepoName, configrepo.RosterFilePath(classroom))
 	if plan.empty() && len(scan.staleSlugs) == 0 && len(retirable) == 0 {

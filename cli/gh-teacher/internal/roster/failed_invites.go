@@ -14,15 +14,13 @@ import (
 )
 
 // failedInviteRecords is the org's failed-invitation list indexed by address,
-// read once and only on first use. GitHub keeps a record of every invitation
-// that expired, and once the address has a fresh invitation (or accepted one)
-// that record is only noise on the org's People page. The web dismisses it
-// right after a confirmed send (dismissFailedInvitation); the CLI's re-invite
-// and sync do the same through this.
+// read on first use. A fresh or accepted invitation makes the address's expired
+// record noise on the org's People page, so re-invite and sync dismiss it, as the
+// web's dismissFailedInvitation does.
 //
-// Bookkeeping, never state: the list is owner-only, so a 403/404 reads as
-// "nothing to dismiss", any other failed read or DELETE is a warning, and none
-// of it can fail the send or the roster commit that came before.
+// Bookkeeping, never state: a 403 (the list is owner-only) or 404 reads as
+// nothing to dismiss, any other failed read or DELETE only warns, and none of it
+// can fail the send or the roster commit that came before.
 type failedInviteRecords struct {
 	client githubapi.Client
 	org    string
@@ -38,16 +36,17 @@ func (f *failedInviteRecords) load(errOut io.Writer) {
 	f.loaded = true
 	list, err := membership.ListFailedOrgInvitations(f.client, f.org)
 	if err != nil {
-		if !cliutil.IsHTTPStatus(err, http.StatusForbidden) && !cliutil.IsHTTPStatus(err, http.StatusNotFound) {
+		// A secondary rate limit is also a 403, and that one is worth a warning.
+		silent := (cliutil.IsHTTPStatus(err, http.StatusForbidden) && !cliutil.IsRateLimited(err)) ||
+			cliutil.IsHTTPStatus(err, http.StatusNotFound)
+		if !silent {
 			_, _ = fmt.Fprintf(errOut, "Warning: %s: reading the failed invitations failed (%v); any expired record is left for you to dismiss from https://github.com/orgs/%s/people/failed_invitations.\n", f.org, err, f.org)
 		}
 		return
 	}
 	f.byEmail = map[string][]int64{}
 	for _, inv := range list {
-		// Login-keyed records belong to account invitations, which never had
-		// an address to match a pending row on.
-		if inv.ID == 0 || inv.Login != "" || inv.Email == "" {
+		if inv.ID == 0 || !inv.IsEmailKeyed() {
 			continue
 		}
 		key := configrepo.NormalizeInviteEmail(inv.Email)

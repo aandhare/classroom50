@@ -143,19 +143,20 @@ func ListPendingOrgInvitations(client githubapi.Client, org string) ([]PendingOr
 // invitation nobody accepted within GitHub's 7 days, or one GitHub couldn't
 // deliver. Keyed by login or email exactly like a pending one.
 type FailedOrgInvitation struct {
-	ID           int64  `json:"id"`
-	Login        string `json:"login"`
-	Email        string `json:"email"`
-	FailedReason string `json:"failed_reason"`
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+	Email string `json:"email"`
 }
 
-// ListFailedOrgInvitations walks the org's failed-invitation list, the record
-// GitHub keeps of an expired invitation once it leaves the pending list. Owner
-// only. Dismissing a record is CancelOrgInvitation on its id (the same DELETE;
-// GitHub's UI calls it "dismiss"). The raw HTTP error is preserved (not
-// classified) so a caller can read a 403/404 as "no list to sweep": these
-// records are bookkeeping, and whether a failed read matters is the caller's
-// call.
+// IsEmailKeyed is PendingOrgInvitation.IsEmailKeyed for a failed record.
+func (inv FailedOrgInvitation) IsEmailKeyed() bool {
+	return inv.Login == "" && inv.Email != ""
+}
+
+// ListFailedOrgInvitations walks GET /orgs/{org}/failed_invitations, the
+// owner-only record GitHub keeps of expired invitations. The HTTP error is left
+// unclassified so a caller can treat 403/404 as an empty list; dismissing a
+// record is CancelOrgInvitation on its id.
 func ListFailedOrgInvitations(client githubapi.Client, org string) ([]FailedOrgInvitation, error) {
 	base := fmt.Sprintf("orgs/%s/failed_invitations", url.PathEscape(org))
 	return githubapi.PaginateAll[FailedOrgInvitation](client, githubapi.ListPerPage, githubapi.ListMaxPages,
@@ -217,8 +218,13 @@ type OrgMembershipKnownError struct {
 func (e *OrgMembershipKnownError) Error() string { return e.msg }
 
 // ClassifyOrgInviteError maps POST /orgs/{org}/invitations errors to
-// user-facing messages. Unrecognized errors wrap with request context.
+// user-facing messages. Unrecognized errors wrap with request context. A rate
+// limit is wrapped, not classified: GitHub sends secondary limits as a 403, and
+// a caller deciding whether to defer needs cliutil.IsRateLimited to still see it.
 func ClassifyOrgInviteError(client githubapi.Client, org, username, path string, err error) error {
+	if cliutil.IsRateLimited(err) {
+		return fmt.Errorf("POST %s: %w", path, err)
+	}
 	if httpErr, ok := errors.AsType[*githubapi.HTTPError](err); ok {
 		switch httpErr.StatusCode {
 		case http.StatusUnauthorized:
@@ -292,11 +298,12 @@ var ErrMissingOrgAdminScope = errors.New("missing admin:org OAuth scope; run `gh
 
 // ClassifyMembershipReadError maps the common failure statuses of the read-only
 // membership endpoints to actionable messages, mirroring ClassifyOrgInviteError's
-// 403/404 handling. `subject` is a human label for the thing being read. Other
+// 403/404 handling (and, like it, leaving a rate limit wrapped rather than
+// classified). `subject` is a human label for the thing being read. Other
 // statuses return the wrapped error.
 func ClassifyMembershipReadError(path, subject string, err error) error {
 	httpErr, ok := errors.AsType[*githubapi.HTTPError](err)
-	if !ok {
+	if !ok || cliutil.IsRateLimited(err) {
 		return fmt.Errorf("GET %s: %w", path, err)
 	}
 	switch httpErr.StatusCode {

@@ -295,7 +295,8 @@ and the **Members** page shows the same badge. To recover:
   GitHub no longer lists is re-sent against the same row, nothing else is
   written, and GitHub's expired record for the address is dismissed once the
   new invitation is confirmed. An address whose invitation is still open, or
-  that was accepted but not yet synced, is skipped with a note saying which.
+  that was accepted but not yet synced, is refused with a message saying which
+  (with `--file` it is skipped instead and the rest of the list still goes).
 
 A failed invitation whose roster row was already removed shows up on the
 **Members** page as a **failed invitation that isn't on any roster**. Nothing

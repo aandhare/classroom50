@@ -96,6 +96,17 @@ func (m *bulkInviteMock) handler(t *testing.T) http.Handler {
 		case sub == "" && r.Method == http.MethodDelete:
 			m.deletedTeams = append(m.deletedTeams, slug)
 			w.WriteHeader(http.StatusNoContent)
+		case sub == "" && r.Method == http.MethodGet:
+			// A team with members from an earlier run holds that run's record;
+			// any other team not yet PATCHed by this run is record-less.
+			description := m.teamRecords[slug]
+			if description == "" && len(m.membersFor(slug)) > 0 {
+				description = m.recordFor(t, slug)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": inviteTestInviteTeamID, "slug": slug,
+				"privacy": "secret", "description": description,
+			})
 		case sub == "":
 			var body struct {
 				Description string `json:"description"`
@@ -112,13 +123,7 @@ func (m *bulkInviteMock) handler(t *testing.T) http.Handler {
 		case strings.HasPrefix(sub, "memberships/"):
 			w.WriteHeader(http.StatusNoContent)
 		case sub == "members":
-			members := []map[string]any{}
-			for email, list := range m.teamMembers {
-				if configrepo.InviteTeamName(inviteTestClassroom, email) == slug {
-					members = list
-				}
-			}
-			_ = json.NewEncoder(w).Encode(members)
+			_ = json.NewEncoder(w).Encode(m.membersFor(slug))
 		default:
 			http.NotFound(w, r)
 		}
@@ -190,6 +195,31 @@ func (m *bulkInviteMock) slugMatchesAny(slug string, set map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// membersFor is the members list served for a team slug, from teamMembers.
+func (m *bulkInviteMock) membersFor(slug string) []map[string]any {
+	for email, list := range m.teamMembers {
+		if configrepo.InviteTeamName(inviteTestClassroom, email) == slug {
+			return list
+		}
+	}
+	return []map[string]any{}
+}
+
+// recordFor is the valid v1 record for the email whose invite team is slug.
+func (m *bulkInviteMock) recordFor(t *testing.T, slug string) string {
+	t.Helper()
+	for email := range m.teamMembers {
+		if configrepo.InviteTeamName(inviteTestClassroom, email) == slug {
+			record, err := configrepo.MarshalInviteDescription(inviteTestClassroom, email)
+			if err != nil {
+				t.Fatalf("marshal invite record: %v", err)
+			}
+			return record
+		}
+	}
+	return ""
 }
 
 func newBulkMock(t *testing.T, rosterCSV string) *bulkInviteMock {
@@ -361,8 +391,12 @@ func TestRunRosterInviteFile_ExpiredPendingRowsAreReinvited(t *testing.T) {
 	if strings.Join(mock.dismissed, ",") != "70,71" {
 		t.Errorf("dismissed = %v, want ada's 70 and cam's 71 only", mock.dismissed)
 	}
-	if n := countCalls(mock.calls, http.MethodGet, "/orgs/o/failed_invitations"); n != 1 {
-		t.Errorf("failed-list reads = %d, want 1 for the whole batch", n)
+	// One read of each list serves the whole batch, even when the pending list
+	// comes back empty.
+	for _, path := range []string{"/orgs/o/invitations", "/orgs/o/failed_invitations"} {
+		if n := countCalls(mock.calls, http.MethodGet, path); n != 1 {
+			t.Errorf("reads of %s = %d, want 1 for the whole batch", path, n)
+		}
 	}
 }
 

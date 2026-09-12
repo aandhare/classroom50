@@ -373,8 +373,8 @@ func TestRunRosterSync_AcceptedInviteRecoveredThenClean(t *testing.T) {
 func TestRunRosterSync_RecoveredAddressDismissesExpiredRecords(t *testing.T) {
 	roster := storedRosterHeader + ",Ada,Lovelace," + inviteTestEmail + ",section-1,,student\n"
 	failed := []map[string]any{
-		{"id": 70, "email": inviteTestEmail, "failed_reason": "Invitation expired."},
-		{"id": 71, "email": "someone-else@uni.edu", "failed_reason": "Invitation expired."},
+		{"id": 70, "email": inviteTestEmail},
+		{"id": 71, "email": "someone-else@uni.edu"},
 	}
 
 	dry := newSyncMock(t, roster)

@@ -167,7 +167,7 @@ func runRosterInviteFile(client githubapi.Client, out, errOut io.Writer, org, cl
 			_, _ = fmt.Fprintf(out, "  skipped %s (line %d): already a member of the org or already invited\n", entry.email, entry.line)
 		case outcomePendingBlocked:
 			pendingBlocked = append(pendingBlocked, entry)
-			_, _ = fmt.Fprintf(out, "  skipped %s (line %d): already has a pending invitation\n", entry.email, entry.line)
+			_, _ = fmt.Fprintf(out, "  skipped %s (line %d): GitHub still lists a pending invitation for the address\n", entry.email, entry.line)
 		case outcomeAcceptedBlocked:
 			acceptedBlocked = append(acceptedBlocked, entry)
 			_, _ = fmt.Fprintf(out, "  skipped %s (line %d): accepted an earlier invitation, not yet recorded\n", entry.email, entry.line)
@@ -205,12 +205,12 @@ func runRosterInviteFile(client githubapi.Client, out, errOut io.Writer, org, cl
 			entry.email, entry.line, org, classroom)
 	}
 	for _, entry := range pendingBlocked {
-		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): already has a pending invitation. Advise them to accept it, then run `gh teacher roster sync %s %s` to record them.\n",
-			entry.email, entry.line, org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): GitHub still lists a pending invitation for the address (this classroom's, or another classroom's in %s). Advise them to accept it, then run %s to record them.\n",
+			entry.email, entry.line, org, syncWriteCommand(org, classroom))
 	}
 	for _, entry := range acceptedBlocked {
-		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): accepted an earlier invitation but isn't recorded on the roster yet. Run `gh teacher roster sync %s %s --write` to record them.\n",
-			entry.email, entry.line, org, classroom)
+		_, _ = fmt.Fprintf(errOut, "Skipped %s (line %d): accepted an earlier invitation but isn't recorded on the roster yet. Run %s to record them.\n",
+			entry.email, entry.line, syncWriteCommand(org, classroom))
 	}
 	for _, addr := range alreadyHeld {
 		_, _ = fmt.Fprintf(errOut, "Invited %s, but a roster row already carries that address, so no second pending row was written.\n", addr)

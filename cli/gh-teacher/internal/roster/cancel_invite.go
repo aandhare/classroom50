@@ -79,10 +79,10 @@ func runRosterCancelInvite(client githubapi.Client, out, errOut io.Writer, org, 
 	if !found {
 		_, _ = fmt.Fprintf(out, "%s: no pending invitation for %s, nothing was cancelled\n", org, email)
 		_, _ = fmt.Fprintf(errOut, "Nothing is touched without a pending invitation to revoke, since the metadata team may hold the only record of an accepted invitation's address.\n"+
-			"  - If they already accepted, run `gh teacher roster sync %s %s --write` to record their username and github_id.\n"+
+			"  - If they already accepted, run %s to record their username and github_id.\n"+
 			"  - If the invitation expired (GitHub invitations last 7 days), run `gh teacher roster invite %s %s %s` to send a new one against the same row.\n"+
 			"  - To drop the row instead, edit %s.\n",
-			org, classroom, org, classroom, email, configrepo.RosterFilePath(classroom))
+			syncWriteCommand(org, classroom), org, classroom, email, configrepo.RosterFilePath(classroom))
 		return nil
 	}
 
