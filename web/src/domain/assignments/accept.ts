@@ -318,6 +318,8 @@ async function provisionAcceptedRepo(params: {
   removeSeededReadme?: boolean
   // Open the accept-time Feedback PR after setup succeeds (issue #228).
   feedbackPr?: boolean
+  // !skipsShim; false drops the Feedback PR body's autograding lines.
+  autograded: boolean
   // When set, the Feedback PR body is read from this template's
   // pull_request_template.md (feedback_pr_template opt-in), best-effort.
   feedbackPrTemplate?: FeedbackPrTemplateRef
@@ -340,6 +342,7 @@ async function provisionAcceptedRepo(params: {
     autogradeYaml,
     removeSeededReadme = false,
     feedbackPr = false,
+    autograded,
     feedbackPrTemplate,
     rerenderShimForBranch,
     onStepUpdate,
@@ -447,6 +450,7 @@ async function provisionAcceptedRepo(params: {
       }),
     mode,
     feedbackPr,
+    autograded,
     feedbackPrTemplate,
     onStepUpdate,
   })
@@ -515,6 +519,7 @@ async function openFeedbackPrStep(params: {
   resolveAcceptCommitSha: () => Promise<string | null>
   mode: AssignmentMode
   feedbackPr: boolean
+  autograded: boolean
   feedbackPrTemplate?: FeedbackPrTemplateRef
   onStepUpdate?: OnAcceptStepUpdate
 }) {
@@ -526,6 +531,7 @@ async function openFeedbackPrStep(params: {
     resolveAcceptCommitSha,
     mode,
     feedbackPr,
+    autograded,
     feedbackPrTemplate,
     onStepUpdate,
   } = params
@@ -560,6 +566,7 @@ async function openFeedbackPrStep(params: {
     branch,
     acceptCommitSha,
     mode,
+    autograded,
     feedbackPrTemplate,
   })
   onStepUpdate?.({
@@ -792,11 +799,12 @@ export async function acceptAssignment(params: {
   // whole setup step are skipped. Mirrors the CLI's acceptIntoBareRepo.
   const isEmptyRepo = assignment.empty_repo === true
 
-  // no_autograder assignment (teacher-supplied CI): a TEMPLATED repo that
-  // commits the marker + template content but NO autograde shim of either kind
-  // (neither the default shim nor a Pages-fetched workflow), so the teacher's
-  // own .github/ CI runs. Unlike empty_repo it keeps the template and permits
-  // the Feedback PR. Mirrors the CLI student accept gate (entry.CommitsShim()).
+  // no_autograder assignment: an initialized repo (template or README) that
+  // commits the marker + starter content but NO autograde shim of either kind
+  // (neither the default shim nor a Pages-fetched workflow), so a template's
+  // own .github/ CI runs, or nothing does. Unlike empty_repo it keeps the
+  // starter content and permits the Feedback PR. Mirrors the CLI student accept
+  // gate (entry.CommitsShim()).
   const isNoAutograder = assignment.no_autograder === true
 
   // init_shim assignment: a TEMPLATE-LESS repo initialized with only the marker
@@ -1220,6 +1228,7 @@ export async function acceptAssignment(params: {
           }),
         mode: assignment.mode,
         feedbackPr: wantsFeedbackPr,
+        autograded: !skipsShim,
         feedbackPrTemplate,
         onStepUpdate,
       })
@@ -1305,6 +1314,7 @@ export async function acceptAssignment(params: {
       autogradeYaml,
       removeSeededReadme: isInitShim,
       feedbackPr: wantsFeedbackPr,
+      autograded: !skipsShim,
       feedbackPrTemplate,
       rerenderShimForBranch: rerenderShim,
       onStepUpdate,
@@ -1348,6 +1358,7 @@ export async function acceptAssignment(params: {
     autogradeYaml,
     removeSeededReadme: isInitShim,
     feedbackPr: wantsFeedbackPr,
+    autograded: !skipsShim,
     feedbackPrTemplate,
     rerenderShimForBranch: rerenderShim,
     onStepUpdate,

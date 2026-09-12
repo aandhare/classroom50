@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import type { OpenAllFeedbackPrsSummary } from "@/domain/assignments"
 
@@ -65,6 +65,7 @@ const renderWith = (data: OpenAllFeedbackPrsSummary) => {
       org="acme"
       assignmentName="Homework 1"
       mode="individual"
+      autograded
       repos={["cs-hw-alice", "cs-hw-bob"]}
     />,
   )
@@ -145,5 +146,36 @@ describe("OpenAllFeedbackPrsModal summary", () => {
     expect(
       screen.queryByText("submissions.openAllPrs.incompleteTitle"),
     ).toBeNull()
+  })
+})
+
+describe("OpenAllFeedbackPrsModal run", () => {
+  it("forwards the assignment's autograded state to the bulk open", () => {
+    const mutate = vi.fn()
+    hookState.mockReturnValue({
+      mutate,
+      isPending: false,
+      data: undefined,
+      progress: null,
+      reset: vi.fn(),
+    })
+    render(
+      <OpenAllFeedbackPrsModal
+        open
+        onClose={vi.fn()}
+        org="acme"
+        assignmentName="Homework 1"
+        mode="group"
+        autograded={false}
+        repos={["cs-hw-team1"]}
+      />,
+    )
+    fireEvent.click(screen.getByText("submissions.openAllPrs.confirmLabel:1"))
+    expect(mutate).toHaveBeenCalledWith({
+      org: "acme",
+      repos: ["cs-hw-team1"],
+      mode: "group",
+      autograded: false,
+    })
   })
 })

@@ -311,6 +311,7 @@ const SubmissionsTable = ({
   filtered = false,
   onClearFilters,
   skipsGrading = false,
+  autograded,
   emptyRepoAssignment = false,
   submissionMode,
   submissionTags,
@@ -391,8 +392,11 @@ const SubmissionsTable = ({
   // The assignment skips built-in grading (empty_repo OR no_autograder): score
   // badges and the grading actions (details/regrade) are hidden.
   skipsGrading?: boolean
+  // !skipsGrading once the entry has resolved; undefined until then, which
+  // withholds the per-row Feedback PR repair (see FeedbackPrAction).
+  autograded?: boolean
   // The narrower bare-repo case (empty_repo alone): also hides the hub's repo
-  // actions (Review/Manage access). A no_autograder repo is templated and keeps
+  // actions (Review/Manage access). A no_autograder repo is initialized and keeps
   // the Feedback PR, so it must NOT set this — mirrors the page's bulk gates.
   emptyRepoAssignment?: boolean
   // The assignment's submission_mode, enabling the per-repo "Update
@@ -574,6 +578,7 @@ const SubmissionsTable = ({
         org={org}
         repo={repo}
         mode={isGroup ? "group" : "individual"}
+        autograded={autograded}
         hasRepo={hasRepo}
       />
     )
@@ -1303,6 +1308,7 @@ const SubmissionsTable = ({
             commit: manageSubmission.commit,
             release: manageSubmission.release,
             skipsGrading,
+            autograded,
             emptyRepoAssignment,
             displayName: manageSubmission.displayName,
             onManageAccess: manageSubmission.isGroup

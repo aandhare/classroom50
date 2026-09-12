@@ -234,7 +234,7 @@ const SubmissionsPageContent = () => {
     ? assignmentSkipsGrading(assignmentInfo)
     : false
   // The narrower bare-repo case: no control files, so no bulk repo management,
-  // Feedback PR, or close toggle. A no_autograder repo is templated and has them.
+  // Feedback PR, or close toggle. A no_autograder repo is initialized and has them.
   const isEmptyRepoAssignment = assignmentInfo?.empty_repo === true
   // Locked assignments are closed to students (accept + submission surfaces
   // refuse them); the gradebook stays fully functional for staff, so this is a
@@ -1493,10 +1493,13 @@ const SubmissionsPageContent = () => {
                 onRegradeAll={() => setRegradeConfirmOpen(true)}
                 // Bulk-open Feedback PRs: owner-only (needs admin on every repo,
                 // like the live reads), never for empty_repo (no PRs). A
-                // no_autograder repo is templated and PERMITS the Feedback PR, so
-                // it is gated on empty_repo only, not on skipsGrading.
+                // no_autograder repo is initialized and PERMITS the Feedback PR, so
+                // it is gated on empty_repo only, not on skipsGrading. Requires a
+                // resolved entry: the body's autograding lines key off it, and an
+                // unresolved entry would default to the autograded body.
                 onOpenAllPrs={
                   isOwner &&
+                  assignmentResolved &&
                   !isEmptyRepoAssignment &&
                   allAssignmentRepos.length > 0
                     ? () => setOpenAllPrsOpen(true)
@@ -1668,6 +1671,7 @@ const SubmissionsPageContent = () => {
           onClearFilters={clearFilters}
           emptyRepoAssignment={isEmptyRepoAssignment}
           skipsGrading={skipsGrading}
+          autograded={assignmentResolved ? !skipsGrading : undefined}
           // Per-row trigger retrofit: owner + default-autograder only (teacher-
           // authored shims are never rewritten). Mirrors the bulk-action gate,
           // including assignmentResolved.
@@ -1870,6 +1874,7 @@ const SubmissionsPageContent = () => {
         org={org}
         assignmentName={assignmentInfo?.name ?? assignment}
         mode={isGroupFlavor ? "group" : "individual"}
+        autograded={!skipsGrading}
         repos={allAssignmentRepos}
       />
       <DownloadAllSubmissionsModal
