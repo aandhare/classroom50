@@ -121,6 +121,7 @@ own account (scope it tightly to the organization):
 | Repository access | **All repositories** ("Only select repositories" misses on-demand student repositories). |
 | Contents | **Read and write** (read: collect; write: regrade pushes `submit/*` tags). |
 | Actions | **Read and write** (regrade re-runs autograde). |
+| Workflows | **Read and write** (regrade can tag a commit pushed before a submission-mode change; GitHub refuses that tag otherwise). |
 | Administration | **Read and write** (grant staff teams read on student repositories and templates). |
 | Metadata | **Read** (auto-included; lets collection read legacy group repository collaborators). |
 | Organization permissions, **Members** | **Read** (list the classroom team; a separate section, shown only once the organization is the resource owner). |
@@ -501,7 +502,8 @@ Exercises every permission with read-only calls GitHub gates behind the write
 permission: `/orgs/{org}/members`, `/orgs/{org}/teams/{slug}/members`,
 `/repos/{org}/classroom50` (its `permissions.push` and `permissions.admin`),
 `/repos/{org}/classroom50/actions/permissions`, and
-`/repos/{org}/classroom50/collaborators`.
+`/repos/{org}/classroom50/collaborators`. Workflows: Read and write has no
+read-only probe, so a token missing it passes here and is caught by regrade.
 
 ### `autograde-runner.yaml` (reusable, runs in student repositories)
 

@@ -530,7 +530,7 @@ func TestSkeletonFiles_AutogradeRunner(t *testing.T) {
 			// rejected delete re-checks existence; if the release survived,
 			// warn and keep it instead of failing the grade job.
 			`if ! DELETE_ERR="$(gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>&1)"; then`,
-			`the release at $TAG is immutable (org ruleset) and cannot be refreshed`,
+			`the release at $TAG is immutable (org ruleset) and $KEPT_MSG`,
 			`gradebook collection keeps reading the OLD release's result.json`,
 		} {
 			if !strings.Contains(releaseRun, want) {
@@ -552,7 +552,7 @@ func TestSkeletonFiles_AutogradeRunner(t *testing.T) {
 			if err := os.MkdirAll(binDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte("#!/bin/sh\ncase \"$1\" in api) echo false ;; esac\nexit 0\n"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			for _, name := range []string{"result.json", "release-body.md"} {
@@ -582,9 +582,13 @@ func TestSkeletonFiles_AutogradeRunner(t *testing.T) {
 				t.Fatal(err)
 			}
 			ghLog := filepath.Join(tmp, "gh.log")
-			// `release view` succeeds so the exists/delete-then-recreate path runs.
+			// `release view` succeeds and the immutable probe answers false, so
+			// the exists/delete-then-recreate path runs.
 			fakeGH := []byte(`#!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
+case "$1" in
+  api) echo false; exit 0 ;;
+esac
 `)
 			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
 				t.Fatal(err)
@@ -630,11 +634,13 @@ printf '%s\n' "$*" >> "$GH_LOG"
 			if strings.Contains(string(log), "result..json") {
 				t.Errorf("invalid staged basename reached gh:\n%s", log)
 			}
-			// Immutable-safe: view -> delete (exists) -> create with result.json
-			// plus the two valid extras attached atomically. No post-create upload.
+			// Immutable-safe: view -> immutable probe -> delete (exists, mutable)
+			// -> create with result.json plus the two valid extras attached
+			// atomically. No post-create upload.
 			gotCalls := strings.Split(strings.TrimSpace(string(log)), "\n")
 			wantCalls := []string{
 				"release view submit/test --repo example/classroom-assignment-student",
+				"api repos/example/classroom-assignment-student/releases/tags/submit/test --jq .immutable",
 				"release delete submit/test --repo example/classroom-assignment-student --yes",
 				"release create submit/test result.json " +
 					filepath.Join(assetsDir, "first.pdf") + " " +
@@ -646,6 +652,236 @@ printf '%s\n' "$*" >> "$GH_LOG"
 			}
 			if !strings.Contains(string(output), "::warning::release_assets: invalid staged basename (skipped)") {
 				t.Errorf("Release shell output missing invalid-basename warning:\n%s", output)
+			}
+		})
+
+		// Immutable release (the repo/org setting, regrade lost a release live
+		// 2026-09-12): GitHub lets the delete through but then refuses the tag
+		// name forever, so the step must not touch the release at all: no
+		// delete, no create, warn, exit 0.
+		t.Run("ReleaseShellKeepsImmutableRelease", func(t *testing.T) {
+			tmp := t.TempDir()
+			binDir := filepath.Join(tmp, "bin")
+			if err := os.MkdirAll(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ghLog := filepath.Join(tmp, "gh.log")
+			fakeGH := []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api repos/example/classroom-assignment-student/releases/tags/submit/test")
+    echo true
+    ;;
+esac
+exit 0
+`)
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"result.json", "release-body.md"} {
+				if err := os.WriteFile(filepath.Join(tmp, name), []byte("fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command("bash", "-c", releaseRun)
+			cmd.Dir = tmp
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GH_LOG="+ghLog,
+				"GH_TOKEN=test-token",
+				"GITHUB_REPOSITORY=example/classroom-assignment-student",
+				"STAGED_RELEASE_BASENAMES=",
+				"TAG=submit/test",
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Release shell must exit 0 for an immutable release: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "::warning::the release at submit/test is immutable and cannot be refreshed") {
+				t.Errorf("Release shell output missing the immutable-release warning:\n%s", output)
+			}
+			log, err := os.ReadFile(ghLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := []string{
+				"release view submit/test --repo example/classroom-assignment-student",
+				"api repos/example/classroom-assignment-student/releases/tags/submit/test --jq .immutable",
+			}
+			if got := strings.Split(strings.TrimSpace(string(log)), "\n"); !reflect.DeepEqual(got, wantCalls) {
+				t.Errorf("immutable release: gh calls = %#v, want %#v (no delete, no create: the tag name would be burned)", got, wantCalls)
+			}
+		})
+
+		// A failed immutability probe must fail safe: guessing "mutable" and
+		// deleting would burn the tag name if the guess is wrong.
+		t.Run("ReleaseShellKeepsReleaseWhenProbeFails", func(t *testing.T) {
+			tmp := t.TempDir()
+			binDir := filepath.Join(tmp, "bin")
+			if err := os.MkdirAll(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ghLog := filepath.Join(tmp, "gh.log")
+			fakeGH := []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1" in
+  api) echo "HTTP 502" >&2; exit 1 ;;
+esac
+exit 0
+`)
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"result.json", "release-body.md"} {
+				if err := os.WriteFile(filepath.Join(tmp, name), []byte("fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command("bash", "-c", releaseRun)
+			cmd.Dir = tmp
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GH_LOG="+ghLog,
+				"GH_TOKEN=test-token",
+				"GITHUB_REPOSITORY=example/classroom-assignment-student",
+				"STAGED_RELEASE_BASENAMES=",
+				"TAG=submit/test",
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Release shell must exit 0 when the probe fails: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "could not be checked") {
+				t.Errorf("Release shell output missing the unchecked-immutability warning:\n%s", output)
+			}
+			log, err := os.ReadFile(ghLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"release delete", "release create"} {
+				if strings.Contains(string(log), forbidden) {
+					t.Errorf("failed probe must not reach `gh %s`:\n%s", forbidden, log)
+				}
+			}
+		})
+
+		// The probe's raw API path must carry the tag percent-encoded: a
+		// student tag with `#` or `%` would otherwise truncate the URL, the
+		// probe would miss the release `gh release view` just found, and the
+		// fail-safe branch would keep that release forever.
+		t.Run("ReleaseShellEncodesTagInImmutabilityProbe", func(t *testing.T) {
+			tmp := t.TempDir()
+			binDir := filepath.Join(tmp, "bin")
+			if err := os.MkdirAll(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ghLog := filepath.Join(tmp, "gh.log")
+			fakeGH := []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "api repos/example/classroom-assignment-student/releases/tags/submit/x%231%2525")
+    echo false
+    ;;
+  "api "*)
+    echo "HTTP 404" >&2; exit 1
+    ;;
+esac
+exit 0
+`)
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"result.json", "release-body.md"} {
+				if err := os.WriteFile(filepath.Join(tmp, name), []byte("fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command("bash", "-c", releaseRun)
+			cmd.Dir = tmp
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GH_LOG="+ghLog,
+				"GH_TOKEN=test-token",
+				"GITHUB_REPOSITORY=example/classroom-assignment-student",
+				"STAGED_RELEASE_BASENAMES=",
+				"TAG=submit/x#1%25",
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Release shell must exit 0 for a mutable release: %v\n%s", err, output)
+			}
+			if strings.Contains(string(output), "could not be checked") {
+				t.Errorf("an encoded probe must answer, not fall to the unchecked branch:\n%s", output)
+			}
+			log, err := os.ReadFile(ghLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"api repos/example/classroom-assignment-student/releases/tags/submit/x%231%2525 --jq .immutable",
+				"release delete submit/x#1%25",
+				"release create submit/x#1%25",
+			} {
+				if !strings.Contains(string(log), want) {
+					t.Errorf("gh log missing %q:\n%s", want, log)
+				}
+			}
+		})
+
+		// A release object without an `immutable` field (GHES before immutable
+		// releases) answers `null`: nothing can be burned there, so the step
+		// refreshes as before rather than keeping the stale release.
+		t.Run("ReleaseShellTreatsNullImmutableAsMutable", func(t *testing.T) {
+			tmp := t.TempDir()
+			binDir := filepath.Join(tmp, "bin")
+			if err := os.MkdirAll(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ghLog := filepath.Join(tmp, "gh.log")
+			fakeGH := []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1" in
+  api) echo null ;;
+esac
+exit 0
+`)
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"result.json", "release-body.md"} {
+				if err := os.WriteFile(filepath.Join(tmp, name), []byte("fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command("bash", "-c", releaseRun)
+			cmd.Dir = tmp
+			cmd.Env = append(os.Environ(),
+				"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"GH_LOG="+ghLog,
+				"GH_TOKEN=test-token",
+				"GITHUB_REPOSITORY=example/classroom-assignment-student",
+				"STAGED_RELEASE_BASENAMES=",
+				"TAG=submit/test",
+			)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Release shell must exit 0 when the probe answers null: %v\n%s", err, output)
+			}
+			if strings.Contains(string(output), "cannot be refreshed") || strings.Contains(string(output), "could not be checked") {
+				t.Errorf("a null probe must refresh the release, not keep it:\n%s", output)
+			}
+			log, err := os.ReadFile(ghLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"release delete submit/test", "release create submit/test"} {
+				if !strings.Contains(string(log), want) {
+					t.Errorf("gh log missing %q:\n%s", want, log)
+				}
 			}
 		})
 
@@ -670,6 +906,9 @@ case "$1 $2" in
     echo "HTTP 422: Release is immutable (ruleset)" >&2
     exit 1
     ;;
+esac
+case "$1" in
+  api) echo false; exit 0 ;;
 esac
 exit 0
 `)
@@ -734,6 +973,9 @@ case "$1 $2" in
     echo "HTTP 500: something transient" >&2
     exit 1
     ;;
+esac
+case "$1" in
+  api) echo false; exit 0 ;;
 esac
 exit 0
 `)
@@ -892,7 +1134,7 @@ func TestSkeletonFiles_AutogradeRunnerSkipsReservedReleaseAssetBasenamesCaseInse
 				t.Fatal(err)
 			}
 			ghLog := filepath.Join(tmp, "gh.log")
-			fakeGH := []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\n")
+			fakeGH := []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\ncase \"$1\" in api) echo false ;; esac\n")
 			if err := os.WriteFile(filepath.Join(binDir, "gh"), fakeGH, 0o700); err != nil {
 				t.Fatal(err)
 			}

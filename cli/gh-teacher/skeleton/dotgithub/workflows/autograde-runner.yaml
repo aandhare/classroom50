@@ -1126,23 +1126,40 @@ jobs:
           # recreate to attach the current result + extras atomically. Keep the
           # git tag (--cleanup-tag omitted) so the submission ref is unchanged.
           #
-          # But an org ruleset enforcing immutable releases (same rule noted
-          # above for post-create uploads) ALSO rejects the delete itself with
-          # HTTP 422/403, seen live on a teacher regrade 2026-08-07: the
-          # delete failed, this step went red, and set-latest was skipped even
-          # though grading PASSED and the commit status posted success. gh's
-          # exit codes can't reliably distinguish that ruleset rejection from
-          # a transient error, so re-check existence instead: if the delete
-          # failed and the release is STILL there, treat it as
-          # immutable-blocked: warn and keep the old release rather than
-          # failing the job over record-keeping GitHub forbids. If the delete
-          # failed but the release is GONE (a race removed it), proceed to
-          # create as usual.
+          # Two ways GitHub forbids that refresh, both kept rather than failed:
+          # grading already posted its commit status, so a refresh GitHub
+          # forbids must not fail the job or lose the record.
+          #
+          # 1. The release itself is immutable (the repo/org "immutable
+          #    releases" setting). GitHub ALLOWS the delete but then refuses the
+          #    tag name forever ("tag_name was used by an immutable release"),
+          #    so deleting would erase this submission's record for good; seen
+          #    live on a regrade 2026-09-12. Check before touching it.
+          # 2. An org ruleset rejects the delete with HTTP 422/403 (seen live
+          #    2026-08-07). gh's exit codes can't reliably distinguish that from
+          #    a transient error, so re-check existence: if the release is STILL
+          #    there, treat it as immutable-blocked; if it's GONE (a race removed
+          #    it), proceed to create as usual.
+          KEPT_MSG="cannot be refreshed; the regraded score is in the commit status and the job summary, but gradebook collection keeps reading the OLD release's result.json for this submission (GitHub's rule, not ours)"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A failed probe answers "" and is treated as immutable: guessing
+            # wrong the other way destroys the record for good. The tag is a
+            # student-chosen ref name, so it is percent-encoded for the raw API
+            # path (a `#` or `%` in it would otherwise make the probe miss the
+            # release `gh release view` just found and keep it forever).
+            ENCODED_TAG="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$TAG")"
+            IMMUTABLE="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_TAG}" --jq '.immutable' 2>/dev/null || true)"
+            if [[ "$IMMUTABLE" == "true" ]]; then
+              echo "::warning::the release at $TAG is immutable and $KEPT_MSG"
+              exit 0
+            elif [[ "$IMMUTABLE" != "false" && "$IMMUTABLE" != "null" ]]; then
+              echo "::warning::the release at $TAG could not be checked for immutability, so it is kept as is; it $KEPT_MSG"
+              exit 0
+            fi
             if ! DELETE_ERR="$(gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>&1)"; then
               if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
                 echo "$DELETE_ERR"
-                echo "::warning::the release at $TAG is immutable (org ruleset) and cannot be refreshed; the regraded score is in the commit status and the job summary, but gradebook collection keeps reading the OLD release's result.json for this submission (GitHub's rule, not ours)"
+                echo "::warning::the release at $TAG is immutable (org ruleset) and $KEPT_MSG"
                 exit 0
               fi
               # Release vanished between delete and re-check: surface why the

@@ -12,6 +12,7 @@ import io
 import json
 import pathlib
 import urllib.error
+import urllib.parse
 import urllib.request
 import email.message
 
@@ -65,15 +66,16 @@ def test_classify_fatal_view():
 
 def test_regrade_repo_reruns_latest_run(monkeypatch):
     calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: 4242)
 
     def fake_rerun(api_url, org, repo, token, run_id):
         calls["run_id"] = run_id
 
     monkeypatch.setattr(rr, "rerun_workflow_run", fake_rerun)
-    # main_head_sha / tagging must NOT be reached when a run exists.
+    # first_gradeable_commit / tagging must NOT be reached when a run exists.
     monkeypatch.setattr(
-        rr, "main_head_sha", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+        rr, "first_gradeable_commit", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
 
     assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "rerun"
@@ -82,8 +84,9 @@ def test_regrade_repo_reruns_latest_run(monkeypatch):
 
 def test_regrade_repo_first_grades_when_no_prior_run(monkeypatch):
     calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
-    monkeypatch.setattr(rr, "main_head_sha", lambda *a, **k: "deadbeefcafe")
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("deadbeefcafe", "main"))
     monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
 
     def fake_create(api_url, org, repo, token, tag, sha):
@@ -97,23 +100,81 @@ def test_regrade_repo_first_grades_when_no_prior_run(monkeypatch):
     assert calls["tag"].startswith("submit/")
 
 
-def test_regrade_repo_first_grade_reuses_existing_tag(monkeypatch):
+def test_regrade_repo_existing_tag_without_a_run_gets_a_fresh_tag(monkeypatch, capsys):
+    # A submit/* tag already at the commit fired nothing (its run is gone, or
+    # the runner minted it with the Actions token). GitHub fires nothing for a
+    # tag that already exists, so reusing it would report "first-graded" while
+    # no run starts: push a fresh tag and say why.
+    calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
-    monkeypatch.setattr(rr, "main_head_sha", lambda *a, **k: "deadbeef")
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("deadbeef", "main"))
     monkeypatch.setattr(
         rr, "existing_submit_tag_at", lambda *a, **k: "submit/2026-01-01T00-00-00Z-deadbee"
     )
 
-    def boom(*a, **k):
-        raise AssertionError("create_tag_ref called despite an existing tag")
+    def fake_create(api_url, org, repo, token, tag, sha):
+        calls["tag"] = tag
+        calls["sha"] = sha
 
-    monkeypatch.setattr(rr, "create_tag_ref", boom)
+    monkeypatch.setattr(rr, "create_tag_ref", fake_create)
     assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "tagged"
+    assert calls["sha"] == "deadbeef"
+    assert calls["tag"] != "submit/2026-01-01T00-00-00Z-deadbee"
+    out = capsys.readouterr().out
+    assert "submit/2026-01-01T00-00-00Z-deadbee already points at commit deadbee" in out
+    assert "pushing a fresh submit tag" in out
+
+
+def test_regrade_repo_tag_mode_switch_from_every_push_grades_again(monkeypatch):
+    # every-push -> tag switch: the runner graded the student's commit on a
+    # branch push and minted submit/* there with github.token (no run fired for
+    # the tag). In tag mode that branch run is not a candidate and would
+    # re-suppress if replayed, so the only way to grade the commit again is a
+    # fresh tag push from the service token.
+    runs = [
+        {"id": 7, "head_branch": "main", "head_sha": "work", "status": "completed",
+         "conclusion": "success"},
+    ]
+
+    def fake_get(url, token, *, accept, _retries=3):
+        if "/actions/workflows/" in url:
+            return json.dumps({"workflow_runs": runs}).encode("utf-8")
+        if url.endswith("/repos/cs50/cs50-hello-alice"):
+            return json.dumps({"default_branch": "main"}).encode("utf-8")
+        if "/commits?" in url:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            if query.get("path") == [rr.ACCEPT_MARKER_PATH]:
+                rows = [("accept", "accept")]
+            else:
+                rows = [("work", "solve"), ("accept", "accept")]
+            return json.dumps([{"sha": s, "commit": {"message": m}} for s, m in rows]).encode("utf-8")
+        assert "/git/matching-refs/tags/" in url, url
+        return json.dumps([
+            {"ref": "refs/tags/submit/2026-01-01T00-00-00Z-work",
+             "object": {"sha": "work", "type": "commit"}},
+        ]).encode("utf-8")
+
+    created = {}
+
+    def fake_create(api_url, org, repo, token, tag, sha):
+        created["tag"] = tag
+        created["sha"] = sha
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "create_tag_ref", fake_create)
+    monkeypatch.setattr(
+        rr, "rerun_workflow_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("rerun"))
+    )
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", True) == "tagged"
+    assert created["sha"] == "work"
+    assert created["tag"].startswith("submit/") and created["tag"].endswith("-work")
 
 
 def test_regrade_repo_missing_repo(monkeypatch):
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
-    monkeypatch.setattr(rr, "main_head_sha", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: None)
     monkeypatch.setattr(
         rr, "existing_submit_tag_at", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
@@ -121,7 +182,7 @@ def test_regrade_repo_missing_repo(monkeypatch):
 
 
 def test_latest_autograde_run_id_parses_newest(monkeypatch):
-    body = json.dumps({"workflow_runs": [{"id": 999}]}).encode("utf-8")
+    body = json.dumps({"workflow_runs": [{"id": 999, "head_branch": "submit/2026-01-01T00-00-00Z-abcdefg"}]}).encode("utf-8")
     monkeypatch.setattr(rr, "_http_get", lambda *a, **k: body)
     assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") == 999
 
@@ -176,45 +237,142 @@ def test_rerun_workflow_run_throttled_403_is_not_a_benign_skip(monkeypatch):
     assert rr.classify(ei.value) is rr.THROTTLED
 
 
-def test_main_head_sha_returns_none_on_404(monkeypatch):
+def _fake_commits_get(*, default_branch="main", commits=(), marker_commits=(), repo_404=False):
+    """A `_http_get` stub for the first-gradeable-commit walk: the repo read,
+    the branch commit list, and the accept-marker path filter. Records URLs."""
+    seen = {"urls": []}
+
     def fake_get(url, token, *, accept, _retries=3):
+        seen["urls"].append(url)
+        if url.endswith("/repos/cs50/repo"):
+            if repo_404:
+                raise _http_error(404)
+            return json.dumps({"default_branch": default_branch}).encode("utf-8")
+        assert "/repos/cs50/repo/commits?" in url, url
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        rows = marker_commits if query.get("path") == [rr.ACCEPT_MARKER_PATH] else commits
+        return json.dumps(
+            [{"sha": sha, "commit": {"message": message}} for sha, message in rows]
+        ).encode("utf-8")
+
+    return fake_get, seen
+
+
+def test_first_gradeable_commit_returns_head_when_it_can_fire(monkeypatch):
+    fake_get, seen = _fake_commits_get(
+        commits=[("work2", "More work"), ("work1", "Work"), ("accept", "[Classroom 50] Initialize")],
+        marker_commits=[("accept", "[Classroom 50] Initialize")],
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") == ("work2", "main")
+    # Walks the repo's real default branch and pins the marker-path filter.
+    assert any("sha=main" in u and "path=" not in u for u in seen["urls"])
+    assert any("path=.classroom50.yaml" in u for u in seen["urls"])
+
+
+def test_first_gradeable_commit_skips_skip_ci_bookkeeping_at_head(monkeypatch):
+    # The issue-956 shape: a submission-mode retrofit ([skip ci]) sits on top
+    # of the student's work. A tag at HEAD fires nothing, so the fallback must
+    # tag the student's commit underneath.
+    fake_get, _ = _fake_commits_get(
+        commits=[
+            ("retrofit", "[Classroom 50] Update autograder trigger to every-push (submission-mode)\n\n[skip ci]"),
+            ("work", "Finish problem set"),
+            ("feedback", "[Classroom 50] Open Feedback PR (gh student accept)\n\n[skip ci]"),
+            ("accept", "[Classroom 50] Initialize .classroom50.yaml and autograde workflow (gh student accept)"),
+        ],
+        marker_commits=[("accept", "[Classroom 50] Initialize ...")],
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") == ("work", "main")
+
+
+def test_first_gradeable_commit_none_when_nothing_pushed_since_accept(monkeypatch):
+    # Accepted (Feedback PR opened on top) but never pushed: no submission, and
+    # the starter code must NOT be graded into a zero-score release.
+    fake_get, _ = _fake_commits_get(
+        commits=[
+            ("feedback", "[Classroom 50] Open Feedback PR (gh student accept)\n\n[skip ci]"),
+            ("accept", "[Classroom 50] Initialize .classroom50.yaml and autograde workflow (gh student accept)"),
+            ("root", "Initial commit"),
+        ],
+        marker_commits=[("accept", "[Classroom 50] Initialize ...")],
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") is None
+
+
+def test_first_gradeable_commit_uses_oldest_marker_commit_as_accept(monkeypatch):
+    # A rename rewrote the marker later ([skip ci]); the ACCEPT commit is the
+    # oldest one touching it, so work between the two still grades.
+    fake_get, _ = _fake_commits_get(
+        commits=[
+            ("rename", "[Classroom 50] Update assignment slug to hello-2 (gh teacher assignment rename)\n\n[skip ci]"),
+            ("work", "Work"),
+            ("accept", "[Classroom 50] Initialize"),
+        ],
+        marker_commits=[("rename", "..."), ("accept", "[Classroom 50] Initialize")],
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") == ("work", "main")
+
+
+def test_first_gradeable_commit_without_marker_history_grades_newest_firable(monkeypatch):
+    # No commit touches the marker (root fallback, like the runner): don't
+    # stop the walk; the newest commit without a skip marker is graded.
+    fake_get, _ = _fake_commits_get(
+        commits=[("retrofit", "[Classroom 50] Update autograder trigger\n\n[skip ci]"), ("work", "Work")],
+        marker_commits=[],
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") == ("work", "main")
+
+
+def test_first_gradeable_commit_resolves_master_default_branch(monkeypatch):
+    fake_get, seen = _fake_commits_get(
+        default_branch="master", commits=[("work", "Work")], marker_commits=[]
+    )
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") == ("work", "master")
+    assert all("sha=master" in u for u in seen["urls"] if "/commits?" in u)
+
+
+def test_first_gradeable_commit_none_when_repo_missing(monkeypatch):
+    # 404 on the repo read (student never accepted): None, no commit reads.
+    fake_get, seen = _fake_commits_get(repo_404=True)
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") is None
+    assert not any("/commits?" in u for u in seen["urls"])
+
+
+def test_first_gradeable_commit_none_when_branch_empty(monkeypatch):
+    def fake_get(url, token, *, accept, _retries=3):
+        if url.endswith("/repos/cs50/repo"):
+            return json.dumps({"default_branch": "main"}).encode("utf-8")
         raise _http_error(404)
 
     monkeypatch.setattr(rr, "_http_get", fake_get)
-    assert rr.main_head_sha("https://api", "cs50", "repo", "tok") is None
+    assert rr.first_gradeable_commit("https://api", "cs50", "repo", "tok") is None
 
 
-def test_main_head_sha_parses_object_sha(monkeypatch):
-    body = json.dumps({"object": {"sha": "1234abcd"}}).encode("utf-8")
-    monkeypatch.setattr(rr, "_http_get", lambda *a, **k: body)
-    assert rr.main_head_sha("https://api", "cs50", "repo", "tok") == "1234abcd"
-
-
-def test_main_head_sha_resolves_master_default_branch(monkeypatch):
-    # A master-default student repo must be regraded off heads/master, not a
-    # nonexistent heads/main.
-    seen = {}
-
-    def fake_get(url, token, *, accept, _retries=3):
-        if url.endswith("/repos/cs50/repo"):
-            return json.dumps({"default_branch": "master"}).encode("utf-8")
-        seen["ref_url"] = url
-        return json.dumps({"object": {"sha": "cafe"}}).encode("utf-8")
-
-    monkeypatch.setattr(rr, "_http_get", fake_get)
-    assert rr.main_head_sha("https://api", "cs50", "repo", "tok") == "cafe"
-    assert seen["ref_url"].endswith("/git/ref/heads/master")
-
-
-def test_main_head_sha_returns_none_when_repo_missing(monkeypatch):
-    # 404 on the repo read (student never accepted) → None, no ref read.
-    def fake_get(url, token, *, accept, _retries=3):
-        if url.endswith("/repos/cs50/repo"):
-            raise _http_error(404)
-        raise AssertionError("ref read should not happen when the repo is 404")
-
-    monkeypatch.setattr(rr, "_http_get", fake_get)
-    assert rr.main_head_sha("https://api", "cs50", "repo", "tok") is None
+@pytest.mark.parametrize(
+    "message, want",
+    [
+        ("Work on pset", False),
+        ("[Classroom 50] Update autograder trigger to tag (submission-mode)\n\n[skip ci]", True),
+        ("[Classroom 50] Open Feedback PR (gh student accept)\n\n[skip ci]", True),
+        ("wip [CI SKIP]", True),
+        ("[no ci] typo", True),
+        ("[skip actions] docs", True),
+        ("[actions skip] docs", True),
+        ("Fix\n\nskip-checks: true", True),
+        ("Fix\n\nskip-checks:true", True),
+        ("mention skip-checks: true inline", False),
+        ("skip ci without brackets", False),
+    ],
+)
+def test_has_ci_skip_marker(message, want):
+    assert rr.has_ci_skip_marker(message) is want
 
 
 def test_existing_submit_tag_matches_sha(monkeypatch):
@@ -1016,36 +1174,111 @@ def test_latest_autograde_run_id_tag_only_tolerates_missing_head_branch(monkeypa
     assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok", tag_only=True) is None
 
 
-def test_latest_autograde_run_id_request_shape_by_mode(monkeypatch):
-    # tag_only scans one 100-run page; the default keeps today's per_page=1
-    # request byte-identical (pins that every-push behavior didn't change).
+def test_latest_autograde_run_id_request_shape(monkeypatch):
+    # Both modes scan one 100-run page: every-push runs can be no-ops too
+    # (acceptance commit, shim retrofit, a push suppressed while in tag mode).
     seen = {}
 
     def fake_get(url, token, *, accept, _retries=3):
-        seen["url"] = url
+        seen.setdefault("urls", []).append(url)
         return json.dumps({"workflow_runs": []}).encode("utf-8")
 
     monkeypatch.setattr(rr, "_http_get", fake_get)
     rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok", tag_only=True)
-    assert "per_page=100" in seen["url"]
     rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok")
-    assert "per_page=1" in seen["url"] and "per_page=100" not in seen["url"]
+    assert all("per_page=100" in u for u in seen["urls"])
+    # No runs at all: the submit-tag map is never fetched.
+    assert not any("matching-refs" in u for u in seen["urls"])
+
+
+def _runs_and_tags_get(runs, tag_refs):
+    """`_http_get` stub serving the workflow-runs page and the submit/* tag
+    refs; records how many times the tag map was fetched."""
+    seen = {"tag_fetches": 0}
+
+    def fake_get(url, token, *, accept, _retries=3):
+        if "/actions/workflows/" in url:
+            return json.dumps({"workflow_runs": runs}).encode("utf-8")
+        assert "/git/matching-refs/tags/submit%2F" in url, url
+        seen["tag_fetches"] += 1
+        return json.dumps(
+            [{"ref": f"refs/tags/{tag}", "object": {"sha": sha, "type": "commit"}} for tag, sha in tag_refs]
+        ).encode("utf-8")
+
+    return fake_get, seen
+
+
+def test_latest_autograde_run_id_every_push_skips_runs_that_graded_nothing(monkeypatch):
+    # Newest-first: a branch run at a commit with no submit/* tag never graded
+    # (acceptance, retrofit backstop, or a push suppressed while the assignment
+    # was in tag mode). The first run whose commit carries a tag is the one to
+    # replay.
+    runs = [
+        {"id": 1, "head_branch": "main", "head_sha": "retrofit"},
+        {"id": 2, "head_branch": "main", "head_sha": "suppressed"},
+        {"id": 3, "head_branch": "main", "head_sha": "graded"},
+        {"id": 4, "head_branch": "main", "head_sha": "accept"},
+    ]
+    fake_get, seen = _runs_and_tags_get(runs, [("submit/2026-01-01T00-00-00Z-graded0", "graded")])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") == 3
+    assert seen["tag_fetches"] == 1
+
+
+def test_latest_autograde_run_id_every_push_none_when_no_run_graded(monkeypatch):
+    # Only an acceptance run (the every-push shape of a never-pushed student):
+    # nothing to replay, so the caller decides via the commit walk.
+    runs = [{"id": 1, "head_branch": "main", "head_sha": "accept"}]
+    fake_get, _ = _runs_and_tags_get(runs, [])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") is None
+
+
+def test_latest_autograde_run_id_every_push_prefers_tag_run_without_tag_lookup(monkeypatch):
+    # A submit/* tag run is graded by construction: no tag-map fetch needed.
+    runs = [{"id": 9, "head_branch": "submit/2026-01-01T00-00-00Z-abcdefg", "head_sha": "x"}]
+    fake_get, seen = _runs_and_tags_get(runs, [])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") == 9
+    assert seen["tag_fetches"] == 0
+
+
+def test_latest_autograde_run_id_every_push_tolerates_missing_head_sha(monkeypatch):
+    runs = [
+        {"id": 1, "head_branch": "main"},
+        {"id": 2, "head_branch": "main", "head_sha": None},
+        {"id": 3, "head_branch": "main", "head_sha": "graded"},
+    ]
+    fake_get, _ = _runs_and_tags_get(runs, [("submit/2026-01-01T00-00-00Z-graded0", "graded")])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") == 3
+
+
+def test_latest_autograde_run_id_tag_only_never_consults_tag_map(monkeypatch):
+    # Tag mode: a branch run is a suppressed no-op even when its commit was
+    # later tagged (the tag run is the candidate), so the map is never fetched.
+    runs = [{"id": 1, "head_branch": "main", "head_sha": "tagged-later"}]
+    fake_get, seen = _runs_and_tags_get(runs, [("submit/2026-01-01T00-00-00Z-tagged0", "tagged-later")])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok", tag_only=True) is None
+    assert seen["tag_fetches"] == 0
 
 
 def test_regrade_repo_tag_mode_reruns_latest_tag_run(monkeypatch):
     calls = {}
 
-    def fake_latest(api_url, org, repo, token, *, tag_only=False, submission_tags=None):
+    def fake_latest(api_url, org, repo, token, *, tag_only=False, submission_tags=None, lookups=None):
         assert tag_only is True
         return 4242
 
     def fake_rerun(api_url, org, repo, token, run_id):
         calls["run_id"] = run_id
 
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", fake_latest)
     monkeypatch.setattr(rr, "rerun_workflow_run", fake_rerun)
     monkeypatch.setattr(
-        rr, "main_head_sha", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+        rr, "first_gradeable_commit", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
     assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", True) == "rerun"
     assert calls["run_id"] == 4242
@@ -1053,15 +1286,16 @@ def test_regrade_repo_tag_mode_reruns_latest_tag_run(monkeypatch):
 
 def test_regrade_repo_tag_mode_suppressed_only_falls_to_tag_fallback(monkeypatch):
     # A repo whose runs are ALL suppressed branch pushes must not replay one
-    # (it would re-suppress and grade nothing) — the tag-at-HEAD fallback
-    # fires a REAL tag run instead.
+    # (it would re-suppress and grade nothing); the tag fallback fires a REAL
+    # tag run at the student's latest commit instead.
     calls = {}
 
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
     monkeypatch.setattr(
         rr, "rerun_workflow_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
-    monkeypatch.setattr(rr, "main_head_sha", lambda *a, **k: "deadbeefcafe")
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("deadbeefcafe", "main"))
     monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
 
     def fake_create(api_url, org, repo, token, tag, sha):
@@ -1073,14 +1307,395 @@ def test_regrade_repo_tag_mode_suppressed_only_falls_to_tag_fallback(monkeypatch
 
 
 def test_regrade_repo_every_push_uses_default_lookup(monkeypatch):
-    # Every-push must keep today's selection exactly: tag_only stays False.
-    def fake_latest(api_url, org, repo, token, *, tag_only=False, submission_tags=None):
+    # Every-push passes tag_only=False so graded branch runs stay candidates.
+    def fake_latest(api_url, org, repo, token, *, tag_only=False, submission_tags=None, lookups=None):
         assert tag_only is False
         return 7
 
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
     monkeypatch.setattr(rr, "latest_autograde_run_id", fake_latest)
     monkeypatch.setattr(rr, "rerun_workflow_run", lambda *a, **k: None)
     assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "rerun"
+
+
+def test_regrade_repo_after_trigger_retrofit_tags_student_commit(monkeypatch):
+    # Issue 956 end to end (HTTP stubbed): tag mode -> every-push with the bulk
+    # trigger update. The student pushed in tag mode (no run fired), then the
+    # retrofit landed a [skip ci] commit at HEAD. Regrade must tag the
+    # student's commit, not HEAD (where a tag fires nothing), and not report
+    # "missing".
+    created = {}
+
+    def fake_get(url, token, *, accept, _retries=3):
+        if "/actions/workflows/" in url:
+            return json.dumps({"workflow_runs": []}).encode("utf-8")
+        if url.endswith("/repos/cs50/cs50-hello-alice"):
+            return json.dumps({"default_branch": "main"}).encode("utf-8")
+        if "/commits?" in url:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            if query.get("path") == [rr.ACCEPT_MARKER_PATH]:
+                rows = [("accept", "[Classroom 50] Initialize .classroom50.yaml and autograde workflow (gh student accept)")]
+            else:
+                rows = [
+                    ("retrofit", "[Classroom 50] Update autograder trigger to every-push (submission-mode)\n\n[skip ci]"),
+                    ("work", "Finish pset"),
+                    ("accept", "[Classroom 50] Initialize .classroom50.yaml and autograde workflow (gh student accept)"),
+                ]
+            return json.dumps([{"sha": s, "commit": {"message": m}} for s, m in rows]).encode("utf-8")
+        assert "/git/matching-refs/tags/" in url, url
+        return b"[]"
+
+    def fake_request(method, url, token, *, body=None, accept, _retries=3):
+        created["method"] = method
+        created["payload"] = json.loads(body.decode("utf-8"))
+        return b"{}"
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "_http_request", fake_request)
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "tagged"
+    assert created["method"] == "POST"
+    assert created["payload"]["sha"] == "work"
+    assert created["payload"]["ref"].startswith("refs/tags/submit/")
+    assert created["payload"]["ref"].endswith("-work")
+
+
+def test_regrade_repo_names_workflows_permission_when_tag_is_refused(monkeypatch):
+    # Tagging a pre-retrofit commit trips GitHub's workflow-file protection
+    # (its shim differs from the default branch's) and the service token
+    # lacks Workflows: write. That must surface as a named per-repo failure,
+    # not the generic "re-scope Contents/Actions" abort.
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
+    monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "repo_default_branch", lambda *a, **k: "main")
+
+    def fake_get(url, token, *, accept, _retries=3):
+        assert "/contents/.github/workflows/autograde.yaml?ref=" in url, url
+        blob = "old-shim" if url.endswith("ref=work") else "new-shim"
+        return json.dumps({"sha": blob}).encode("utf-8")
+
+    def refuse(*a, **k):
+        raise _http_error(403, body={"message": "Resource not accessible by personal access token"})
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "create_tag_ref", refuse)
+    with pytest.raises(rr._RepoFailed) as ei:
+        rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False)
+    assert "Workflows: Read and write" in str(ei.value)
+    assert "cs50/cs50-hello-alice" in str(ei.value)
+
+
+def test_regrade_repo_403_with_same_shim_propagates(monkeypatch):
+    # Same 403 but the shim matches the default branch: not the workflow-file
+    # rule, so the caller's generic classification applies.
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
+    monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "repo_default_branch", lambda *a, **k: "main")
+    monkeypatch.setattr(
+        rr, "_http_get", lambda *a, **k: json.dumps({"sha": "same"}).encode("utf-8")
+    )
+
+    def refuse(*a, **k):
+        raise _http_error(403)
+
+    monkeypatch.setattr(rr, "create_tag_ref", refuse)
+    with pytest.raises(urllib.error.HTTPError):
+        rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False)
+
+
+def test_regrade_repo_reruns_suppressed_branch_run_at_latest_commit(monkeypatch):
+    # Mixed history: a stale every-push shim fired a branch run that the runner
+    # suppressed while the assignment was in tag mode. Now in every-push, that
+    # run at the student's latest commit is re-run (it grades this time) rather
+    # than tagging, which would trip GitHub's workflow-file rule.
+    runs = [
+        {"id": 11, "head_branch": "main", "head_sha": "work", "status": "completed", "conclusion": "success"},
+        {"id": 10, "head_branch": "main", "head_sha": "accept", "status": "completed", "conclusion": "success"},
+    ]
+    calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: runs)
+    monkeypatch.setattr(rr, "submit_tags_by_commit", lambda *a, **k: {})
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "rerun_workflow_run", lambda *a, run_id=None, **k: calls.setdefault("run_id", a[-1]))
+    monkeypatch.setattr(
+        rr, "create_tag_ref", lambda *a, **k: (_ for _ in ()).throw(AssertionError("tagged instead of re-running"))
+    )
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "rerun"
+    assert calls["run_id"] == 11
+
+
+def test_regrade_repo_tag_mode_never_reruns_branch_run_at_latest_commit(monkeypatch):
+    # In tag mode a branch run re-suppresses, so the same shape must tag.
+    runs = [{"id": 11, "head_branch": "main", "head_sha": "work"}]
+    calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: runs)
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rr, "rerun_workflow_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-ran a suppressed run"))
+    )
+    monkeypatch.setattr(rr, "create_tag_ref", lambda api, org, repo, tok, tag, sha: calls.setdefault("sha", sha))
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", True) == "tagged"
+    assert calls["sha"] == "work"
+
+
+def test_latest_autograde_run_id_every_push_replays_red_run(monkeypatch):
+    # A run that failed before minting its tag (Pages outage, tag push
+    # rejected) has no submit/* tag but did try to grade; every skip path ends
+    # green, so red means "replay me", ahead of an older graded run.
+    runs = [
+        {"id": 2, "head_branch": "main", "head_sha": "newest", "status": "completed", "conclusion": "failure"},
+        {"id": 1, "head_branch": "main", "head_sha": "older", "status": "completed", "conclusion": "success"},
+    ]
+    fake_get, seen = _runs_and_tags_get(runs, [("submit/2026-01-01T00-00-00Z-older00", "older")])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "repo_default_branch", lambda *a, **k: "main")
+    monkeypatch.setattr(rr, "acceptance_commit_sha", lambda *a, **k: "accept")
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") == 2
+    assert seen["tag_fetches"] == 0
+    # In-progress or skipped runs are not "red".
+    runs = [
+        {"id": 3, "head_branch": "main", "head_sha": "x", "status": "in_progress", "conclusion": None},
+        {"id": 2, "head_branch": "main", "head_sha": "y", "status": "completed", "conclusion": "skipped"},
+    ]
+    fake_get, _ = _runs_and_tags_get(runs, [])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") is None
+
+
+def test_latest_autograde_run_id_red_run_at_accept_or_skip_ci_commit_is_not_a_candidate(monkeypatch):
+    # The runner's skip detection fails open on a Pages outage, so a red run at
+    # the acceptance commit or at a [skip ci] retrofit is a real shape; its
+    # rerun skips again, so it must not be replayed. The acceptance lookup is
+    # made once, and only because a red branch run was seen.
+    calls = {"accept": 0}
+
+    def fake_accept(*a, **k):
+        calls["accept"] += 1
+        return "accept"
+
+    runs = [
+        {"id": 3, "head_branch": "main", "head_sha": "retrofit", "status": "completed", "conclusion": "failure",
+         "head_commit": {"message": "[Classroom 50] Update autograder trigger\n\n[skip ci]"}},
+        {"id": 2, "head_branch": "main", "head_sha": "accept", "status": "completed", "conclusion": "failure",
+         "head_commit": {"message": "[Classroom 50] Initialize .classroom50.yaml"}},
+        {"id": 1, "head_branch": "main", "head_sha": "work", "status": "completed", "conclusion": "success"},
+    ]
+    fake_get, _ = _runs_and_tags_get(runs, [])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "repo_default_branch", lambda *a, **k: "main")
+    monkeypatch.setattr(rr, "acceptance_commit_sha", fake_accept)
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok") is None
+    assert calls["accept"] == 1
+
+
+def test_latest_autograde_run_id_tag_only_ignores_red_branch_run(monkeypatch):
+    # In tag mode a branch run is a suppressed no-op whatever its conclusion.
+    runs = [{"id": 1, "head_branch": "main", "head_sha": "x", "status": "completed", "conclusion": "failure"}]
+    fake_get, seen = _runs_and_tags_get(runs, [])
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(
+        rr, "acceptance_commit_sha", lambda *a, **k: (_ for _ in ()).throw(AssertionError("looked up accept"))
+    )
+    assert rr.latest_autograde_run_id("https://api", "cs50", "repo", "tok", tag_only=True) is None
+    assert seen["tag_fetches"] == 0
+
+
+def test_branch_run_at_matches_default_branch_only():
+    runs = [
+        {"id": 5, "head_branch": "submit/2026-01-01T00-00-00Z-work000", "head_sha": "work"},
+        {"id": 4, "head_branch": "feedback", "head_sha": "work"},
+        {"id": 3, "head_branch": "v1", "head_sha": "work"},
+        "garbage",
+        {"id": 2, "head_branch": "main", "head_sha": "work"},
+        {"id": 1, "head_branch": "main", "head_sha": "work"},
+    ]
+    assert rr._branch_run_at(runs, "work", "main") == runs[4]
+    assert rr._branch_run_at(runs, "other", "main") is None
+
+
+def test_regrade_repo_suppressed_rerun_refused_falls_back_to_tagging(monkeypatch):
+    # The suppressed run completed but is past GitHub's rerun window (403 ->
+    # _SkipRepo): don't leave the repo ungraded, continue to the tag path.
+    runs = [{"id": 11, "head_branch": "main", "head_sha": "work", "status": "completed"}]
+    calls = {}
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: runs)
+    monkeypatch.setattr(rr, "submit_tags_by_commit", lambda *a, **k: {})
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "rerun_workflow_run", lambda *a, **k: (_ for _ in ()).throw(rr._SkipRepo()))
+    monkeypatch.setattr(rr, "create_tag_ref", lambda api, org, repo, tok, tag, sha: calls.setdefault("sha", sha))
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "tagged"
+    assert calls["sha"] == "work"
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress", "waiting", None])
+def test_regrade_repo_in_flight_run_at_latest_commit_is_skipped(monkeypatch, capsys, status):
+    # The student's push is still grading (the runner has not minted its tag
+    # yet, so the run isn't judged graded). Tagging now would grade the commit
+    # twice; the live run covers it, so the repo is skipped with a reason.
+    run = {"id": 11, "head_branch": "main", "head_sha": "work"}
+    if status is not None:
+        run["status"] = status
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [run])
+    monkeypatch.setattr(rr, "submit_tags_by_commit", lambda *a, **k: {})
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(
+        rr, "rerun_workflow_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("rerun"))
+    )
+    monkeypatch.setattr(
+        rr, "create_tag_ref", lambda *a, **k: (_ for _ in ()).throw(AssertionError("tagged"))
+    )
+    with pytest.raises(rr._SkipRepo):
+        rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False)
+    assert "already in progress and will grade it; skipping" in capsys.readouterr().err
+
+
+def test_regrade_repo_fetches_each_lookup_once(monkeypatch):
+    # The run page, submit-tag map, repo metadata and acceptance commit are
+    # each read once per repo across latest_autograde_run_id, the commit walk
+    # and the existing-tag check.
+    counts = {"runs": 0, "tags": 0, "repo": 0, "accept": 0}
+    runs = [
+        {"id": 3, "head_branch": "main", "head_sha": "accept", "status": "completed",
+         "conclusion": "failure", "head_commit": {"message": "accept"}},
+    ]
+
+    def fake_get(url, token, *, accept, _retries=3):
+        if "/actions/workflows/" in url:
+            counts["runs"] += 1
+            return json.dumps({"workflow_runs": runs}).encode("utf-8")
+        if url.endswith("/repos/cs50/cs50-hello-alice"):
+            counts["repo"] += 1
+            return json.dumps({"default_branch": "main"}).encode("utf-8")
+        if "/commits?" in url:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            if query.get("path") == [rr.ACCEPT_MARKER_PATH]:
+                counts["accept"] += 1
+                rows = [("accept", "accept")]
+            else:
+                rows = [("work", "solve"), ("accept", "accept")]
+            return json.dumps([{"sha": s, "commit": {"message": m}} for s, m in rows]).encode("utf-8")
+        assert "/git/matching-refs/tags/" in url, url
+        counts["tags"] += 1
+        return b"[]"
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "create_tag_ref", lambda *a, **k: None)
+    assert rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False) == "tagged"
+    assert counts == {"runs": 1, "tags": 1, "repo": 1, "accept": 1}
+
+
+def test_regrade_repo_throttled_403_on_tag_is_not_a_permission_failure(monkeypatch):
+    # A rate-limited 403 from the tag push must reach main()'s throttle
+    # handling untouched, never be mistaken for the Workflows-permission
+    # refusal (which would read the shim twice and blame the token).
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
+    monkeypatch.setattr(rr, "latest_autograde_run_id", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rr,
+        "shim_differs_from_default_branch",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("shim read on a throttle")),
+    )
+    throttled = github_http_error(403, {"Retry-After": "60"}, b"secondary rate limit")
+    monkeypatch.setattr(
+        rr, "create_tag_ref", lambda *a, **k: (_ for _ in ()).throw(throttled)
+    )
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False)
+    assert rr.classify(ei.value) is rr.THROTTLED
+
+
+def test_shim_differs_propagates_a_throttle(monkeypatch):
+    # A read failure falls back to False (generic 403 handling), except a
+    # throttle, which must reach main() so the teacher is told not to rotate.
+    throttled = github_http_error(403, {"Retry-After": "60"}, b"secondary rate limit")
+
+    def fake_get(url, token, *, accept, _retries=3):
+        raise throttled
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    with pytest.raises(urllib.error.HTTPError):
+        rr.shim_differs_from_default_branch("https://api", "cs50", "repo", "tok", "work", "main")
+
+
+def test_list_autograde_runs_404_is_empty(monkeypatch):
+    def fake_get(url, token, *, accept, _retries=3):
+        raise _http_error(404)
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.list_autograde_runs("https://api", "cs50", "repo", "tok") == []
+
+
+def test_git_data_reads_treat_empty_repo_409_as_nothing(monkeypatch):
+    # An accepted repo whose git database is still empty answers 409, not 404.
+    def fake_get(url, token, *, accept, _retries=3):
+        raise _http_error(409)
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    assert rr.list_branch_commits("https://api", "cs50", "repo", "tok", "main") == []
+    assert rr.submit_tags_by_commit("https://api", "cs50", "repo", "tok") == {}
+
+
+def test_submit_tags_by_commit_first_tag_wins(monkeypatch):
+    body = json.dumps([
+        {"ref": "refs/tags/submit/2026-01-01T00-00-00Z-aaaaaaa", "object": {"sha": "c1", "type": "commit"}},
+        {"ref": "refs/tags/submit/2026-01-02T00-00-00Z-aaaaaaa", "object": {"sha": "c1", "type": "commit"}},
+        {"ref": "refs/tags/v1", "object": {"sha": "c2", "type": "commit"}},
+    ]).encode("utf-8")
+    monkeypatch.setattr(rr, "_http_get", lambda *a, **k: body)
+    assert rr.submit_tags_by_commit("https://api", "cs50", "repo", "tok") == {
+        "c1": "submit/2026-01-01T00-00-00Z-aaaaaaa",
+    }
+
+
+def test_shim_differs_read_failure_propagates_generic_403(monkeypatch):
+    # The shim at the commit can't be read: don't claim the Workflows rule.
+    monkeypatch.setattr(rr, "list_autograde_runs", lambda *a, **k: [])
+    monkeypatch.setattr(rr, "first_gradeable_commit", lambda *a, **k: ("work", "main"))
+    monkeypatch.setattr(rr, "existing_submit_tag_at", lambda *a, **k: None)
+    monkeypatch.setattr(rr, "repo_default_branch", lambda *a, **k: "main")
+
+    def fake_get(url, token, *, accept, _retries=3):
+        raise _http_error(404)
+
+    def refuse(*a, **k):
+        raise _http_error(403)
+
+    monkeypatch.setattr(rr, "_http_get", fake_get)
+    monkeypatch.setattr(rr, "create_tag_ref", refuse)
+    with pytest.raises(urllib.error.HTTPError):
+        rr.regrade_repo("https://api", "cs50", "cs50-hello-alice", "tok", False)
+
+
+def test_main_prints_missing_repos(monkeypatch, capsys):
+    _set_main_env(monkeypatch)
+    monkeypatch.setattr(rr, "load_roster", lambda *a, **k: (["alice"], {"slug": "hello"}))
+    monkeypatch.setattr(rr, "regrade_repo", lambda *a, **k: "missing")
+    assert rr.main() == 0
+    out = capsys.readouterr().out
+    assert "cs50org/cs50-hello-alice: no submission to grade" in out
+    assert "skipped 1" in out
+
+
+def test_main_repo_failed_counts_as_failed_and_exits_1(monkeypatch, capsys):
+    _set_main_env(monkeypatch)
+    monkeypatch.setattr(rr, "load_roster", lambda *a, **k: (["alice", "bob"], {"slug": "hello"}))
+
+    def fake_regrade(api_url, org, repo, token, tag_mode, submission_tags=None):
+        if "alice" in repo:
+            raise rr._RepoFailed(f"cs50/{repo}: needs Workflows: Read and write")
+        return "rerun"
+
+    monkeypatch.setattr(rr, "regrade_repo", fake_regrade)
+    assert rr.main() == 1
+    err = capsys.readouterr().err
+    assert "needs Workflows: Read and write" in err
+    assert "1 repo(s) could not be regraded" in err
 
 
 def test_main_threads_tag_mode_from_manifest(monkeypatch, capsys):
