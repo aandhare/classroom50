@@ -16,7 +16,8 @@ import (
 
 // classroomServer fakes a config repo with the given classroom.json bodies
 // (short-name -> JSON; a nil body means the dir exists without the file) and
-// the org's team listing (slug -> id/privacy).
+// the listing of teams that hold a grant on it (slug -> id/privacy). A team
+// with no grant is simply not in that listing, whatever slug it sits at.
 func classroomServer(t *testing.T, classrooms map[string]*string, teams map[string]struct {
 	id      int64
 	privacy string
@@ -38,6 +39,24 @@ func classroomServer(t *testing.T, classrooms map[string]*string, teams map[stri
 				return
 			}
 			_, _ = w.Write([]byte(`{"default_branch":"main"}`))
+		case path == "/repos/"+org+"/classroom50/teams" && r.Method == http.MethodGet:
+			if repoMissing {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+				return
+			}
+			if teams == nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"boom"}`))
+				return
+			}
+			list := make([]map[string]any, 0, len(teams))
+			if r.URL.Query().Get("page") == "1" {
+				for slug, tm := range teams {
+					list = append(list, map[string]any{"id": tm.id, "slug": slug, "privacy": tm.privacy, "permission": "pull"})
+				}
+			}
+			_ = json.NewEncoder(w).Encode(list)
 		case path == "/repos/"+org+"/classroom50/contents" && r.Method == http.MethodGet:
 			var sb strings.Builder
 			sb.WriteByte('[')
@@ -68,18 +87,8 @@ func classroomServer(t *testing.T, classrooms map[string]*string, teams map[stri
 				"content": base64.StdEncoding.EncodeToString([]byte(*b)), "encoding": "base64",
 			})
 		case path == "/orgs/"+org+"/teams" && r.Method == http.MethodGet:
-			if teams == nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"message":"boom"}`))
-				return
-			}
-			list := make([]map[string]any, 0, len(teams))
-			if r.URL.Query().Get("page") == "1" {
-				for slug, tm := range teams {
-					list = append(list, map[string]any{"id": tm.id, "slug": slug, "privacy": tm.privacy})
-				}
-			}
-			_ = json.NewEncoder(w).Encode(list)
+			t.Errorf("the org-wide team listing must not be read: it cannot tell a staff team from a squatter at its slug")
+			w.WriteHeader(http.StatusInternalServerError)
 		case strings.HasPrefix(path, "/orgs/"+org+"/teams/") && r.Method == http.MethodPatch:
 			slug := strings.TrimPrefix(path, "/orgs/"+org+"/teams/")
 			if slug == "classroom50-stuck-teacher" {
@@ -135,6 +144,25 @@ func TestCollectStaffTeamSlugs(t *testing.T) {
 		want := []string{"classroom50-cs-teacher", "classroom50-cs-hta", "classroom50-cs-ta"}
 		if strings.Join(slugs, ",") != strings.Join(want, ",") {
 			t.Errorf("slugs = %v, want %v", slugs, want)
+		}
+	})
+
+	t.Run("a sibling classroom's student slug is not a staff slug", func(t *testing.T) {
+		// `classroom50-ml-ta` is `ml-ta`'s student team, so `ml` has no TA slug;
+		// `ml-ta`'s own staff slugs are unaffected.
+		server, _ := classroomServer(t, map[string]*string{"ml": str(csClassroom), "ml-ta": str(csClassroom)}, nil, false)
+		slugs, err := CollectStaffTeamSlugs(githubtest.NewTestClient(t, server), org)
+		if err != nil {
+			t.Fatalf("CollectStaffTeamSlugs: %v", err)
+		}
+		got := strings.Join(slugs, ",")
+		if strings.Contains(got, "classroom50-ml-ta,") || strings.HasSuffix(got, "classroom50-ml-ta") {
+			t.Errorf("slugs = %v, must not include ml-ta's student team as ml's TA team", slugs)
+		}
+		for _, want := range []string{"classroom50-ml-teacher", "classroom50-ml-hta", "classroom50-ml-ta-teacher", "classroom50-ml-ta-hta", "classroom50-ml-ta-ta"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("slugs = %v, missing %s", slugs, want)
+			}
 		}
 	})
 
@@ -200,7 +228,33 @@ func TestPrepareStaffTeams(t *testing.T) {
 	t.Run("a listing failure is an error, not an empty list", func(t *testing.T) {
 		server, _ := classroomServer(t, nil, nil, false)
 		if _, err := PrepareStaffTeams(githubtest.NewTestClient(t, server), &out, &errOut, org, []string{"classroom50-cs-teacher"}); err == nil {
-			t.Error("expected an error when the org team listing fails")
+			t.Error("expected an error when the config-repo team listing fails")
+		}
+	})
+
+	t.Run("a team at a staff slug without the config-repo grant is not staff", func(t *testing.T) {
+		// A sibling's student team and a squatted team hold no config-repo
+		// grant, so neither is listed: no PATCH, no id.
+		server, patched := classroomServer(t, nil, map[string]struct {
+			id      int64
+			privacy string
+		}{"classroom50-cs-teacher": {11, "closed"}}, false)
+		ids, err := PrepareStaffTeams(githubtest.NewTestClient(t, server), &out, &errOut, org, []string{
+			"classroom50-cs-teacher", "classroom50-cs-hta", "classroom50-cs-ta",
+		})
+		if err != nil {
+			t.Fatalf("PrepareStaffTeams: %v", err)
+		}
+		if !equalInt64s(ids, []int64{11}) || len(patched()) != 0 {
+			t.Errorf("ids = %v patched = %v, want only the granted teacher team and no PATCH", ids, patched())
+		}
+	})
+
+	t.Run("no config repo yields no teams", func(t *testing.T) {
+		server, _ := classroomServer(t, nil, nil, true)
+		ids, err := PrepareStaffTeams(githubtest.NewTestClient(t, server), &out, &errOut, org, []string{"classroom50-cs-teacher"})
+		if err != nil || len(ids) != 0 {
+			t.Errorf("ids=%v err=%v, want none/nil", ids, err)
 		}
 	})
 }

@@ -10,10 +10,12 @@ import { paginateAll } from "./paginate"
 import type { CheckVerdict } from "./orgChecks"
 import { readFailedDetail } from "./orgChecks"
 import { ClassroomConfigError, forEachClassroom } from "./configRepoReads"
+import { liveTeamId } from "./queries/teamReads"
 import { STAFF_TEAM_PRIVACY, type GitHubTeam } from "./types"
 import { GitHubAPIError } from "./errors"
 import type { LocalizedMessage } from "@/types/localizedMessage"
 import { FEEDBACK_BASE_BRANCH } from "@/util/feedbackPr"
+import { CONFIG_REPO } from "@/util/configRepo"
 import { classroomTeamSlug } from "@/util/teamSlug"
 import { STAFF_ROLES } from "@/types/classroom"
 import { mapWithConcurrency } from "@/util/concurrency"
@@ -486,7 +488,8 @@ export async function exemptStaffTeams(
 
 // Best-effort: drop staff teams about to be deleted from the feedback-base
 // bypass list, so the ruleset never references an actor GitHub no longer
-// knows. Run before the team delete.
+// knows. Run before the team delete. Takes ids the caller just minted (the
+// create rollback); a delete flow uses revokeClassroomStaffTeams instead.
 export async function revokeStaffTeams(
   client: GitHubClient,
   org: string,
@@ -504,19 +507,45 @@ export async function revokeStaffTeams(
   }
 }
 
-// The canonical staff team slugs (teacher, hta, ta) of every classroom in the
-// config repo. The slug, not classroom.json, identifies a classroom's staff
-// team: it is what every writer creates, what a role flow that never recorded
-// a `teams` block still produced, and what a head-TA-editable ref can't
-// redirect. A missing config repo (fresh org) yields []. Any other failure,
-// including one unreadable classroom.json, throws: a shorter list would
-// rebuild a shorter bypass list, so callers fall back to what is already on
-// the ruleset instead.
+// Best-effort: drop the classrooms' staff teams from the feedback-base bypass
+// list. Resolves each canonical slug to the live team rather than trusting the
+// head-TA-writable `teams` block, so an unrecorded team is dropped too. Run
+// before the team deletes.
+export async function revokeClassroomStaffTeams(
+  client: GitHubClient,
+  org: string,
+  classrooms: readonly string[],
+): Promise<void> {
+  const slugs = classrooms.flatMap((classroom) =>
+    STAFF_ROLES.map((role) => classroomTeamSlug(classroom, role)),
+  )
+  const ids: number[] = []
+  await mapWithConcurrency(slugs, 4, async (slug) => {
+    try {
+      const id = await liveTeamId(client, org, slug)
+      if (id !== null) ids.push(id)
+    } catch (err) {
+      log.warn("could not look up a staff team to drop it from the lock", {
+        org,
+        slug,
+        err,
+      })
+    }
+  })
+  await revokeStaffTeams(client, org, ids)
+}
+
+// The canonical staff team slugs of every classroom in the config repo. The
+// slug is the identity: it is what every writer creates and what a
+// head-TA-editable `teams` block can't redirect. A slug that is a sibling
+// classroom's student team (`ml`'s TA slug when `ml-ta` exists) is left out. A
+// missing config repo yields []; any other failure throws, so callers keep the
+// current bypass list rather than rebuilding a shorter one.
 export async function collectStaffTeamSlugs(
   client: GitHubClient,
   org: string,
 ): Promise<string[]> {
-  const slugs: string[] = []
+  const classrooms: string[] = []
   await forEachClassroom(
     client,
     org,
@@ -524,32 +553,43 @@ export async function collectStaffTeamSlugs(
       throw err
     },
     (classroom) => {
-      for (const role of STAFF_ROLES)
-        slugs.push(classroomTeamSlug(classroom, role))
+      classrooms.push(classroom)
     },
   )
-  return slugs
+  const known = new Set(classrooms)
+  return classrooms.flatMap((classroom) =>
+    STAFF_ROLES.filter((role) => !known.has(`${classroom}-${role}`)).map(
+      (role) => classroomTeamSlug(classroom, role),
+    ),
+  )
 }
 
 type OrgTeamListing = Pick<GitHubTeam, "id" | "slug" | "privacy">
 
-// One paginated read of the org's teams, keyed by slug. Strict, unlike
-// queries/teamReads.listOrgTeams: a failure here must not read as "no teams".
-// The caller runs as an owner, so secret teams are listed too.
-async function listOrgTeamsBySlug(
+// The teams with a grant on the config repo, keyed by slug: the teams Classroom
+// 50 owns (see AdoptGuard). Strict on purpose, unlike listRepoTeams, which
+// swallows failures: a failure here must not rebuild the bypass list empty. A
+// missing config repo (fresh org) is the one 404 that means "no teams".
+async function listConfigRepoTeamsBySlug(
   client: GitHubClient,
   org: string,
 ): Promise<Map<string, OrgTeamListing>> {
-  const teams = await paginateAll<OrgTeamListing>(
-    client,
-    (page) =>
-      `/orgs/${encodeURIComponent(org)}/teams?per_page=100&page=${page}`,
-  )
+  let teams: OrgTeamListing[]
+  try {
+    teams = await paginateAll<OrgTeamListing>(
+      client,
+      (page) =>
+        `/repos/${encodeURIComponent(org)}/${CONFIG_REPO}/teams?per_page=100&page=${page}`,
+    )
+  } catch (err) {
+    if (err instanceof GitHubAPIError && err.isNotFound) return new Map()
+    throw err
+  }
   return new Map(teams.map((t) => [t.slug, t]))
 }
 
-// The live staff teams behind the slugs; a slug with no team (a role never
-// staffed) is simply absent.
+// The live staff teams behind the slugs; a slug with no granted team (a role
+// never staffed, or a team that isn't ours) is simply absent.
 function resolveStaffTeams(
   slugs: readonly string[],
   teams: ReadonlyMap<string, OrgTeamListing>,
@@ -573,7 +613,10 @@ export async function prepareStaffTeams(
   org: string,
   slugs: readonly string[],
 ): Promise<number[]> {
-  const teams = resolveStaffTeams(slugs, await listOrgTeamsBySlug(client, org))
+  const teams = resolveStaffTeams(
+    slugs,
+    await listConfigRepoTeamsBySlug(client, org),
+  )
   const ids: number[] = []
   await mapWithConcurrency(teams, 4, async (team) => {
     if (team.privacy !== STAFF_TEAM_PRIVACY) {
@@ -633,7 +676,7 @@ async function expectedStaffTeamIds(
   try {
     const [slugs, teams] = await Promise.all([
       collectStaffTeamSlugs(client, org),
-      listOrgTeamsBySlug(client, org),
+      listConfigRepoTeamsBySlug(client, org),
     ])
     return { ids: resolveStaffTeams(slugs, teams).map((t) => t.id) }
   } catch (err) {

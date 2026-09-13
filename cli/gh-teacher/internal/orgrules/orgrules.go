@@ -317,11 +317,25 @@ func ExemptStaffTeams(client githubapi.Client, errOut io.Writer, org string, tea
 	}
 }
 
-// RevokeStaffTeams drops staff teams about to be deleted from the
-// feedback-base bypass list, best-effort. Run before the team delete so the
-// PUT never references an actor GitHub no longer knows.
-func RevokeStaffTeams(client githubapi.Client, errOut io.Writer, org string, teams []configrepo.TeamRef) {
-	ids := teamIDs(teams)
+// RevokeClassroomStaffTeams drops the classrooms' staff teams from the
+// feedback-base bypass list, best-effort. It resolves each canonical slug to the
+// live team rather than trusting the head-TA-writable `teams` block, so an
+// unrecorded team is dropped too. Run before the team delete so the PUT never
+// references an actor GitHub no longer knows.
+func RevokeClassroomStaffTeams(client githubapi.Client, errOut io.Writer, org string, shortNames ...string) {
+	var ids []int64
+	for _, shortName := range shortNames {
+		for _, slug := range configrepo.StaffTeamSlugs(shortName) {
+			id, err := configrepo.LiveTeamID(client, org, slug)
+			if err != nil {
+				_, _ = fmt.Fprintf(errOut, "Warning: %s: could not look up staff team %q to drop it from the feedback-base ruleset bypass list (%v); re-run `gh teacher init %s` to rebuild it.\n", org, slug, err, org)
+				continue
+			}
+			if id > 0 {
+				ids = append(ids, id)
+			}
+		}
+	}
 	if len(ids) == 0 {
 		return
 	}
@@ -401,15 +415,14 @@ func bypassTeamIDs(client githubapi.Client, out, errOut io.Writer, org string) (
 	return PrepareStaffTeams(client, out, errOut, org, slugs)
 }
 
-// CollectStaffTeamSlugs lists every classroom in the org's config repo and
-// returns the canonical staff team slugs (teacher, head-TA, TA) each one owns.
-// The slug is the identity: it is what every writer creates, what a web role
-// flow that never wrote classroom.json still produced, and what a
-// head-TA-editable `teams` block cannot redirect. A missing config repo (fresh
-// org) yields none; any read failure propagates so the caller keeps the list
-// already on the ruleset rather than rebuilding a shorter one.
+// CollectStaffTeamSlugs returns the canonical staff team slugs of every
+// classroom in the config repo. The slug is the identity: it is what every
+// writer creates and what a head-TA-editable `teams` block cannot redirect. A
+// slug that is a sibling classroom's student team (`ml`'s TA slug when `ml-ta`
+// exists) is left out. A missing config repo yields none; any read failure
+// propagates so the caller keeps the current bypass list.
 func CollectStaffTeamSlugs(client githubapi.Client, org string) ([]string, error) {
-	var slugs []string
+	var shortNames []string
 	var readErr error
 	err := configrepo.WalkClassrooms(client, org,
 		func(shortName string, err error) {
@@ -418,23 +431,35 @@ func CollectStaffTeamSlugs(client githubapi.Client, org string) ([]string, error
 			}
 		},
 		func(shortName string, _ *configrepo.ClassroomJSON) {
-			slugs = append(slugs, configrepo.StaffTeamSlugs(shortName)...)
+			shortNames = append(shortNames, shortName)
 		})
 	if err != nil {
 		return nil, err
 	}
+	classrooms := make(map[string]bool, len(shortNames))
+	for _, s := range shortNames {
+		classrooms[s] = true
+	}
+	var slugs []string
+	for _, s := range shortNames {
+		for _, role := range configrepo.StaffRoles {
+			if classrooms[s+"-"+string(role)] {
+				continue
+			}
+			slugs = append(slugs, configrepo.StaffTeamSlug(s, role))
+		}
+	}
 	return slugs, readErr
 }
 
-// PrepareStaffTeams resolves the canonical slugs to live teams in one org-wide
-// listing, makes each a valid bypass actor (GitHub rejects a `secret` team; the
-// PATCH is the one-time upgrade for teams an older release created), and
-// returns their IDs for Ensure. A slug with no team (a role never staffed) is
-// simply absent. A listing failure propagates so the caller falls back to the
-// current list; a PATCH failure warns and leaves that team out, since a secret
-// team can't be an actor anyway.
+// PrepareStaffTeams resolves the canonical slugs against the config-repo team
+// listing, makes each match a valid bypass actor (GitHub rejects a `secret`
+// team), and returns their IDs for Ensure. A slug with no granted team (a role
+// never staffed, or a team Classroom 50 did not create) is simply absent. A
+// listing failure propagates so the caller keeps the current list; a PATCH
+// failure warns and leaves that team out.
 func PrepareStaffTeams(client githubapi.Client, out, errOut io.Writer, org string, slugs []string) ([]int64, error) {
-	teams, err := configrepo.ListOrgTeams(client, org)
+	teams, err := configrepo.ListConfigRepoTeams(client, org)
 	if err != nil {
 		return nil, err
 	}

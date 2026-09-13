@@ -151,9 +151,10 @@ func staffRemoveCmd() *cobra.Command {
 	return cmd
 }
 
-// runStaffAdd resolves the staff team from classroom.json and adds the
-// canonical-login user. If the `teams` block is missing/partial, it self-heals
-// (create/adopt the team, grant the role's config-repo access, record the ref).
+// runStaffAdd adds the user to the classroom's staff team for `role`, after an
+// idempotent ensure pass (team exists, holds its config-repo access, is exempt
+// from the feedback-base lock, is recorded). Always running the pass is what
+// heals a pre-feature classroom, a hand-edited `teams` block, or a lost grant.
 func runStaffAdd(client githubapi.Client, out, errOut io.Writer, org, classroom, username string, role configrepo.StaffRole) error {
 	branch, err := configrepo.ResolveConfigRepoBranch(client, org)
 	if err != nil {
@@ -164,23 +165,14 @@ func runStaffAdd(client githubapi.Client, out, errOut io.Writer, org, classroom,
 	if err != nil {
 		return err
 	}
-	team, ok, err := configrepo.ResolveClassroomStaffTeam(client, org, classroom, branch, role)
+	if recorded, ok, err := configrepo.ResolveClassroomStaffTeam(client, org, classroom, branch, role); err != nil {
+		return err
+	} else if ok {
+		canonicalOrWarn(errOut, org, classroom, role, recorded, " and re-recording it")
+	}
+	team, err := ensureStaffTeamRecorded(client, out, errOut, org, classroom, branch, role)
 	if err != nil {
 		return err
-	}
-	if ok && !canonicalOrWarn(errOut, org, classroom, role, team, " and re-recording it") {
-		ok = false
-	}
-	if !ok {
-		// Self-heal a missing/partial `teams` block: ensure the team, grant
-		// the role's config-repo access, persist its ref, then proceed. Makes
-		// `staff add` idempotent for pre-feature classrooms rather than
-		// dead-ending at `classroom add` (which can't repair an existing
-		// classroom).
-		team, err = ensureStaffTeamRecorded(client, out, errOut, org, classroom, branch, role)
-		if err != nil {
-			return err
-		}
 	}
 	if err := configrepo.AddTeamMembership(client, org, team.Slug, login); err != nil {
 		return fmt.Errorf("adding %s to the %s team failed: %w", login, role, err)
@@ -210,14 +202,21 @@ func canonicalOrWarn(errOut io.Writer, org, classroom string, role configrepo.St
 // commit. Confirms the classroom exists first (so a typo doesn't mint a stray
 // team); no-op-safe if already recorded.
 func ensureStaffTeamRecorded(client githubapi.Client, out, errOut io.Writer, org, classroom, branch string, role configrepo.StaffRole) (configrepo.TeamRef, error) {
-	if _, ok, err := configrepo.LoadClassroom(client, org, classroom, branch); err != nil {
+	c, ok, err := configrepo.LoadClassroom(client, org, classroom, branch)
+	if err != nil {
 		return configrepo.TeamRef{}, err
 	} else if !ok {
 		return configrepo.TeamRef{}, fmt.Errorf("%s: classroom %s not found in %s: run `gh teacher classroom add %s %s` first",
 			org, classroom, configrepo.ConfigRepoName, org, classroom)
 	}
-	team, err := configrepo.EnsureClassroomStaffTeam(client, org, classroom, role)
+	// The recorded id lets a team whose grant was lost be re-adopted.
+	team, err := configrepo.EnsureClassroomStaffTeam(client, org, classroom, role, configrepo.RecordedStaffTeamID(classroom, role, c.Teams))
 	if err != nil {
+		return configrepo.TeamRef{}, err
+	}
+	// Record before granting, so a failed grant leaves a team the re-run can
+	// re-adopt by id rather than one nothing vouches for.
+	if err := recordStaffTeam(client, out, org, classroom, branch, role, team); err != nil {
 		return configrepo.TeamRef{}, err
 	}
 	if _, err := configrepo.GrantTeamConfigRepoAccess(client, org, team.Slug, role); err != nil {
@@ -226,8 +225,12 @@ func ensureStaffTeamRecorded(client githubapi.Client, out, errOut io.Writer, org
 	// A team minted here (rather than at classroom add) still needs the
 	// feedback-base exemption to merge feedback PRs.
 	orgrules.ExemptStaffTeams(client, errOut, org, []configrepo.TeamRef{team})
-	// Persist the ref so future resolves and the delete/teardown sweeps find
-	// it. RMW classroom.json in one commit.
+	return team, nil
+}
+
+// recordStaffTeam persists the ref under classroom.json `teams.<role>` in one
+// RMW commit; no commit when already recorded.
+func recordStaffTeam(client githubapi.Client, out io.Writer, org, classroom, branch string, role configrepo.StaffRole, team configrepo.TeamRef) error {
 	path := configrepo.ClassroomFilePath(classroom)
 	message := contract.PrefixCommit(fmt.Sprintf("Record %s staff team for %s (gh teacher staff add)", role, classroom))
 	build := func(parentSHA string) (map[string]string, error) {
@@ -264,10 +267,10 @@ func ensureStaffTeamRecorded(client githubapi.Client, out, errOut io.Writer, org
 		return map[string]string{path: string(updated)}, nil
 	}
 	if _, err := configwrite.CommitTree(client, org, configrepo.ConfigRepoName, branch, message, build); err != nil {
-		return configrepo.TeamRef{}, err
+		return err
 	}
 	_, _ = fmt.Fprintf(out, "%s: recorded %s staff team %s in classroom.json\n", org, role, team.Slug)
-	return team, nil
+	return nil
 }
 
 // runStaffRemove resolves the staff team and removes the user. Idempotent — a

@@ -3,6 +3,8 @@
 // per-segment — a READ-side tolerance so pre-cap documents keep validating.
 // Write paths layer the composed repo-name budget on top (#691): see
 // repoNameBudget (CLASSROOM_SHORT_NAME_MAX_LEN, composedRepoNameFits).
+import { STAFF_ROLES, type StaffRole } from "@/types/classroom"
+
 export const SHORT_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{1,99}$/
 export const SHORT_NAME_PATTERN_DESCRIPTION =
   "2-100 chars, lowercase letters/digits/hyphens, starting with a letter or digit"
@@ -20,4 +22,12 @@ export function isValidShortName(shortName: string): boolean {
   return (
     SHORT_NAME_PATTERN.test(shortName) && isCanonicalTeamShortName(shortName)
   )
+}
+
+// The staff role suffix a NEW short-name must not end in, or null: `ml-ta`'s
+// student team would sit at `ml`'s TA slug. Creation-time only; an existing
+// classroom with such a name stays operable. Mirrors the CLI's
+// validate.ClassroomShortNameSuffix.
+export function reservedShortNameSuffix(shortName: string): StaffRole | null {
+  return STAFF_ROLES.find((role) => shortName.endsWith(`-${role}`)) ?? null
 }

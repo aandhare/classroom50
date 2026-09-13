@@ -54,6 +54,13 @@ function makeLegacyOrg(opts: { rulesetInstalled: boolean }) {
         }
       }
       if (teamGet && method === "PATCH") return undefined
+      // Every legacy staff team holds its config-repo grant (it is ours).
+      if (
+        /^\/orgs\/acme\/teams\/[^/]+\/repos\/acme\/classroom50$/.test(path) &&
+        method === "GET"
+      ) {
+        return undefined
+      }
       if (path.startsWith("/orgs/acme/rulesets?") && method === "GET") {
         return opts.rulesetInstalled
           ? [{ id: 7, name: RULESET_NAME_FEEDBACK_BASE }]
@@ -76,7 +83,11 @@ function makeLegacyOrg(opts: { rulesetInstalled: boolean }) {
       throw new Error(`unexpected ${method} ${path}`)
     },
   )
-  const client = { request } as unknown as GitHubClient
+  // No classroom `cs101-<role>` exists: the adopt guard's sibling probe 404s.
+  const requestRaw = vi.fn(async (): Promise<string> => {
+    throw apiError(404)
+  })
+  const client = { request, requestRaw } as unknown as GitHubClient
   return { client, calls }
 }
 

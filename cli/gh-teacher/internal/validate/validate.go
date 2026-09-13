@@ -104,6 +104,19 @@ func ClassroomShortNameBudget(shortName string) error {
 	return nil
 }
 
+// ClassroomShortNameSuffix rejects a NEW short-name ending in a staff role
+// suffix: `ml-ta`'s student team would sit at `ml`'s TA slug. Creation-time
+// only; an existing classroom with such a name stays operable.
+func ClassroomShortNameSuffix(shortName string) error {
+	for _, role := range contract.StaffRoles {
+		if strings.HasSuffix(shortName, "-"+string(role)) {
+			return fmt.Errorf("classroom short-name %q ends in -%s, which Classroom 50 reserves for staff team names (classroom50-<short-name>-%s); choose a short-name that does not end in -teacher, -hta, or -ta",
+				shortName, role, role)
+		}
+	}
+	return nil
+}
+
 // ComposedRepoNameBudget rejects a classroom+slug pair whose composed
 // student-repo name can exceed GitHub's limit with a worst-case
 // (contract.GitHubLoginMaxLen) username — the hard write-time gate for every

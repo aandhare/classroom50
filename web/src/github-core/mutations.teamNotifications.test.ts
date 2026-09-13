@@ -44,12 +44,21 @@ function makeClient(adoptGet?: Record<string, unknown>) {
         if (adoptGet) throw apiError(422)
         return { id: 1, slug: "created" }
       }
+      if (/\/teams\/[^/]+\/repos\/o\/classroom50$/.test(path)) {
+        // Staff adopt probes the grant (held); student adopt removes a stale
+        // grant (none to remove).
+        if (method === "GET") return undefined
+        throw apiError(404)
+      }
       if (method === "GET") return adoptGet
       if (method === "PATCH") return undefined
       return undefined
     },
   )
-  const client = { request } as unknown as GitHubClient
+  const requestRaw = vi.fn(async (): Promise<string> => {
+    throw apiError(404) // no sibling classroom `cs101-<role>`
+  })
+  const client = { request, requestRaw } as unknown as GitHubClient
   const posts = () => calls.filter((c) => c.path.endsWith("/teams"))
   const patches = () => calls.filter((c) => c.options?.method === "PATCH")
   return { client, calls, posts, patches }

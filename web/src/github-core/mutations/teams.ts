@@ -6,6 +6,8 @@ import {
   type TeamPrivacy,
 } from "../types"
 import { GitHubAPIError, tolerateGitHubError } from "../errors"
+import { getClassroomJson } from "../configRepoReads"
+import { liveTeamId } from "../queries/teamReads"
 import type { StaffRole } from "@/types/classroom"
 import { STAFF_ROLES } from "@/types/classroom"
 import { createTeam, type TeamNotificationSetting } from "../teamWrites"
@@ -13,6 +15,10 @@ import { exemptStaffTeams } from "../rulesets"
 import { CONFIG_REPO } from "@/util/configRepo"
 import { isCanonicalTeamShortName } from "@/util/shortName"
 import { classroomTeamSlug, type ClassroomTeamRole } from "@/util/teamSlug"
+import {
+  describeLocalizedMessage,
+  type LocalizedMessage,
+} from "@/types/localizedMessage"
 
 // Minimal team identity persisted in classroom.json. The slug is authoritative
 // for team ops (GitHub may slugify a name differently on collision); the id is
@@ -87,6 +93,7 @@ async function ensureTeamByName(
   name: string,
   notify: TeamNotificationSetting,
   privacy: TeamPrivacy,
+  guard: AdoptGuard,
 ): Promise<ClassroomTeamRef & { created: boolean }> {
   try {
     const created = await createTeam(client, {
@@ -98,26 +105,154 @@ async function ensureTeamByName(
     return { id: created.id, slug: created.slug, created: true }
   } catch (err) {
     if (err instanceof GitHubAPIError && err.status === 422) {
-      const adopted = await adoptTeamByName(client, org, name, notify, privacy)
+      const adopted = await adoptTeamByName(
+        client,
+        org,
+        name,
+        notify,
+        privacy,
+        guard,
+      )
       return { ...adopted, created: false }
     }
     throw err
   }
 }
 
-// Adopt an existing same-named team: read its { id, slug } and reconcile drift
-// (privacy, notification setting). Names are slug-safe (guarded upstream), so
-// the name doubles as the lookup slug.
+// Decides whether an existing team at a canonical slug may be adopted. A slug
+// proves nothing: any org member can create a team there, and classroom
+// `<short>-<role>`'s student team sits at `<short>`'s `<role>` slug. So a staff
+// team must not be a sibling classroom's student team, and must hold the
+// config-repo grant only an owner-run flow gives (or match the id recorded when
+// the grant step failed). A student team is always the classroom's own.
+// Mirrors the CLI's adoptGuard.
+type AdoptGuard =
+  | { kind: "student" }
+  | { kind: "staff"; classroom: string; role: StaffRole; recordedId?: number }
+
+async function teamHasConfigRepoAccess(
+  client: GitHubClient,
+  org: string,
+  slug: string,
+): Promise<boolean> {
+  try {
+    await client.request(
+      `/orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(slug)}/repos/${encodeURIComponent(org)}/${CONFIG_REPO}`,
+    )
+    return true
+  } catch (err) {
+    if (err instanceof GitHubAPIError && err.isNotFound) return false
+    throw err
+  }
+}
+
+// The classroom whose student team sits at `classroom`'s `role` slug (the
+// classroom `<classroom>-<role>`), or null. Mirrors the CLI's StudentTeamOwner.
+export async function studentTeamOwner(
+  client: GitHubClient,
+  org: string,
+  classroom: string,
+  role: StaffRole,
+): Promise<string | null> {
+  const other = `${classroom}-${role}`
+  try {
+    await getClassroomJson(client, { org, classroom: other })
+    return other
+  } catch (err) {
+    if (err instanceof GitHubAPIError && err.isNotFound) return null
+    throw err
+  }
+}
+
+// Thrown when a team at a staff slug is not this classroom's, so nothing adopts
+// or reshapes it. `studentOf` is set when it is a sibling classroom's student
+// team; otherwise it lacks the config-repo grant. A dedicated type lets the
+// reconcile latch it as permanent rather than retry it.
+export class UnclaimedTeamError extends Error {
+  org: string
+  slug: string
+  role: StaffRole
+  studentOf: string | null
+  readonly localized: LocalizedMessage
+  constructor(args: {
+    org: string
+    slug: string
+    role: StaffRole
+    studentOf?: string | null
+  }) {
+    const studentOf = args.studentOf ?? null
+    const localized: LocalizedMessage = studentOf
+      ? {
+          key: "staffTeams.unclaimed.studentOf",
+          params: { slug: args.slug, classroom: studentOf, role: args.role },
+        }
+      : {
+          key: "staffTeams.unclaimed.staff",
+          params: {
+            slug: args.slug,
+            url: `https://github.com/orgs/${args.org}/teams/${args.slug}`,
+          },
+        }
+    super(describeLocalizedMessage(localized))
+    this.name = "UnclaimedTeamError"
+    this.org = args.org
+    this.slug = args.slug
+    this.role = args.role
+    this.studentOf = studentOf
+    this.localized = localized
+  }
+}
+
+// Adopt an existing same-named team: read its { id, slug }, confirm it is ours
+// (see AdoptGuard), then reconcile drift. Names are slug-safe (guarded
+// upstream), so the name doubles as the lookup slug.
 async function adoptTeamByName(
   client: GitHubClient,
   org: string,
   name: string,
   notify: TeamNotificationSetting,
   privacy: TeamPrivacy,
+  guard: AdoptGuard,
 ): Promise<ClassroomTeamRef> {
   const existing = await client.request<GitHubTeam>(
     `/orgs/${org}/teams/${name}`,
   )
+  // Before any write: a team that isn't ours must not be reshaped.
+  if (guard.kind === "staff") {
+    const owner = await studentTeamOwner(
+      client,
+      org,
+      guard.classroom,
+      guard.role,
+    )
+    if (owner) {
+      throw new UnclaimedTeamError({
+        org,
+        slug: existing.slug,
+        role: guard.role,
+        studentOf: owner,
+      })
+    }
+    const granted = await teamHasConfigRepoAccess(client, org, existing.slug)
+    const recorded =
+      guard.recordedId !== undefined && guard.recordedId === existing.id
+    if (!granted && !recorded) {
+      throw new UnclaimedTeamError({
+        org,
+        slug: existing.slug,
+        role: guard.role,
+      })
+    }
+  } else {
+    // A student team must never hold config-repo access (students could read
+    // classroom.json); an older release may have granted it. Idempotent.
+    await removeRepositoryFromTeam(client, {
+      org,
+      teamSlug: existing.slug,
+      owner: org,
+      repo: CONFIG_REPO,
+    })
+  }
   const patch: {
     privacy?: TeamPrivacy
     notification_setting?: TeamNotificationSetting
@@ -166,6 +301,7 @@ export async function ensureClassroomTeam(
     classroomTeamSlug(classroom),
     "notifications_disabled",
     STUDENT_TEAM_PRIVACY,
+    { kind: "student" },
   )
 }
 
@@ -176,6 +312,17 @@ export type StaffTeamRefs = {
   teacher?: ClassroomTeamRef
   hta?: ClassroomTeamRef
   ta?: ClassroomTeamRef
+}
+
+// The id classroom.json records for the role's canonical team, or undefined
+// when absent or naming another team.
+function recordedStaffTeamId(
+  classroom: string,
+  role: StaffRole,
+  recorded: StaffTeamRefs | undefined,
+): number | undefined {
+  const ref = recorded?.[role]
+  return isOwnedClassroomTeamRef(classroom, role, ref) ? ref.id : undefined
 }
 
 // Config-repo permission per staff role: teacher/hta author assignments
@@ -190,14 +337,18 @@ const CONFIG_REPO_PERMISSION: Partial<Record<StaffRole, "pull" | "push">> = {
 // Create (or adopt) the per-classroom STAFF team for `role`, a `closed` team
 // named `classroom50-<classroom>-<role>`. Idempotent — safe as a preflight
 // before any role op. A newly minted team is exempted from the feedback-base
-// lock so its members can merge feedback PRs (best-effort).
+// lock so its members can merge feedback PRs (best-effort). `recorded` is the
+// current `teams` block, consulted only to re-adopt a team whose grant was
+// lost; the role flows omit it because the per-visit reconcile has already
+// healed or refused such a team before a teacher can act on the role.
 export async function ensureClassroomRoleTeam(
   client: GitHubClient,
   org: string,
   classroom: string,
   role: StaffRole,
+  recorded?: StaffTeamRefs,
 ): Promise<ClassroomTeamRef & { created: boolean }> {
-  const team = await ensureRoleTeamRaw(client, org, classroom, role)
+  const team = await ensureRoleTeamRaw(client, org, classroom, role, recorded)
   await exemptStaffTeams(client, org, [team.id])
   return team
 }
@@ -209,6 +360,7 @@ async function ensureRoleTeamRaw(
   org: string,
   classroom: string,
   role: StaffRole,
+  recorded: StaffTeamRefs | undefined,
 ): Promise<ClassroomTeamRef & { created: boolean }> {
   assertCanonicalTeamShortName(classroom)
   // Staff enable notifications so @mentions reach TAs/teachers (#335); the
@@ -219,6 +371,12 @@ async function ensureRoleTeamRaw(
     classroomTeamSlug(classroom, role),
     "notifications_enabled",
     STAFF_TEAM_PRIVACY,
+    {
+      kind: "staff",
+      classroom,
+      role,
+      recordedId: recordedStaffTeamId(classroom, role, recorded),
+    },
   )
 }
 
@@ -273,16 +431,34 @@ export async function grantTeamConfigRepoAccess(
 // maintainer, and removing a member from a team that HOLDS repo access emails
 // them a "removed from team" alert; doing the grant only once the owner is gone
 // keeps that drop silent (the notification_setting toggle can't — it governs
-// only @mentions).
+// only @mentions). `recorded` is the current `teams` block (absent at create).
+// A role whose slug is held by a team that isn't ours is left out of `teams`
+// and reported in `unclaimed`: create fails on it, the reconcile works around
+// it.
 export async function ensureStaffTeams(
   client: GitHubClient,
   org: string,
   classroom: string,
-): Promise<{ teams: StaffTeamRefs; created: StaffRole[] }> {
+  recorded?: StaffTeamRefs,
+): Promise<{
+  teams: StaffTeamRefs
+  created: StaffRole[]
+  unclaimed: UnclaimedTeamError[]
+}> {
   const teams: StaffTeamRefs = {}
   const created: StaffRole[] = []
+  const unclaimed: UnclaimedTeamError[] = []
   for (const role of STAFF_ROLES) {
-    const team = await ensureRoleTeamRaw(client, org, classroom, role)
+    let team: ClassroomTeamRef & { created: boolean }
+    try {
+      team = await ensureRoleTeamRaw(client, org, classroom, role, recorded)
+    } catch (err) {
+      if (err instanceof UnclaimedTeamError) {
+        unclaimed.push(err)
+        continue
+      }
+      throw err
+    }
     teams[role] = { id: team.id, slug: team.slug }
     if (team.created) created.push(role)
   }
@@ -294,7 +470,7 @@ export async function ensureStaffTeams(
     org,
     STAFF_ROLES.flatMap((role) => teams[role]?.id ?? []),
   )
-  return { teams, created }
+  return { teams, created, unclaimed }
 }
 
 // Grant each staff team its role's config-repo access (teacher/hta write, ta
@@ -353,23 +529,15 @@ export async function deleteClassroomTeam(
   // doesn't own. A non-conforming ref is a no-op.
   if (!isDeletableClassroomTeamRef(team)) return
 
-  try {
-    const live = await client.request<{ id: number }>(
-      `/orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(team.slug)}`,
-    )
-    if (live.id !== team.id) {
-      throw new TeamIdMismatchError({
-        org,
-        slug: team.slug,
-        recordedId: team.id,
-        liveId: live.id,
-      })
-    }
-  } catch (err) {
-    if (err instanceof GitHubAPIError && err.isNotFound) {
-      return
-    }
-    throw err
+  const liveId = await liveTeamId(client, org, team.slug)
+  if (liveId === null) return
+  if (liveId !== team.id) {
+    throw new TeamIdMismatchError({
+      org,
+      slug: team.slug,
+      recordedId: team.id,
+      liveId,
+    })
   }
 
   await tolerateGitHubError(

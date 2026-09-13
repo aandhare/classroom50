@@ -208,7 +208,8 @@ func EnsureClassroomTeam(client githubapi.Client, org, shortName, description st
 	if !CanonicalTeamSlugShortName(shortName) {
 		return TeamRef{}, fmt.Errorf("classroom short-name %q can't back a GitHub team: remove consecutive or trailing hyphens (GitHub would rewrite the team slug, breaking membership and template grants)", shortName)
 	}
-	return ensureTeamByName(client, org, classroomTeamName(shortName), description, notificationsDisabled, studentTeamPrivacy)
+	team, _, err := ensureTeamByName(client, org, classroomTeamName(shortName), description, notificationsDisabled, studentTeamPrivacy, adoptGuard{})
+	return team, err
 }
 
 // Team privacy per kind. The student team is `secret`: its description carries
@@ -226,19 +227,30 @@ const (
 // `role` — a `closed` team `classroom50-<short>-<role>`. Mirrors the web's
 // ensureClassroomRoleTeam. Idempotent; safe as a preflight before any staff op.
 // Staff teams create `notificationsEnabled` so @mentions reach TAs/teachers
-// (#335).
-func EnsureClassroomStaffTeam(client githubapi.Client, org, shortName string, role StaffRole) (TeamRef, error) {
+// (#335). `recordedID` is classroom.json's id for the role (0 when absent); an
+// existing team is adopted only when adoptGuard accepts it.
+func EnsureClassroomStaffTeam(client githubapi.Client, org, shortName string, role StaffRole, recordedID int64) (TeamRef, error) {
+	team, _, err := ensureStaffTeam(client, org, shortName, role, recordedID)
+	return team, err
+}
+
+// ensureStaffTeam also reports whether this call created the team, so a
+// partial run can be rolled back.
+func ensureStaffTeam(client githubapi.Client, org, shortName string, role StaffRole, recordedID int64) (TeamRef, bool, error) {
 	if !CanonicalTeamSlugShortName(shortName) {
-		return TeamRef{}, fmt.Errorf("classroom short-name %q can't back a GitHub team: remove consecutive or trailing hyphens (GitHub would rewrite the team slug, breaking staff membership and classroom50 repository access)", shortName)
+		return TeamRef{}, false, fmt.Errorf("classroom short-name %q can't back a GitHub team: remove consecutive or trailing hyphens (GitHub would rewrite the team slug, breaking staff membership and classroom50 repository access)", shortName)
 	}
 	// Staff teams carry no bootstrap description: staff read the authoritative
 	// classroom.json directly, and the secret belongs only on the student team.
-	return ensureTeamByName(client, org, StaffTeamSlug(shortName, role), "", notificationsEnabled, StaffTeamPrivacy)
+	return ensureTeamByName(client, org, StaffTeamSlug(shortName, role), "", notificationsEnabled, StaffTeamPrivacy,
+		adoptGuard{staff: true, shortName: shortName, role: role, recordedID: recordedID})
 }
 
 // EnsureStaffTeams creates (or adopts) all staff teams (teacher, hta, ta) and
 // returns the refs to record under classroom.json `teams`. Mirrors the web's
-// ensureStaffTeams.
+// ensureStaffTeams. `recorded` is the current `teams` block (nil at create).
+// When a later role fails, the teams this call created are deleted again:
+// unrecorded and ungranted, a re-run would refuse them as unclaimed.
 //
 // This does NOT grant config-repo access — callers must invoke
 // GrantStaffTeamsConfigRepoAccess separately, AFTER dropping the auto-added
@@ -247,12 +259,19 @@ func EnsureClassroomStaffTeam(client githubapi.Client, org, shortName string, ro
 // them a "removed from team" alert; granting only once the owner is gone keeps
 // that drop silent (the notification_setting toggle can't — it governs only
 // @mentions).
-func EnsureStaffTeams(client githubapi.Client, org, shortName string) (*StaffTeamsRef, error) {
+func EnsureStaffTeams(client githubapi.Client, org, shortName string, recorded *StaffTeamsRef) (*StaffTeamsRef, error) {
 	refs := &StaffTeamsRef{}
+	var created []TeamRef
 	for _, role := range StaffRoles {
-		team, err := EnsureClassroomStaffTeam(client, org, shortName, role)
+		team, wasCreated, err := ensureStaffTeam(client, org, shortName, role, RecordedStaffTeamID(shortName, role, recorded))
 		if err != nil {
+			for _, t := range created {
+				_ = DeleteClassroomTeam(client, org, t)
+			}
 			return nil, fmt.Errorf("ensure %s staff team: %w", role, err)
+		}
+		if wasCreated {
+			created = append(created, team)
 		}
 		switch role {
 		case RoleTeacher:
@@ -367,7 +386,7 @@ func ReconcileClassroomTeamDescription(client githubapi.Client, org, shortName, 
 //
 // The org's `members_can_create_teams` setting is irrelevant here — the
 // teacher authenticates as an org owner.
-func ensureTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string) (TeamRef, error) {
+func ensureTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string, guard adoptGuard) (TeamRef, bool, error) {
 	teamBody := map[string]any{
 		"name":                 name,
 		"privacy":              privacy,
@@ -378,7 +397,7 @@ func ensureTeamByName(client githubapi.Client, org, name, description, notificat
 	}
 	body, err := json.Marshal(teamBody)
 	if err != nil {
-		return TeamRef{}, fmt.Errorf("encode team body: %w", err)
+		return TeamRef{}, false, fmt.Errorf("encode team body: %w", err)
 	}
 	createPath := fmt.Sprintf("orgs/%s/teams", url.PathEscape(org))
 	var created TeamRef
@@ -387,25 +406,26 @@ func ensureTeamByName(client githubapi.Client, org, name, description, notificat
 		// re-run reconciles. If the adopt read 404s, the 422 wasn't a name
 		// collision — surface the original create error.
 		if cliutil.IsHTTPStatus(err, http.StatusUnprocessableEntity) {
-			adopted, adoptErr := adoptTeamByName(client, org, name, description, notificationSetting, privacy)
+			adopted, adoptErr := adoptTeamByName(client, org, name, description, notificationSetting, privacy, guard)
 			if adoptErr != nil {
 				if cliutil.IsHTTPStatus(adoptErr, http.StatusNotFound) {
-					return TeamRef{}, fmt.Errorf("POST %s: %w", createPath, err)
+					return TeamRef{}, false, fmt.Errorf("POST %s: %w", createPath, err)
 				}
-				return TeamRef{}, adoptErr
+				return TeamRef{}, false, adoptErr
 			}
-			return adopted, nil
+			return adopted, false, nil
 		}
-		return TeamRef{}, fmt.Errorf("POST %s: %w", createPath, err)
+		return TeamRef{}, false, fmt.Errorf("POST %s: %w", createPath, err)
 	}
-	return created, nil
+	return created, true, nil
 }
 
 // adoptTeamByName reads an existing team by slug (== name, given the
-// canonical short-name guard) and reconciles drift toward the desired state:
-// the privacy, the notification setting, and (when non-empty and differing)
-// the description. Used on the 422 already-exists path.
-func adoptTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string) (TeamRef, error) {
+// canonical short-name guard), checks it against `guard`, and reconciles
+// privacy, notification setting, and (when non-empty) description. A student
+// team also loses any config-repo grant an older release gave it: that access
+// would let students read classroom.json. Used on the 422 already-exists path.
+func adoptTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string, guard adoptGuard) (TeamRef, error) {
 	slug := name
 	getPath := fmt.Sprintf("orgs/%s/teams/%s", url.PathEscape(org), url.PathEscape(slug))
 	var existing struct {
@@ -417,6 +437,15 @@ func adoptTeamByName(client githubapi.Client, org, name, description, notificati
 	}
 	if err := client.Get(getPath, &existing); err != nil {
 		return TeamRef{}, fmt.Errorf("GET %s (adopting existing team): %w", getPath, err)
+	}
+	// Before any write: a team that isn't ours must not be reshaped.
+	if err := guard.check(client, org, existing.Slug, existing.ID); err != nil {
+		return TeamRef{}, err
+	}
+	if !guard.staff {
+		if err := RemoveTeamRepo(client, org, existing.Slug, org, ConfigRepoName); err != nil {
+			return TeamRef{}, fmt.Errorf("remove the student team's access to the classroom50 repository: %w", err)
+		}
 	}
 	// Batch every drifted field into one PATCH (description only drifts for the
 	// student team, which carries the bootstrap record). GitHub returns
@@ -467,38 +496,6 @@ func SetTeamPrivacy(client githubapi.Client, org, slug, privacy string) error {
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
-}
-
-// OrgTeam is the slice of GitHub's team object the org-wide listing readers
-// need.
-type OrgTeam struct {
-	ID      int64  `json:"id"`
-	Slug    string `json:"slug"`
-	Privacy string `json:"privacy"`
-}
-
-// ListOrgTeams returns every team in the org keyed by slug, in one paginated
-// read. An org owner sees secret teams too, so the map is complete for the
-// callers that run as one (init, org audit). A read failure propagates.
-func ListOrgTeams(client githubapi.Client, org string) (map[string]OrgTeam, error) {
-	teams, err := githubapi.PaginateAll[OrgTeam](
-		client, githubapi.ListPerPage, githubapi.ListMaxPages,
-		func(page int) string {
-			return fmt.Sprintf("orgs/%s/teams?per_page=%d&page=%d",
-				url.PathEscape(org), githubapi.ListPerPage, page)
-		},
-		func(path string, err error) error {
-			return fmt.Errorf("GET %s: %w", path, err)
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	bySlug := make(map[string]OrgTeam, len(teams))
-	for _, t := range teams {
-		bySlug[t.Slug] = t
-	}
-	return bySlug, nil
 }
 
 // StaffTeamSlugs are the canonical staff team slugs for a classroom, in role
@@ -616,19 +613,16 @@ func DeleteClassroomTeam(client githubapi.Client, org string, team TeamRef) erro
 	}
 	// Defense-in-depth: confirm the team at this slug is the one we recorded
 	// (same id) before deleting.
-	getPath := fmt.Sprintf("orgs/%s/teams/%s", url.PathEscape(org), url.PathEscape(team.Slug))
-	var live struct {
-		ID int64 `json:"id"`
+	liveID, err := LiveTeamID(client, org, team.Slug)
+	if err != nil {
+		return fmt.Errorf("verify team before delete: %w", err)
 	}
-	if err := client.Get(getPath, &live); err != nil {
-		if cliutil.IsHTTPStatus(err, http.StatusNotFound) {
-			return nil // already gone
-		}
-		return fmt.Errorf("GET %s (verify team before delete): %w", getPath, err)
+	if liveID == 0 {
+		return nil // already gone
 	}
-	if live.ID != team.ID {
+	if liveID != team.ID {
 		return fmt.Errorf("team %q at %s now has id %d, not the recorded %d: refusing to delete a team that isn't the one this classroom created; remove it by hand if intended",
-			team.Slug, org, live.ID, team.ID)
+			team.Slug, org, liveID, team.ID)
 	}
 	path := fmt.Sprintf("orgs/%s/teams/%s", url.PathEscape(org), url.PathEscape(team.Slug))
 	resp, err := client.Request(http.MethodDelete, path, nil)

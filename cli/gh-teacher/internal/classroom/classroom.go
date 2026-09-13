@@ -119,6 +119,9 @@ func classroomAddCmd() *cobra.Command {
 			if err := validate.ClassroomShortNameBudget(shortName); err != nil {
 				return err
 			}
+			if err := validate.ClassroomShortNameSuffix(shortName); err != nil {
+				return err
+			}
 
 			// Resolve the optional capability-URL key before any API call so
 			// an invalid --key fails fast. An explicit --key implies opt-in
@@ -202,6 +205,18 @@ func addClassroom(client githubapi.Client, out, errOut io.Writer, org, shortName
 		return fmt.Errorf("classroom %q already exists in %s/%s: refusing to overwrite (inspect or edit at https://github.com/%s/%s/tree/%s/%s)",
 			shortName, org, configrepo.ConfigRepoName,
 			org, configrepo.ConfigRepoName, branch, shortName)
+	}
+	// Classroom `<short>-<role>`'s student team would sit at this classroom's
+	// staff slug for that role.
+	for _, role := range configrepo.StaffRoles {
+		other, err := configrepo.StudentTeamOwner(client, org, shortName, role)
+		if err != nil {
+			return err
+		}
+		if other != "" {
+			return fmt.Errorf("classroom %q would share its %s team name (%s) with the student team of the existing classroom %q; choose a different short-name",
+				shortName, role, configrepo.StaffTeamSlug(shortName, role), other)
+		}
 	}
 
 	// Create (or adopt) the per-classroom team before scaffolding so its
@@ -303,7 +318,8 @@ func addClassroom(client githubapi.Client, out, errOut io.Writer, org, shortName
 // teams. The maintainer add is best-effort: a CurrentUser/membership failure
 // warns but doesn't fail creation (the teacher can self-add via the web).
 func seedStaffTeams(client githubapi.Client, errOut io.Writer, org, shortName string) (*configrepo.StaffTeamsRef, string, error) {
-	staffTeams, err := configrepo.EnsureStaffTeams(client, org, shortName)
+	// No recorded refs yet: an existing team is adopted only if already granted.
+	staffTeams, err := configrepo.EnsureStaffTeams(client, org, shortName, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("create staff teams: %w", err)
 	}
@@ -817,6 +833,15 @@ func removeClassroom(client githubapi.Client, in io.Reader, out, errOut io.Write
 				org, shortName, t.Slug, role, org)
 			continue
 		}
+		// An older release could record `ml-ta`'s student team as `ml`'s TA
+		// team; never delete a sibling classroom's roster.
+		if other, oerr := configrepo.StudentTeamOwner(client, org, shortName, role); oerr != nil {
+			return oerr
+		} else if other != "" {
+			_, _ = fmt.Fprintf(errOut, "Warning: %s: %q is the student team of classroom %s, not %s's %s team; leaving it alone.\n",
+				org, t.Slug, other, shortName, role)
+			continue
+		}
 		staffTeams = append(staffTeams, t)
 	}
 
@@ -844,7 +869,7 @@ func removeClassroom(client githubapi.Client, in io.Reader, out, errOut io.Write
 
 	// Drop the staff teams from the feedback-base bypass list before deleting
 	// them, so the ruleset never references a team GitHub no longer knows.
-	orgrules.RevokeStaffTeams(client, errOut, org, staffTeams)
+	orgrules.RevokeClassroomStaffTeams(client, errOut, org, shortName)
 
 	// Delete the per-classroom team (idempotent; 404 = gone). Its grants +
 	// memberships go with it. A delete failure is surfaced but doesn't undo

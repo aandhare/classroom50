@@ -24,7 +24,10 @@ import {
   type GitTreeFileMode,
   type StaffTeamRefs,
 } from "@/github-core/mutations"
-import { revokeStaffTeams } from "@/github-core/rulesets"
+import {
+  revokeClassroomStaffTeams,
+  revokeStaffTeams,
+} from "@/github-core/rulesets"
 import type { StaffRole } from "@/types/classroom"
 import { logger } from "@/lib/logger"
 
@@ -72,11 +75,21 @@ export async function createClassroomFiles(
     input.org,
     input.classroom,
   )
-  const { teams, created: staffCreated } = await ensureStaffTeams(
-    client,
-    input.org,
-    input.classroom,
-  )
+  const {
+    teams,
+    created: staffCreated,
+    unclaimed,
+  } = await ensureStaffTeams(client, input.org, input.classroom)
+  // Fail before scaffolding so the teacher sees what to do, and undo the teams
+  // this run did create.
+  if (unclaimed.length > 0) {
+    await rollbackCreatedTeams(client, input.org, {
+      students: teamCreated ? team : undefined,
+      staff: teams,
+      staffCreated,
+    })
+    throw unclaimed[0]
+  }
 
   // The creator becomes a teacher (the only way to seed staff membership in
   // a serverless app). Best-effort: a membership hiccup must not fail creation —
@@ -405,11 +418,7 @@ export async function deleteClassroom(
   })
   // Drop the teams from the feedback-base bypass list first, so the ruleset
   // never references a team GitHub no longer knows.
-  await revokeStaffTeams(
-    client,
-    org,
-    refsToDelete.map((t) => t.id),
-  )
+  await revokeClassroomStaffTeams(client, org, [classroom])
   const failedTeamSlugs: string[] = []
   for (const teamRef of refsToDelete) {
     try {

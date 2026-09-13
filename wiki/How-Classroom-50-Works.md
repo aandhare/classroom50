@@ -333,6 +333,21 @@ organization:
   adds each staff team to the exemption list when it creates the team;
   re-running setup rebuilds the list from every classroom.
 
+A staff team is the team named `classroom50-<short-name>-<role>` **that has
+access to the `classroom50` repository**. Classroom 50 grants that access when
+it creates the team, and only an organization owner (or someone an owner made
+an admin of that repository, or a maintainer of an already-granted team) can
+grant it, so the grant is what tells a real staff team from any other team
+that happens to sit at the same name. A team an organization member created at
+a staff name is never exempted, made visible, or granted access to student
+repositories; Classroom 50 warns about it instead of adopting it. One case
+outranks the grant: if a classroom named `<short-name>-<role>` exists, the
+team at that name is its **student** team, whatever access an older release
+gave it, and Classroom 50 removes that access on the next visit. Setup, **Fix
+it**, score collection, and the classroom page all apply the same rules. New
+classroom short names can't end in a role suffix, and a new classroom can't
+take a name whose staff team name an existing classroom already holds.
+
 Both rulesets include an organization-owner bypass, so teachers keep full
 control. Separately, the `classroom50` repository's default branch has classic
 branch protection with force pushes and deletion disabled.

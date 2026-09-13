@@ -104,6 +104,10 @@ _PERMISSION_RANK = {level: i for i, level in enumerate(_PERMISSION_LEVELS)}
 # the web STAFF_ROLES; the derived slug for each is `classroom50-<short>-<role>`.
 STAFF_ROLES = ("teacher", "hta", "ta")
 
+# The org's config repo. Only an owner-run Classroom 50 flow grants a team
+# access to it, so the grant marks a real staff team (see staff_team_is_claimed).
+CONFIG_REPO = "classroom50"
+
 # Body markers that identify a rate-limit response, for the cases no header
 # names: GitHub words the secondary limit and the abuse detector differently.
 # "abuse" is the bare stem on purpose: it catches every "abuse detection
@@ -303,6 +307,9 @@ def main() -> int:
     ).rstrip("/")
 
     classroom_dirs = list(iter_classrooms(base_dir, classroom_filter))
+    # Every classroom, filter or not: `<short>`'s grant pass must know a
+    # classroom `<short>-<role>` exists even when only `<short>` is collected.
+    all_classrooms = classroom_dir_names(base_dir)
     if not classroom_dirs:
         if classroom_filter:
             # An explicit filter matching nothing is a FAILED run (typo, or a
@@ -365,6 +372,7 @@ def main() -> int:
                 repo_index=repo_index,
                 team_members=team_members,
                 assignment_filter=assignment_filter,
+                all_classrooms=all_classrooms,
             )
         except GrantThrottled as exc:
             # NOT a failure: collection is untouched, the pass is idempotent, and
@@ -585,6 +593,16 @@ def main() -> int:
 
 
 # Classroom enumeration -------------------------------------------------------
+
+
+def classroom_dir_names(base_dir: pathlib.Path) -> frozenset[str]:
+    """Every directory under base_dir holding a classroom.json (the same
+    authority the Go and web sides probe for a sibling classroom)."""
+    if not base_dir.is_dir():
+        return frozenset()
+    return frozenset(
+        p.name for p in base_dir.iterdir() if p.is_dir() and (p / "classroom.json").is_file()
+    )
 
 
 def iter_classrooms(
@@ -2114,6 +2132,7 @@ def grant_classroom_team_access(
     repo_index: RepoIndex | None = None,
     team_members: "TeamMembers | None" = None,
     assignment_filter: str = "",
+    all_classrooms: frozenset[str] = frozenset(),
 ) -> None:
     """Grant each classroom staff team its mapped repo permission (see
     STAFF_TEAM_PERMISSIONS) on every EXISTING student assignment repo, and read
@@ -2141,11 +2160,19 @@ def grant_classroom_team_access(
     and its private template); blank grants every assignment as before.
     """
     staff_teams = resolve_staff_team_slugs(classroom_meta, classroom_short)
-    grant_teams = [
-        (role, team, STAFF_TEAM_PERMISSIONS[role])
-        for role, team in staff_teams.items()
-        if role in STAFF_TEAM_PERMISSIONS
-    ]
+    grant_teams = []
+    for role, team in staff_teams.items():
+        if role not in STAFF_TEAM_PERMISSIONS:
+            continue
+        # Classroom `<short>-<role>`'s student team sits at this slug; a roster
+        # is never staff, whatever an older release granted it.
+        if f"{classroom_short}-{role}" in all_classrooms:
+            print(
+                f"{classroom_short}: {team.slug!r} is the student team of classroom "
+                f"{classroom_short}-{role}, so {classroom_short} has no {role} team to grant."
+            )
+            continue
+        grant_teams.append((role, team, STAFF_TEAM_PERMISSIONS[role]))
     if not grant_teams:
         return
 
@@ -2266,6 +2293,28 @@ def grant_classroom_team_access(
         known_repos = known_team_repos(
             api_url, org, team_slug, service_token, classroom_short
         )
+        # Any member can create a team at this slug; only one Classroom 50
+        # granted config-repo access gets push on every student repo.
+        claimed = staff_team_is_claimed(
+            api_url, org, team_slug, service_token, known_repos
+        )
+        if claimed is None:
+            emit_warning(
+                f"{classroom_short}: could not check whether team {team_slug!r} has access "
+                f"to the {CONFIG_REPO} repository, so it was not granted access to student "
+                f"repos this run; the next run retries."
+            )
+            continue
+        if not claimed:
+            emit_warning(
+                f"{classroom_short}: team {team_slug!r} exists but was not created by "
+                f"Classroom 50 (it has no access to the {CONFIG_REPO} repository), so it "
+                f"was not granted access to student repos. Review its members at "
+                f"https://github.com/orgs/{org}/teams/{team_slug}, then either delete it "
+                f"or grant it access to the {CONFIG_REPO} repository to use it as the "
+                f"{role} team."
+            )
+            continue
         granted = 0
         for index, (t_owner, t_repo, t_permission) in enumerate(targets):
             try:
@@ -2393,6 +2442,30 @@ def private_template_targets(
             continue
         targets.append((t_owner, t_repo))
     return targets
+
+
+def staff_team_is_claimed(
+    api_url: str,
+    org: str,
+    team_slug: str,
+    token: str,
+    known_repos: dict[str, str] | None,
+) -> bool | None:
+    """Whether `team_slug` holds a grant on the config repo, the proof Classroom
+    50 created it (the grant half of the Go/web adopt guard; the collector never
+    adopts, so the recorded-id exception does not apply). Read from the bulk repo
+    listing when available, else one per-repo read. None means the read failed:
+    the caller says "could not check" rather than "not Classroom 50's", and
+    grants nothing either way."""
+    key = f"{org}/{CONFIG_REPO}".lower()
+    if known_repos is not None:
+        return key in known_repos
+    try:
+        return team_repo_permission(api_url, org, team_slug, org, CONFIG_REPO, token) is not None
+    except urllib.error.HTTPError as exc:
+        if classify(exc) is not SKIPPABLE:
+            raise
+        return None
 
 
 def known_team_repos(
@@ -4175,7 +4248,11 @@ def throttle_sleep_budget_spent(delay: float) -> bool:
     with _transport_lock:
         start = max(now, getattr(_throttle_local, "sleep_until", 0.0))
         end = start + delay
-        charge = max(0.0, end - max(start, _throttle_sleep_until))
+        # Charge `delay` less the overlap, not `end - start`: subtracting two
+        # large monotonic readings loses ULPs, and five 60s waits then overshoot
+        # a 300s budget.
+        overlap = min(delay, max(0.0, _throttle_sleep_until - start))
+        charge = delay - overlap
         if _throttle_sleep_spent + charge > MAX_TOTAL_THROTTLE_SLEEP_SECONDS:
             return True
         _throttle_sleep_spent += charge

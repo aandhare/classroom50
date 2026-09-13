@@ -7,14 +7,17 @@ import {
   type StaffRole,
 } from "@/types/classroom"
 import {
+  deleteClassroomTeam,
   ensureClassroomTeam,
   ensureStaffTeams,
   grantStaffTeamsConfigRepoAccess,
   projectTeamDescriptionFromRecord,
   reconcileStudentTeamDescription,
   removeUserFromTeam,
+  type StaffTeamRefs,
   type TeamDescriptionReconcileResult,
 } from "@/github-core/mutations"
+import { revokeStaffTeams } from "@/github-core/rulesets"
 import { reconcileRoster } from "./students/reconcileRoster"
 import { logger } from "@/lib/logger"
 
@@ -111,18 +114,29 @@ export async function reconcileClassroom(
   // pass must not resurrect (see useSuppressedLogins).
   excludeLogins?: () => Set<string>,
 ): Promise<ClassroomReconcileResult> {
-  const archivedRecord = await readArchivedRecord(client, org, classroom)
-  if (archivedRecord) {
-    return reconcileArchivedClassroom(client, org, classroom, archivedRecord)
+  const record = await readClassroomRecord(client, org, classroom)
+  if (record && isClassroomArchived(record)) {
+    return reconcileArchivedClassroom(client, org, classroom, record)
   }
 
   const { slug: studentTeamSlug, created: studentTeamCreated } =
     await ensureClassroomTeam(client, org, classroom)
-  const { teams: staffTeams, created: staffCreated } = await ensureStaffTeams(
-    client,
-    org,
-    classroom,
-  )
+  const {
+    teams: staffTeams,
+    created: staffCreated,
+    unclaimed,
+  } = await ensureStaffTeams(client, org, classroom, record?.teams)
+  // A team that isn't ours is left alone and the rest of the pass converges.
+  // Recorded so the gap is visible; the owner sees the fix on their next staff
+  // action.
+  for (const err of unclaimed) {
+    log.warn("classroom reconcile: staff slug held by an unclaimed team", {
+      org,
+      classroom,
+      slug: err.slug,
+      record: true,
+    })
+  }
 
   // Clear the owner off every non-teacher team we just touched. Best-effort and
   // idempotent (404 = already absent); a failure leaves them on a team where the
@@ -134,9 +148,10 @@ export async function reconcileClassroom(
   ])
 
   // Grant staff-team config-repo access AFTER the drop (order is load-bearing —
-  // see ensureStaffTeams); also re-affirms the TA read-only downgrade.
-  // Best-effort: a failure leaves access unset until the next pass, never aborts
-  // the heal.
+  // see ensureStaffTeams); also re-affirms the TA read-only downgrade. A
+  // failure must not abort the heal, but a team created here and left
+  // ungranted would be refused on every later visit (nothing records it), so
+  // undo the creation and let the next pass recreate it.
   try {
     await grantStaffTeamsConfigRepoAccess(client, org, staffTeams)
   } catch (err) {
@@ -148,6 +163,7 @@ export async function reconcileClassroom(
         err,
       },
     )
+    await rollbackCreatedStaffTeams(client, org, staffTeams, staffCreated)
   }
 
   // A 404 from the student-team read is permanent (a wrong derived slug never
@@ -236,18 +252,45 @@ async function dropCreatorFromNonTeacherTeams(
   }
 }
 
-// The classroom.json record when the classroom positively records
-// active: false, else null. A missing classroom.json (404, legacy) reads as
-// active; a transient read failure rethrows so the caller's latch retries
-// rather than reconciling blind.
-async function readArchivedRecord(
+// Best-effort undo of the staff teams this pass created. Their ids were just
+// minted, so revoking by id is safe.
+async function rollbackCreatedStaffTeams(
+  client: GitHubClient,
+  org: string,
+  teams: StaffTeamRefs,
+  created: readonly StaffRole[],
+): Promise<void> {
+  const refs = created.flatMap((role) => teams[role] ?? [])
+  if (refs.length === 0) return
+  await revokeStaffTeams(
+    client,
+    org,
+    refs.map((t) => t.id),
+  )
+  for (const ref of refs) {
+    try {
+      await deleteClassroomTeam(client, org, ref)
+    } catch (err) {
+      log.warn("classroom reconcile: rollback of a created staff team failed", {
+        org,
+        teamSlug: ref.slug,
+        err,
+      })
+    }
+  }
+}
+
+// classroom.json, read once per pass: the archived flag picks the branch and
+// the `teams` block lets ensureStaffTeams re-adopt a team whose grant was lost.
+// A 404 (legacy) reads as active with nothing recorded; a transient failure
+// rethrows so the caller retries rather than reconciling blind.
+async function readClassroomRecord(
   client: GitHubClient,
   org: string,
   classroom: string,
 ): Promise<Classroom | null> {
   try {
-    const record = await getClassroomJson(client, { org, classroom })
-    return isClassroomArchived(record) ? record : null
+    return await getClassroomJson(client, { org, classroom })
   } catch (err) {
     if (err instanceof GitHubAPIError && err.isNotFound) return null
     throw err

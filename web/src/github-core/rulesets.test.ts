@@ -10,6 +10,7 @@ import {
   feedbackBaseBypassActors,
   prepareStaffTeams,
   repairRulesets,
+  revokeClassroomStaffTeams,
   updateFeedbackBaseBypassTeams,
   type RulesetBypassActor,
 } from "./rulesets"
@@ -27,6 +28,8 @@ type Recorded = { method: string; path: string; body: unknown }
 function makeClient(
   existing: Array<{ id: number; name: string }>,
   feedbackActors: RulesetBypassActor[] = [],
+  // slug -> id for GET /orgs/acme/teams/{slug}; an unlisted slug 404s.
+  liveTeams: Record<string, number> = {},
 ) {
   const calls: Recorded[] = []
   const request = vi
@@ -35,6 +38,12 @@ function makeClient(
       (path: string, options?: { method?: string; body?: unknown }) => {
         const method = options?.method ?? "GET"
         calls.push({ method, path, body: options?.body })
+        const teamGet = path.match(/^\/orgs\/acme\/teams\/([^/]+)$/)
+        if (method === "GET" && teamGet) {
+          const id = liveTeams[teamGet[1]]
+          if (id === undefined) return Promise.reject(httpError(404))
+          return Promise.resolve({ id, slug: teamGet[1] })
+        }
         if (method === "GET" && /\/rulesets\/\d+$/.test(path)) {
           const id = Number(path.split("/").pop())
           const rs = existing.find((r) => r.id === id)
@@ -273,9 +282,40 @@ describe("updateFeedbackBaseBypassTeams", () => {
   })
 })
 
+describe("revokeClassroomStaffTeams", () => {
+  it("drops the live team at each of the classroom's staff slugs, recorded or not", async () => {
+    // The unrecorded ta team is dropped, the other classroom's team is kept,
+    // and an unstaffed role (no hta team) is skipped.
+    const { client, calls } = makeClient(
+      [{ id: 20, name: RULESET_NAME_FEEDBACK_BASE }],
+      [OWNER_EXEMPT, team(10), team(20), team(30)],
+      {
+        "classroom50-cs101-teacher": 10,
+        "classroom50-cs101-ta": 30,
+        "classroom50-other-teacher": 20,
+      },
+    )
+    await revokeClassroomStaffTeams(client, "acme", ["cs101"])
+    const put = calls.find((c) => c.method === "PUT")
+    expect(
+      (put?.body as { bypass_actors: RulesetBypassActor[] }).bypass_actors,
+    ).toEqual([OWNER_EXEMPT, team(20)])
+  })
+
+  it("is a no-op when no team exists at any of the slugs", async () => {
+    const { client, calls } = makeClient(
+      [{ id: 20, name: RULESET_NAME_FEEDBACK_BASE }],
+      [OWNER_EXEMPT, team(10)],
+    )
+    await revokeClassroomStaffTeams(client, "acme", ["cs101"])
+    expect(calls.some((c) => c.method === "PUT")).toBe(false)
+  })
+})
+
 // A fake org for the collector/audit/repair path: a config repo with
-// classroom dirs, per-classroom classroom.json bodies, the org's live teams
-// (slug -> {id, privacy}), and the installed rulesets' feedback-base actors.
+// classroom dirs, per-classroom classroom.json bodies, the teams that hold a
+// grant on the config repo (slug -> {id, privacy}), and the installed
+// rulesets' feedback-base actors. The org-wide team listing is never consulted.
 function makeConfigRepoClient(opts: {
   classrooms?: Record<string, unknown | null> // null: dir without classroom.json
   teams?: Record<string, { id: number; privacy: string }>
@@ -298,12 +338,22 @@ function makeConfigRepoClient(opts: {
       const method = options?.method ?? "GET"
       calls.push({ method, path, body: options?.body })
       if (method === "GET" && /^\/orgs\/acme\/teams\?/.test(path)) {
+        throw new Error(
+          "the org-wide team listing must not be read: it cannot tell a staff team from a squatter at its slug",
+        )
+      }
+      if (
+        method === "GET" &&
+        /^\/repos\/acme\/classroom50\/teams\?/.test(path)
+      ) {
         if (opts.teamsError) throw opts.teamsError
+        if (!opts.classrooms && !opts.teams) throw httpError(404)
         // Single page; <100 ends pagination.
         return Object.entries(opts.teams ?? {}).map(([slug, t]) => ({
           id: t.id,
           slug,
           privacy: t.privacy,
+          permission: "pull",
         }))
       }
       if (method === "PATCH" && /^\/orgs\/acme\/teams\/[^/]+$/.test(path)) {
@@ -366,7 +416,8 @@ function httpError(status: number, rateLimited = false): GitHubAPIError {
 }
 
 // A classroom whose head TA pointed `teams.ta` at the student team. The slug
-// walk never reads the teams block, so the tampering changes nothing.
+// walk never reads the teams block, so the tampering changes nothing, and the
+// student team holds no config-repo grant, so it is never in the listing.
 const cs101 = {
   short_name: "cs101",
   team: { id: 100, slug: "classroom50-cs101" },
@@ -384,7 +435,6 @@ const CS101_SLUGS = [
 const cs101Teams = {
   "classroom50-cs101-teacher": { id: 11, privacy: "closed" },
   "classroom50-cs101-hta": { id: 12, privacy: "closed" },
-  "classroom50-cs101": { id: 100, privacy: "secret" },
 }
 
 describe("auditRulesets", () => {
@@ -539,6 +589,21 @@ describe("collectStaffTeamSlugs", () => {
     expect(await collectStaffTeamSlugs(client, "acme")).toEqual([])
   })
 
+  it("leaves out a slug that is a sibling classroom's student team", async () => {
+    // `classroom50-ml-ta` is `ml-ta`'s student team, so `ml` has no TA slug;
+    // `ml-ta`'s own staff slugs are unaffected.
+    const { client } = makeConfigRepoClient({
+      classrooms: { ml: cs101, "ml-ta": cs101 },
+    })
+    expect(await collectStaffTeamSlugs(client, "acme")).toEqual([
+      "classroom50-ml-teacher",
+      "classroom50-ml-hta",
+      "classroom50-ml-ta-teacher",
+      "classroom50-ml-ta-hta",
+      "classroom50-ml-ta-ta",
+    ])
+  })
+
   it("throws on a listing or per-classroom read failure rather than returning a shorter list", async () => {
     const listing = makeConfigRepoClient({ listingError: httpError(500) })
     await expect(
@@ -587,6 +652,21 @@ describe("prepareStaffTeams", () => {
     await expect(
       prepareStaffTeams(client, "acme", ["classroom50-x-ta"]),
     ).rejects.toThrow()
+  })
+
+  it("a team at a staff slug without the config-repo grant is not staff", async () => {
+    // A sibling's student team and a squatted team hold no config-repo grant,
+    // so neither is listed: no PATCH, no id.
+    const { client, calls } = makeConfigRepoClient({
+      teams: { "classroom50-cs101-teacher": { id: 11, privacy: "closed" } },
+    })
+    expect(await prepareStaffTeams(client, "acme", CS101_SLUGS)).toEqual([11])
+    expect(calls.filter((c) => c.method === "PATCH")).toEqual([])
+  })
+
+  it("resolves to [] on a fresh org (no config repo)", async () => {
+    const { client } = makeConfigRepoClient({})
+    expect(await prepareStaffTeams(client, "acme", CS101_SLUGS)).toEqual([])
   })
 })
 
