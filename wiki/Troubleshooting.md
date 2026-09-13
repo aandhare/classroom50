@@ -971,6 +971,31 @@ In the web form, enter `bash "$CLASSROOM50_BUNDLE_DIR/check.sh"` as the **Run
 command**. On a Windows runner, write `%CLASSROOM50_BUNDLE_DIR%` instead. See
 [Teacher-only test files](Autograding-Basics#teacher-only-test-files).
 
+### "Merging is blocked" on a feedback pull request
+
+The `feedback` branch is locked by the `classroom50-feedback-base-lock`
+ruleset so a student can never merge or move it. Organization owners and the
+classroom's teacher, head TA, and TA teams are exempt from the lock and see the
+normal **Merge** button. What you see tells you what's missing:
+
+- **Owner with a "Merge without waiting for requirements to be met"
+  checkbox.** The ruleset was installed by an older release. Re-run
+  `gh teacher init`, or open the organization's settings in the web app and
+  click **Fix it** on the rulesets check. The checkbox still works in the
+  meantime. If it comes back, a co-teacher is still running an older
+  `gh teacher`: its `init` reinstalls the old ruleset and drops the staff
+  exemptions again. Have every teacher run `gh extension upgrade gh-teacher`
+  before re-running `init`.
+- **TA or head TA with no merge button at all.** Staff get write access to
+  student repositories from the score-collection workflow, not at accept
+  time. Run **Collect now** (or wait for the scheduled run), then reload the
+  pull request.
+- **TA or head TA with merging blocked.** Your staff team isn't on the
+  ruleset's exemption list yet (a classroom created before this release, or a
+  team added outside Classroom 50). The organization settings page flags this
+  under the rulesets check; a teacher clicks **Fix it** there or re-runs
+  `gh teacher init`, which rebuilds the list from every classroom.
+
 ## Collecting scores and downloading submissions
 
 ### `collect-scores` warns "collected 0 submissions"
@@ -1012,9 +1037,9 @@ See the [service-token setup](GitHub-Integration#4-fine-grained-pat-for-score-co
 
 ### `collect-scores` says "no staff access was granted"
 
-Collection grants the head TA and TA teams read access to student repositories
-as it runs, and reports when it had nobody to grant it to. The level tells you
-whether anything needs fixing:
+Collection grants the head TA and TA teams write access to student
+repositories as it runs, and reports when it had nobody to grant it to. The
+level tells you whether anything needs fixing:
 
 - A **notice** means the classroom has no staff team at all: nothing in
   `classroom.json` names one and none exists on GitHub. A solo teacher can
@@ -1023,6 +1048,12 @@ whether anything needs fixing:
 - A **warning** means a staff team exists but has no members, or a team
   recorded in `classroom.json` is missing or couldn't be read. Check each TA's
   role on the roster page, then run collection again.
+- A **warning that `classroom.json` records another team** as a staff role
+  means the `teams.<role>` entry names a team Classroom 50 didn't create for
+  that classroom. Collection grants the classroom's own team
+  (`classroom50-<classroom>-<role>`) regardless. To fix the record, run
+  `gh teacher staff add <org> <classroom> <username> --role <role>` with any
+  current member of that role; it rewrites the entry to the right team.
 
 ### "The collection run failed."
 

@@ -1,12 +1,18 @@
 import type { GitHubClient } from "../client"
 import { type GitHubTeam } from "../types"
+import {
+  STAFF_TEAM_PRIVACY,
+  STUDENT_TEAM_PRIVACY,
+  type TeamPrivacy,
+} from "../types"
 import { GitHubAPIError, tolerateGitHubError } from "../errors"
 import type { StaffRole } from "@/types/classroom"
 import { STAFF_ROLES } from "@/types/classroom"
 import { createTeam, type TeamNotificationSetting } from "../teamWrites"
+import { exemptStaffTeams } from "../rulesets"
 import { CONFIG_REPO } from "@/util/configRepo"
 import { isCanonicalTeamShortName } from "@/util/shortName"
-import { classroomTeamSlug } from "@/util/teamSlug"
+import { classroomTeamSlug, type ClassroomTeamRole } from "@/util/teamSlug"
 
 // Minimal team identity persisted in classroom.json. The slug is authoritative
 // for team ops (GitHub may slugify a name differently on collision); the id is
@@ -33,27 +39,66 @@ export function isDeletableClassroomTeamRef(
   )
 }
 
-// Create (or adopt) a `secret` team by exact name. Idempotent: adopts a
-// same-named team on 422, reconciling privacy and notification setting.
-// `created: false` means it pre-existed and must NOT be deleted on a
+// The stricter gate for a classroom's own `teams.<role>` ref: it must name the
+// team this app creates for that classroom and role, not merely a
+// `classroom50-` team. Staff refs are head-TA writable and drive an owner-run
+// bypass revoke plus delete, so a ref pointed at another classroom's staff team
+// (which would pass the namespace check and the live-id check) is refused.
+// Mirrors the CLI's configrepo.IsCanonicalStaffTeamRef.
+export function isOwnedClassroomTeamRef(
+  classroom: string,
+  role: ClassroomTeamRole,
+  team: { id?: unknown; slug?: unknown } | undefined | null,
+): team is ClassroomTeamRef {
+  return (
+    isDeletableClassroomTeamRef(team) &&
+    team.slug === classroomTeamSlug(classroom, role)
+  )
+}
+
+// A classroom's deletable team refs (student plus staff), each gated by
+// isOwnedClassroomTeamRef for its role.
+export function ownedClassroomTeamRefs(
+  classroom: string,
+  refs: {
+    team?: { id?: unknown; slug?: unknown } | null
+    teams?: Partial<
+      Record<StaffRole, { id?: unknown; slug?: unknown } | null | undefined>
+    > | null
+  },
+): ClassroomTeamRef[] {
+  const out: ClassroomTeamRef[] = []
+  if (isOwnedClassroomTeamRef(classroom, "student", refs.team))
+    out.push(refs.team)
+  for (const role of STAFF_ROLES) {
+    const ref = refs.teams?.[role]
+    if (isOwnedClassroomTeamRef(classroom, role, ref)) out.push(ref)
+  }
+  return out
+}
+
+// Create (or adopt) a team by exact name at the given privacy. Idempotent:
+// adopts a same-named team on 422, reconciling privacy and notification
+// setting. `created: false` means it pre-existed and must NOT be deleted on a
 // create-failure rollback. The shared core the student and staff teams build on.
-async function ensureSecretTeamByName(
+async function ensureTeamByName(
   client: GitHubClient,
   org: string,
   name: string,
   notify: TeamNotificationSetting,
+  privacy: TeamPrivacy,
 ): Promise<ClassroomTeamRef & { created: boolean }> {
   try {
     const created = await createTeam(client, {
       org,
       name,
-      privacy: "secret",
+      privacy,
       notification_setting: notify,
     })
     return { id: created.id, slug: created.slug, created: true }
   } catch (err) {
     if (err instanceof GitHubAPIError && err.status === 422) {
-      const adopted = await adoptSecretTeamByName(client, org, name, notify)
+      const adopted = await adoptTeamByName(client, org, name, notify, privacy)
       return { ...adopted, created: false }
     }
     throw err
@@ -63,20 +108,21 @@ async function ensureSecretTeamByName(
 // Adopt an existing same-named team: read its { id, slug } and reconcile drift
 // (privacy, notification setting). Names are slug-safe (guarded upstream), so
 // the name doubles as the lookup slug.
-async function adoptSecretTeamByName(
+async function adoptTeamByName(
   client: GitHubClient,
   org: string,
   name: string,
   notify: TeamNotificationSetting,
+  privacy: TeamPrivacy,
 ): Promise<ClassroomTeamRef> {
   const existing = await client.request<GitHubTeam>(
     `/orgs/${org}/teams/${name}`,
   )
   const patch: {
-    privacy?: "secret"
+    privacy?: TeamPrivacy
     notification_setting?: TeamNotificationSetting
   } = {}
-  if (existing.privacy !== "secret") patch.privacy = "secret"
+  if (existing.privacy !== privacy) patch.privacy = privacy
   // GitHub returns notification_setting only to org members, so an absent value
   // is "unknown, not read" — skip it rather than PATCH every reconcile. A
   // concrete value that differs is reconciled on purpose (a student team left
@@ -114,11 +160,12 @@ export async function ensureClassroomTeam(
   classroom: string,
 ): Promise<ClassroomTeamRef & { created: boolean }> {
   assertCanonicalTeamShortName(classroom)
-  return ensureSecretTeamByName(
+  return ensureTeamByName(
     client,
     org,
     classroomTeamSlug(classroom),
     "notifications_disabled",
+    STUDENT_TEAM_PRIVACY,
   )
 }
 
@@ -140,10 +187,24 @@ const CONFIG_REPO_PERMISSION: Partial<Record<StaffRole, "pull" | "push">> = {
   ta: "pull",
 }
 
-// Create (or adopt) the per-classroom STAFF team for `role`, a `secret` team
+// Create (or adopt) the per-classroom STAFF team for `role`, a `closed` team
 // named `classroom50-<classroom>-<role>`. Idempotent — safe as a preflight
-// before any role op.
+// before any role op. A newly minted team is exempted from the feedback-base
+// lock so its members can merge feedback PRs (best-effort).
 export async function ensureClassroomRoleTeam(
+  client: GitHubClient,
+  org: string,
+  classroom: string,
+  role: StaffRole,
+): Promise<ClassroomTeamRef & { created: boolean }> {
+  const team = await ensureRoleTeamRaw(client, org, classroom, role)
+  await exemptStaffTeams(client, org, [team.id])
+  return team
+}
+
+// ensureClassroomRoleTeam without the ruleset hook, so ensureStaffTeams can
+// exempt all three teams in one ruleset write.
+async function ensureRoleTeamRaw(
   client: GitHubClient,
   org: string,
   classroom: string,
@@ -152,11 +213,12 @@ export async function ensureClassroomRoleTeam(
   assertCanonicalTeamShortName(classroom)
   // Staff enable notifications so @mentions reach TAs/teachers (#335); the
   // student team stays disabled (see TeamNotificationSetting).
-  return ensureSecretTeamByName(
+  return ensureTeamByName(
     client,
     org,
     classroomTeamSlug(classroom, role),
     "notifications_enabled",
+    STAFF_TEAM_PRIVACY,
   )
 }
 
@@ -220,10 +282,18 @@ export async function ensureStaffTeams(
   const teams: StaffTeamRefs = {}
   const created: StaffRole[] = []
   for (const role of STAFF_ROLES) {
-    const team = await ensureClassroomRoleTeam(client, org, classroom, role)
+    const team = await ensureRoleTeamRaw(client, org, classroom, role)
     teams[role] = { id: team.id, slug: team.slug }
     if (team.created) created.push(role)
   }
+  // One idempotent ruleset pass for all three teams, created or adopted: this
+  // is how a classroom from an older release gets its staff onto the bypass
+  // list the first time a teacher opens it (the reconcile calls this).
+  await exemptStaffTeams(
+    client,
+    org,
+    STAFF_ROLES.flatMap((role) => teams[role]?.id ?? []),
+  )
   return { teams, created }
 }
 

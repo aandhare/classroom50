@@ -61,23 +61,30 @@ describe("ensureClassroomTeam / ensureClassroomRoleTeam create notification_sett
     await ensureClassroomTeam(client, "o", "cs101")
     const body = posts()[0]?.options?.body as {
       notification_setting?: string
+      privacy?: string
     }
     expect(body.notification_setting).toBe("notifications_disabled")
+    // The student team stays secret so students can't see each other's roster.
+    expect(body.privacy).toBe("secret")
   })
 
-  it("creates staff teams with notifications_enabled (teacher and ta)", async () => {
-    for (const role of ["teacher", "ta"] as const) {
+  it("creates staff teams with notifications_enabled (teacher, hta, ta)", async () => {
+    for (const role of ["teacher", "hta", "ta"] as const) {
       const { client, posts } = makeClient()
       await ensureClassroomRoleTeam(client, "o", "cs101", role)
       const body = posts()[0]?.options?.body as {
         notification_setting?: string
+        privacy?: string
       }
       expect(body.notification_setting).toBe("notifications_enabled")
+      // GitHub rejects a secret team as a ruleset bypass actor, so staff teams
+      // must be created closed for the feedback-base exemption to take.
+      expect(body.privacy).toBe("closed")
     }
   })
 })
 
-describe("adoptSecretTeamByName notification_setting reconcile", () => {
+describe("adoptTeamByName notification_setting reconcile", () => {
   it("PATCHes notification_setting when the existing value drifts", async () => {
     const { client, patches } = makeClient({
       id: 7,
@@ -110,9 +117,24 @@ describe("adoptSecretTeamByName notification_setting reconcile", () => {
     const { client, patches } = makeClient({
       id: 7,
       slug: "classroom50-cs101-teacher",
-      privacy: "secret",
+      // Staff teams are `closed`; already there, so nothing to reconcile.
+      privacy: "closed",
     })
     await ensureClassroomRoleTeam(client, "o", "cs101", "teacher")
     expect(patches()).toHaveLength(0)
+  })
+
+  it("PATCHes a secret staff team to closed on adopt", async () => {
+    // Teams from an older release were secret; GitHub refuses a secret team
+    // as a ruleset bypass actor, so adopt reconciles the visibility.
+    const { client, patches } = makeClient({
+      id: 7,
+      slug: "classroom50-cs101-teacher",
+      privacy: "secret",
+    })
+    await ensureClassroomRoleTeam(client, "o", "cs101", "teacher")
+    expect(patches().map((c) => c.options?.body)).toEqual([
+      { privacy: "closed" },
+    ])
   })
 })

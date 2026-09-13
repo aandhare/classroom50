@@ -742,7 +742,8 @@ func filterFeedbackPRAutogradeLines(tmpl string, autograded bool) string {
 }
 
 // StaffRole is a per-classroom staff role backing the web GUI's in-app roles.
-// Each maps to a `secret` GitHub team named `classroom50-<short>-<role>`.
+// Each maps to a `closed` GitHub team named `classroom50-<short>-<role>`
+// (visible to the org, as a ruleset bypass actor must be).
 // Mirrors web StaffRole (web/src/types/classroom.ts) and gh-teacher
 // configrepo.StaffRole — a cross-tool contract with no compile-time link.
 type StaffRole string
@@ -770,8 +771,8 @@ func ClassroomStudentTeamSlug(shortName string) string {
 }
 
 // StaffTeamSlug is the single source of a staff-role team slug
-// `classroom50-<short>-<role>`. Byte-mirrors web classroomTeamSlug(short, role)
-// and gh-teacher staffTeamName.
+// `classroom50-<short>-<role>`. Byte-mirrors web classroomTeamSlug(short, role);
+// gh-teacher configrepo.StaffTeamSlug delegates here.
 func StaffTeamSlug(shortName string, role StaffRole) string {
 	return ConfigRepoName + "-" + shortName + "-" + string(role)
 }

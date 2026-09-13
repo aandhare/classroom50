@@ -14,6 +14,13 @@ import type { GitHubClient } from "@/github-core/client"
 // setting. The fake client records write paths/methods so each case can assert
 // it hit the right GitHub endpoint.
 
+// An org with no classrooms: the config-repo listing is empty and nothing else
+// is read raw.
+const noClassroomsRequestRaw = (path: string) =>
+  path.includes("/classroom50/contents")
+    ? Promise.resolve("[]")
+    : Promise.reject(new Error("unexpected requestRaw"))
+
 type Recorded = { method: string; path: string }
 
 function httpError(status: number): GitHubAPIError {
@@ -53,6 +60,10 @@ function makeClient(configRepoBranch = "main"): {
       if (method === "GET" && path === "/repos/acme/classroom50") {
         return Promise.resolve({ default_branch: configRepoBranch })
       }
+      // The org team listing the ruleset repair resolves staff slugs against.
+      if (method === "GET" && path.startsWith("/orgs/acme/teams?")) {
+        return Promise.resolve([])
+      }
       if (method === "GET" && path.includes("/rulesets")) {
         return Promise.resolve([
           { id: 1, name: RULESET_NAME_SUBMISSION_HISTORY },
@@ -70,7 +81,7 @@ function makeClient(configRepoBranch = "main"): {
   return {
     client: {
       request: request as unknown as GitHubClient["request"],
-      requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+      requestRaw: noClassroomsRequestRaw,
       fetchArchive: () => Promise.reject(new Error("unexpected fetchArchive")),
     },
     calls,
@@ -102,7 +113,7 @@ describe("repairConcern", () => {
           allowed_actions: "all",
         })
       }) as unknown as GitHubClient["request"],
-      requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+      requestRaw: noClassroomsRequestRaw,
       fetchArchive: () => Promise.reject(new Error("unexpected fetchArchive")),
     }
     const result = await repairConcern(client, "acme", "orgActions", "team")
@@ -119,7 +130,7 @@ describe("repairConcern", () => {
           })
         return Promise.reject(httpError(403))
       }) as unknown as GitHubClient["request"],
-      requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+      requestRaw: noClassroomsRequestRaw,
       fetchArchive: () => Promise.reject(new Error("unexpected fetchArchive")),
     }
     const result = await repairConcern(client, "acme", "orgActions", "team")
@@ -151,7 +162,7 @@ describe("repairConcern", () => {
           })
         return Promise.reject(rateLimited)
       }) as unknown as GitHubClient["request"],
-      requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+      requestRaw: noClassroomsRequestRaw,
       fetchArchive: () => Promise.reject(new Error("unexpected fetchArchive")),
     }
     const result = await repairConcern(client, "acme", "orgActions", "team")
@@ -284,6 +295,16 @@ describe("repairConcern", () => {
     ).toHaveLength(2)
   })
 
+  it("rulesets: a failed staff-team read is transient, so Fix it stays offered", async () => {
+    const { client } = makeClient()
+    const failing: GitHubClient = {
+      ...client,
+      requestRaw: () => Promise.reject(httpError(500)),
+    }
+    const result = await repairConcern(failing, "acme", "rulesets", "team")
+    expect(result.unresolved?.transient).toBe(true)
+  })
+
   it("rulesets success returns no unresolved outcome", async () => {
     const { client } = makeClient()
     const result = await repairConcern(client, "acme", "rulesets", "team")
@@ -314,6 +335,28 @@ describe("repairConcern", () => {
     expect(result.unresolved).toBeDefined()
     expect(result.unresolved?.transient).toBe(false)
     expect(result.unresolved?.message).toBeTruthy()
+  })
+
+  it("rulesets: a 5xx on the ruleset write stays transient so one blip never pins the concern", async () => {
+    const request = vi
+      .fn()
+      .mockImplementation((path: string, options?: { method?: string }) => {
+        const method = options?.method ?? "GET"
+        if (method === "GET" && path.includes("/rulesets")) {
+          return Promise.resolve([])
+        }
+        if (method === "POST" && path.endsWith("/rulesets")) {
+          return Promise.reject(httpError(502))
+        }
+        return Promise.resolve({})
+      })
+    const client: GitHubClient = {
+      request: request as unknown as GitHubClient["request"],
+      requestRaw: () => Promise.reject(new Error("x")),
+      fetchArchive: () => Promise.reject(new Error("x")),
+    }
+    const result = await repairConcern(client, "acme", "rulesets", "team")
+    expect(result.unresolved?.transient).toBe(true)
   })
 
   it("every audit concern is repairable", () => {

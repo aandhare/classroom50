@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import {
   AlertIcon,
@@ -33,7 +33,12 @@ import type {
 } from "@/orgPolicy/audit"
 import { REPAIRABLE_CONCERNS } from "@/orgPolicy/repair"
 import type { RepairResult } from "@/orgPolicy/repair"
-import { mergeUnresolved, readUnresolved } from "@/orgPolicy/unresolvedStore"
+import {
+  forgetResolvedConcerns,
+  mergeUnresolved,
+  readUnresolved,
+  reconcileUnresolvedConcerns,
+} from "@/orgPolicy/unresolvedStore"
 import type { CheckState } from "@/github-core/orgChecks"
 import { sectionHighlightClass } from "@/hooks/useHashSectionHighlight"
 import SettingsSection from "./SettingsSection"
@@ -294,7 +299,7 @@ function AuditBody({
   fixingId: ConcernId | null
   fixingConfigBranch: boolean
   enterprisePinned: Set<string>
-  unresolvedConcerns: Map<ConcernId, string>
+  unresolvedConcerns: ReadonlyMap<ConcernId, string>
   onFix: (id: ConcernId) => void
   onRenameConfigRepo: () => void
 }) {
@@ -500,6 +505,28 @@ const OrgPolicyAuditPane = ({
     isError,
   } = useGetOrgAudit(org, planDetails?.plan?.name)
 
+  // A latched concern the audit now reports enforced is hidden and forgotten
+  // in storage (see reconcileUnresolvedConcerns). State is dropped too: the
+  // memo only hides an id while its verdict is enforced, so a later unreadable
+  // or unenforced audit would otherwise re-show the stale badge and hide Fix it.
+  const {
+    resolvedIds: resolvedConcernIds,
+    visible: visibleUnresolvedConcerns,
+  } = useMemo(
+    () =>
+      reconcileUnresolvedConcerns(unresolvedConcerns, report?.concerns ?? []),
+    [report, unresolvedConcerns],
+  )
+  useEffect(() => {
+    if (resolvedConcernIds.length === 0) return
+    forgetResolvedConcerns(org, resolvedConcernIds)
+    setUnresolvedConcerns((prev) => {
+      const next = new Map(prev)
+      for (const id of resolvedConcernIds) next.delete(id)
+      return next
+    })
+  }, [org, resolvedConcernIds])
+
   // Persist the classified Fix-it outcome to the per-org store — a DURABLE
   // write, so it runs in the hook's onSuccess (via onRepaired below), NOT the
   // call site, to survive a mid-repair unmount.
@@ -617,7 +644,7 @@ const OrgPolicyAuditPane = ({
           fixingId={fixingId}
           fixingConfigBranch={renameMutation.isPending}
           enterprisePinned={enterprisePinned}
-          unresolvedConcerns={unresolvedConcerns}
+          unresolvedConcerns={visibleUnresolvedConcerns}
           onFix={(id) => {
             if (!fixMutation.isPending)
               void runFix(() =>

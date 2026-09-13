@@ -16,7 +16,10 @@ import {
 } from "@/github-core/mutations"
 import { repairOrgDefaults } from "@/github-core/orgChecks"
 import { CONFIG_REPO } from "@/util/configRepo"
-import { repairRulesets } from "@/github-core/rulesets"
+import {
+  collectBypassStaffTeamIds,
+  repairRulesets,
+} from "@/github-core/rulesets"
 import type { ConcernId } from "./audit"
 
 // Whether a concern can be repaired by an API call. The four manual-only
@@ -131,13 +134,21 @@ export async function repairConcern(
       await ensurePages(client, org, CONFIG_REPO)
       return { unfixableFields: [] }
     case "rulesets": {
-      const result = await repairRulesets(client, org)
+      const result = await repairRulesets(
+        client,
+        org,
+        await collectBypassStaffTeamIds(client, org),
+      )
       if (result.status === "warning") {
-        // Can't distinguish a policy block from a validation error, so
-        // non-transient but cause-neutral.
+        // repairRulesets classifies: a failed read, or a write GitHub refused
+        // with a rate limit or 5xx, succeeds on retry, so the UI keeps
+        // offering Fix it. A 403/422 is a policy block and pins the concern.
         return {
           unfixableFields: [],
-          unresolved: { message: result.message, transient: false },
+          unresolved: {
+            message: result.message,
+            transient: result.transient === true,
+          },
         }
       }
       return { unfixableFields: [] }

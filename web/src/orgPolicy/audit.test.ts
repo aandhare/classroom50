@@ -14,6 +14,13 @@ import type { GitHubClient } from "@/github-core/client"
 // The GUI is stricter than the CLI: ANY drift (critical or not) fails; a read
 // failure fails; all enforced is ok. The 4 manual items never fail.
 
+// An org with no classrooms: the config-repo listing is empty and nothing else
+// is read raw.
+const noClassroomsRequestRaw = (path: string) =>
+  path.includes("/classroom50/contents")
+    ? Promise.resolve("[]")
+    : Promise.reject(new Error("unexpected requestRaw"))
+
 function httpError(status: number): GitHubAPIError {
   return new GitHubAPIError({
     status,
@@ -83,6 +90,8 @@ function makeClient(overrides: Routes = {}): GitHubClient {
           },
         )
       }
+      // The org team listing the ruleset audit resolves staff slugs against.
+      if (path.startsWith("/orgs/acme/teams?")) return ok([])
       if (path.includes("/actions/permissions/repositories"))
         return ok({
           total_count: 1,
@@ -108,6 +117,18 @@ function makeClient(overrides: Routes = {}): GitHubClient {
         return ok({ access_level: "organization" })
       if (path.includes("/pages"))
         return ok({ build_type: "workflow", public: true })
+      if (/\/rulesets\/\d+$/.test(path))
+        return ok({
+          id: 2,
+          name: RULESET_NAME_FEEDBACK_BASE,
+          bypass_actors: [
+            {
+              actor_id: 1,
+              actor_type: "OrganizationAdmin",
+              bypass_mode: "exempt",
+            },
+          ],
+        })
       if (path.includes("/rulesets"))
         return ok([
           { id: 1, name: RULESET_NAME_SUBMISSION_HISTORY },
@@ -115,7 +136,7 @@ function makeClient(overrides: Routes = {}): GitHubClient {
         ])
       return Promise.reject(new Error(`unexpected: ${path}`)) as Promise<T>
     },
-    requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+    requestRaw: noClassroomsRequestRaw,
     fetchArchive: () => Promise.reject(new Error("unexpected fetchArchive")),
   }
 }
@@ -247,7 +268,7 @@ describe("buildOrgAuditReport", () => {
             ])
           return Promise.reject(new Error(`unexpected: ${path}`)) as Promise<T>
         },
-        requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+        requestRaw: noClassroomsRequestRaw,
         fetchArchive: () =>
           Promise.reject(new Error("unexpected fetchArchive")),
       },
@@ -426,7 +447,7 @@ describe("buildOrgAuditReport", () => {
             ])
           return Promise.reject(new Error(`unexpected: ${path}`)) as Promise<T>
         },
-        requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+        requestRaw: noClassroomsRequestRaw,
         fetchArchive: () =>
           Promise.reject(new Error("unexpected fetchArchive")),
       },
@@ -472,7 +493,7 @@ describe("buildOrgAuditReport", () => {
             ])
           return Promise.reject(new Error(`unexpected: ${path}`)) as Promise<T>
         },
-        requestRaw: () => Promise.reject(new Error("unexpected requestRaw")),
+        requestRaw: noClassroomsRequestRaw,
         fetchArchive: () =>
           Promise.reject(new Error("unexpected fetchArchive")),
       },

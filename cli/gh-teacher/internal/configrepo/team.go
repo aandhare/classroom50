@@ -3,6 +3,7 @@ package configrepo
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,8 +40,9 @@ type TeamRef struct {
 }
 
 // StaffRole is a per-classroom staff role backing the web GUI's in-app
-// roles. Each maps to a `secret` GitHub team named
-// `classroom50-<short>-<role>` granted write on the classroom50 repository.
+// roles. Each maps to a `closed` GitHub team named
+// `classroom50-<short>-<role>` (see StaffTeamPrivacy) granted access to the
+// classroom50 repository.
 type StaffRole string
 
 const (
@@ -62,50 +64,44 @@ const (
 )
 
 // StaffTeamRepoPermissions maps a staff role to the repo permission a staff
-// team gets on each student assignment repo and on private in-org templates.
-// The head-TA/TA-team template read is applied at TWO points: eagerly at
-// assignment add/reuse (see grantStaffTeamTemplateRead), and again as an
-// idempotent re-affirm at collect-scores. The eager sites use this map only
-// as a presence gate and hardcode read
-// (GrantTeamRepoRead); collect-scores reads the value. Source of truth for the
-// collector's hand-mirrored STAFF_TEAM_PERMISSIONS (collect_scores.py) — keep in
-// lockstep.
+// team gets on each student assignment repo, granted at collect-scores. Both
+// non-owner staff roles get push: merging the Feedback PR needs write on the
+// repo, and the feedback-base ruleset exempts every staff team from its lock.
+// Source of truth for the collector's hand-mirrored STAFF_TEAM_PERMISSIONS
+// (collect_scores.py) — keep in lockstep.
 //
-// A role absent from this map is granted nothing here. The teacher team is
-// omitted (its members are org owners with repo access via ownership); head-TA
-// and TA are plain members that need an explicit read grant.
-// Adding a future non-read staff permission is a one-line addition here and in
-// the mirror, but would also need the eager sites to consume the value instead
-// of hardcoding read.
+// Private in-org templates are a separate, read-only grant (TemplateReadStaffRoles
+// below; TEMPLATE_STAFF_PERMISSION in the collector). A role absent from this
+// map is granted nothing here. The teacher team is omitted (its members are
+// org owners with repo access via ownership).
 var StaffTeamRepoPermissions = map[StaffRole]string{
-	RoleHeadTA: "pull",
-	RoleTA:     "pull",
+	RoleHeadTA: "push",
+	RoleTA:     "push",
 }
 
 // TemplateReadStaffRoles is the ordered set of non-owner staff roles that get an
 // eager read grant on a private in-org template (head-TA, then TA; teacher
-// omitted per StaffTeamRepoPermissions above). Single-sources the loop in
+// omitted, as in StaffTeamRepoPermissions). Single-sources the loop in
 // grantStaffTeamTemplateRead (reuse.go) so a future non-owner staff role is
-// one line here. Still presence-gated against
-// StaffTeamRepoPermissions at each call site.
+// one line here.
 var TemplateReadStaffRoles = []StaffRole{RoleHeadTA, RoleTA}
 
 // ConfigRepoPermission is the permission a staff role's team gets on the org's
 // `classroom50` config repo. Teacher and the head-TA can author assignments →
 // `push`; a plain TA is read-only → `pull`.
 // This is a SEPARATE axis from StaffTeamRepoPermissions above, which governs
-// student assignment repos and private templates. A role absent here is granted
-// nothing on the classroom50 repository.
+// student assignment repos. A role absent here is granted nothing on the
+// classroom50 repository.
 var ConfigRepoPermission = map[StaffRole]string{
 	RoleTeacher: "push",
 	RoleHeadTA:  "push",
 	RoleTA:      "pull",
 }
 
-// staffTeamName derives the staff-role team name: `classroom50-<short>-<role>`.
-// Mirrors the web's classroomTeamSlug(short, role). The short-name is canonical, so slug == name.
-func staffTeamName(shortName string, role StaffRole) string {
-	return "classroom50-" + shortName + "-" + string(role)
+// StaffTeamSlug is the staff-role team name `classroom50-<short>-<role>`; the
+// short-name is canonical, so slug == name.
+func StaffTeamSlug(shortName string, role StaffRole) string {
+	return contract.StaffTeamSlug(shortName, contract.StaffRole(role))
 }
 
 // StaffTeamsRef holds the per-classroom staff team refs the web GUI persists
@@ -212,11 +208,22 @@ func EnsureClassroomTeam(client githubapi.Client, org, shortName, description st
 	if !CanonicalTeamSlugShortName(shortName) {
 		return TeamRef{}, fmt.Errorf("classroom short-name %q can't back a GitHub team: remove consecutive or trailing hyphens (GitHub would rewrite the team slug, breaking membership and template grants)", shortName)
 	}
-	return ensureSecretTeamByName(client, org, classroomTeamName(shortName), description, notificationsDisabled)
+	return ensureTeamByName(client, org, classroomTeamName(shortName), description, notificationsDisabled, studentTeamPrivacy)
 }
 
+// Team privacy per kind. The student team is `secret`: its description carries
+// the capability secret and its membership is the roster, neither of which
+// other org members may read. Staff teams are `closed` (visible to org
+// members) because GitHub refuses a secret team as an org ruleset bypass
+// actor, and the feedback-base lock exempts every staff team so staff can
+// merge Feedback PRs. Mirrored by the web's STAFF_TEAM_PRIVACY.
+const (
+	studentTeamPrivacy = "secret"
+	StaffTeamPrivacy   = "closed"
+)
+
 // EnsureClassroomStaffTeam creates (or adopts) the per-classroom STAFF team for
-// `role` — a `secret` team `classroom50-<short>-<role>`. Mirrors the web's
+// `role` — a `closed` team `classroom50-<short>-<role>`. Mirrors the web's
 // ensureClassroomRoleTeam. Idempotent; safe as a preflight before any staff op.
 // Staff teams create `notificationsEnabled` so @mentions reach TAs/teachers
 // (#335).
@@ -226,7 +233,7 @@ func EnsureClassroomStaffTeam(client githubapi.Client, org, shortName string, ro
 	}
 	// Staff teams carry no bootstrap description: staff read the authoritative
 	// classroom.json directly, and the secret belongs only on the student team.
-	return ensureSecretTeamByName(client, org, staffTeamName(shortName, role), "", notificationsEnabled)
+	return ensureTeamByName(client, org, StaffTeamSlug(shortName, role), "", notificationsEnabled, StaffTeamPrivacy)
 }
 
 // EnsureStaffTeams creates (or adopts) all staff teams (teacher, hta, ta) and
@@ -352,7 +359,7 @@ func ReconcileClassroomTeamDescription(client githubapi.Client, org, shortName, 
 	return true, nil
 }
 
-// ensureSecretTeamByName creates a `secret` GitHub team named `name`,
+// ensureTeamByName creates a GitHub team named `name` at `privacy`,
 // adopting an existing team of the same name rather than failing. `name` is a
 // canonical short-name-derived value, so its slug equals the name. A non-empty
 // `description` is written on create AND reconciled on adopt so a rotated
@@ -360,10 +367,10 @@ func ReconcileClassroomTeamDescription(client githubapi.Client, org, shortName, 
 //
 // The org's `members_can_create_teams` setting is irrelevant here — the
 // teacher authenticates as an org owner.
-func ensureSecretTeamByName(client githubapi.Client, org, name, description, notificationSetting string) (TeamRef, error) {
+func ensureTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string) (TeamRef, error) {
 	teamBody := map[string]any{
 		"name":                 name,
-		"privacy":              "secret",
+		"privacy":              privacy,
 		"notification_setting": notificationSetting,
 	}
 	if description != "" {
@@ -380,7 +387,7 @@ func ensureSecretTeamByName(client githubapi.Client, org, name, description, not
 		// re-run reconciles. If the adopt read 404s, the 422 wasn't a name
 		// collision — surface the original create error.
 		if cliutil.IsHTTPStatus(err, http.StatusUnprocessableEntity) {
-			adopted, adoptErr := adoptSecretTeamByName(client, org, name, description, notificationSetting)
+			adopted, adoptErr := adoptTeamByName(client, org, name, description, notificationSetting, privacy)
 			if adoptErr != nil {
 				if cliutil.IsHTTPStatus(adoptErr, http.StatusNotFound) {
 					return TeamRef{}, fmt.Errorf("POST %s: %w", createPath, err)
@@ -394,11 +401,11 @@ func ensureSecretTeamByName(client githubapi.Client, org, name, description, not
 	return created, nil
 }
 
-// adoptSecretTeamByName reads an existing team by slug (== name, given the
+// adoptTeamByName reads an existing team by slug (== name, given the
 // canonical short-name guard) and reconciles drift toward the desired state:
-// privacy `secret`, the notification setting, and (when non-empty and differing)
+// the privacy, the notification setting, and (when non-empty and differing)
 // the description. Used on the 422 already-exists path.
-func adoptSecretTeamByName(client githubapi.Client, org, name, description, notificationSetting string) (TeamRef, error) {
+func adoptTeamByName(client githubapi.Client, org, name, description, notificationSetting, privacy string) (TeamRef, error) {
 	slug := name
 	getPath := fmt.Sprintf("orgs/%s/teams/%s", url.PathEscape(org), url.PathEscape(slug))
 	var existing struct {
@@ -417,13 +424,13 @@ func adoptSecretTeamByName(client githubapi.Client, org, name, description, noti
 	// not read" — skip it rather than force a PATCH every reconcile. A concrete
 	// value that differs is reconciled on purpose (e.g., a student team left
 	// enabled gets disabled — #335).
-	needPrivacy := existing.Privacy != "secret"
+	needPrivacy := existing.Privacy != privacy
 	needNotification := existing.NotificationSetting != "" && existing.NotificationSetting != notificationSetting
 	needDescription := description != "" && existing.Description != description
 	if needPrivacy || needNotification || needDescription {
 		patch := map[string]any{}
 		if needPrivacy {
-			patch["privacy"] = "secret"
+			patch["privacy"] = privacy
 		}
 		if needNotification {
 			patch["notification_setting"] = notificationSetting
@@ -444,6 +451,134 @@ func adoptSecretTeamByName(client githubapi.Client, org, name, description, noti
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
 	return TeamRef{ID: existing.ID, Slug: existing.Slug}, nil
+}
+
+// SetTeamPrivacy PATCHes a team's visibility.
+func SetTeamPrivacy(client githubapi.Client, org, slug, privacy string) error {
+	body, err := json.Marshal(map[string]any{"privacy": privacy})
+	if err != nil {
+		return fmt.Errorf("encode team patch: %w", err)
+	}
+	path := fmt.Sprintf("orgs/%s/teams/%s", url.PathEscape(org), url.PathEscape(slug))
+	resp, err := client.Request(http.MethodPatch, path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("PATCH %s (set team privacy): %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// OrgTeam is the slice of GitHub's team object the org-wide listing readers
+// need.
+type OrgTeam struct {
+	ID      int64  `json:"id"`
+	Slug    string `json:"slug"`
+	Privacy string `json:"privacy"`
+}
+
+// ListOrgTeams returns every team in the org keyed by slug, in one paginated
+// read. An org owner sees secret teams too, so the map is complete for the
+// callers that run as one (init, org audit). A read failure propagates.
+func ListOrgTeams(client githubapi.Client, org string) (map[string]OrgTeam, error) {
+	teams, err := githubapi.PaginateAll[OrgTeam](
+		client, githubapi.ListPerPage, githubapi.ListMaxPages,
+		func(page int) string {
+			return fmt.Sprintf("orgs/%s/teams?per_page=%d&page=%d",
+				url.PathEscape(org), githubapi.ListPerPage, page)
+		},
+		func(path string, err error) error {
+			return fmt.Errorf("GET %s: %w", path, err)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	bySlug := make(map[string]OrgTeam, len(teams))
+	for _, t := range teams {
+		bySlug[t.Slug] = t
+	}
+	return bySlug, nil
+}
+
+// StaffTeamSlugs are the canonical staff team slugs for a classroom, in role
+// order. The slug, not classroom.json, is what identifies a classroom's staff
+// team to GitHub: a team a web role flow created without recording it is still
+// found, and a classroom.json edit can't point at another team.
+func StaffTeamSlugs(shortName string) []string {
+	slugs := make([]string, 0, len(StaffRoles))
+	for _, role := range StaffRoles {
+		slugs = append(slugs, StaffTeamSlug(shortName, role))
+	}
+	return slugs
+}
+
+// StaffRoleRefs pairs each recorded staff team ref with its role, in role
+// order, skipping absent slots.
+func (r *StaffTeamsRef) StaffRoleRefs() []StaffRoleRef {
+	if r == nil {
+		return nil
+	}
+	var out []StaffRoleRef
+	for _, role := range StaffRoles {
+		if ref := r.RefForRole(role); ref != nil {
+			out = append(out, StaffRoleRef{Role: role, Ref: *ref})
+		}
+	}
+	return out
+}
+
+// StaffRoleRef is one classroom.json `teams.<role>` entry with its role.
+type StaffRoleRef struct {
+	Role StaffRole
+	Ref  TeamRef
+}
+
+// IsCanonicalStaffTeamRef reports whether a classroom.json `teams.<role>` ref
+// names the team Classroom 50 itself would create for that classroom and
+// role. classroom.json is writable by head TAs, and these refs steer
+// owner-run writes (team visibility, ruleset bypass, repo grants), so any
+// other slug (the student team, an invite team, a typo) is refused.
+func IsCanonicalStaffTeamRef(shortName string, role StaffRole, ref *TeamRef) bool {
+	return ref != nil && ref.ID > 0 && ref.Slug == StaffTeamSlug(shortName, role)
+}
+
+// WalkClassrooms calls fn for every classroom directory in the config repo
+// that holds a readable classroom.json. A missing config repo (fresh org) is a
+// clean no-op. A per-classroom read failure is reported through onError
+// (nil to ignore) and the walk continues, so one bad file never hides the
+// rest; any listing failure propagates.
+func WalkClassrooms(client githubapi.Client, org string, onError func(shortName string, err error), fn func(shortName string, c *ClassroomJSON)) error {
+	branch, err := ResolveConfigRepoBranch(client, org)
+	if err != nil {
+		if errors.Is(err, ErrConfigRepoMissing) {
+			return nil
+		}
+		return err
+	}
+	entries, _, err := ListDirContents(client, org, ConfigRepoName, "", branch)
+	if err != nil {
+		if cliutil.IsHTTPStatus(err, http.StatusNotFound) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.Type != "dir" {
+			continue
+		}
+		c, ok, err := LoadClassroom(client, org, e.Name, branch)
+		if err != nil {
+			if onError != nil {
+				onError(e.Name, err)
+			}
+			continue
+		}
+		if ok {
+			fn(e.Name, c)
+		}
+	}
+	return nil
 }
 
 // IsDeletableClassroomTeamRef reports whether a persisted team ref is safe to

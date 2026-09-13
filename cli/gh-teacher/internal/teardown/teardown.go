@@ -20,6 +20,7 @@ import (
 	"github.com/foundation50/gh-teacher/internal/configrepo"
 	"github.com/foundation50/gh-teacher/internal/githubapi"
 	"github.com/foundation50/gh-teacher/internal/orgrepos"
+	"github.com/foundation50/gh-teacher/internal/orgrules"
 )
 
 // NewCmd implements `gh teacher teardown <org>`: deletes every repo in an org
@@ -170,7 +171,9 @@ func runTeardown(client githubapi.Client, in io.Reader, out, errOut io.Writer, o
 	// marker was preserved: the refs were captured up-front, DeleteClassroomTeam
 	// is idempotent, and a re-run harmlessly no-ops. Sweeping now avoids
 	// stranding write-granted staff teams when a stuck repo blocks a clean
-	// re-run.
+	// re-run. The feedback-base ruleset outlives teardown, so drop the teams
+	// from its bypass list first rather than leave it pointing at deleted ones.
+	orgrules.RevokeStaffTeams(client, errOut, org, teams)
 	for _, t := range teams {
 		if err := configrepo.DeleteClassroomTeam(client, org, t); err != nil {
 			_, _ = fmt.Fprintf(errOut, "Warning: %s: could not delete classroom team %q (%v); delete it by hand at https://github.com/orgs/%s/teams if it lingers.\n",
@@ -249,16 +252,6 @@ func sweepGroupTeams(client githubapi.Client, org string, classrooms []string, o
 // with the classroom short-names (the group-team sweep's scope).
 // Best-effort — a read failure is warned and skipped. Deduped by slug.
 func collectClassroomTeams(client githubapi.Client, org string, errOut io.Writer) (teams []configrepo.TeamRef, classrooms []string) {
-	branch, err := configrepo.ResolveConfigRepoBranch(client, org)
-	if err != nil {
-		_, _ = fmt.Fprintf(errOut, "Warning: %s: could not resolve the classroom50 repository branch to sweep classroom teams (%v); delete any lingering classroom50-* teams by hand.\n", org, err)
-		return nil, nil
-	}
-	entries, _, err := configrepo.ListDirContents(client, org, configrepo.ConfigRepoName, "", branch)
-	if err != nil {
-		_, _ = fmt.Fprintf(errOut, "Warning: %s: could not list classrooms to sweep their teams (%v); delete any lingering classroom50-* teams by hand.\n", org, err)
-		return nil, nil
-	}
 	bySlug := map[string]configrepo.TeamRef{}
 	add := func(t *configrepo.TeamRef) {
 		// Filter through the same fail-closed predicate the delete uses
@@ -268,21 +261,20 @@ func collectClassroomTeams(client githubapi.Client, org string, errOut io.Writer
 			bySlug[t.Slug] = *t
 		}
 	}
-	for _, e := range entries {
-		if e.Type != "dir" {
-			continue
-		}
-		c, ok, err := configrepo.LoadClassroom(client, org, e.Name, branch)
-		if err != nil || !ok {
-			continue
-		}
-		classrooms = append(classrooms, e.Name)
+	err := configrepo.WalkClassrooms(client, org, nil, func(shortName string, c *configrepo.ClassroomJSON) {
+		classrooms = append(classrooms, shortName)
 		add(c.Team)
-		if c.Teams != nil {
-			add(c.Teams.Teacher)
-			add(c.Teams.HeadTA)
-			add(c.Teams.TA)
+		// Staff refs are head-TA writable and drive an owner-run revoke +
+		// delete, so only the team Classroom 50 created for that role counts.
+		for _, rr := range c.Teams.StaffRoleRefs() {
+			if configrepo.IsCanonicalStaffTeamRef(shortName, rr.Role, &rr.Ref) {
+				add(&rr.Ref)
+			}
 		}
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(errOut, "Warning: %s: could not list classrooms to sweep their teams (%v); delete any lingering classroom50-* teams by hand.\n", org, err)
+		return nil, nil
 	}
 	teams = make([]configrepo.TeamRef, 0, len(bySlug))
 	for _, t := range bySlug {

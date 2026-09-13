@@ -174,18 +174,19 @@ func TestSkeletonFiles_AutogradeRunner(t *testing.T) {
 
 	// Cross-binary literal parity: the `feedback` base-branch name now
 	// lives in ensure_feedback_pr.py (BASE_BRANCH), fetched from Pages by
-	// the Feedback PR step. It must match the Go `feedbackBaseBranch` const
-	// that the org ruleset targets — a drift would point the runner and the
-	// ruleset at different branches, silently breaking the frozen-base lock.
+	// the Feedback PR step. It must match contract.FeedbackBaseBranch, the
+	// branch the org ruleset (internal/orgrules) targets — a drift would point
+	// the runner and the ruleset at different branches, silently breaking the
+	// frozen-base lock.
 	// This is the enforced single-source the "keep in lockstep" comment asks
 	// for (Phase 1; moved to the script in Phase 2).
 	fbScript, ok := files[".github/scripts/ensure_feedback_pr.py"]
 	if !ok {
 		t.Fatal("ensure_feedback_pr.py missing from skeleton")
 	}
-	wantBaseBranch := "BASE_BRANCH = \"" + feedbackBaseBranch + "\""
+	wantBaseBranch := "BASE_BRANCH = \"" + contract.FeedbackBaseBranch + "\""
 	if !strings.Contains(fbScript, wantBaseBranch) {
-		t.Errorf("ensure_feedback_pr.py does not pin %s (feedbackBaseBranch drift vs the org ruleset)", wantBaseBranch)
+		t.Errorf("ensure_feedback_pr.py does not pin %s (FeedbackBaseBranch drift vs the org ruleset)", wantBaseBranch)
 	}
 
 	// F1: the grade job must pass MODE through to runner.py so a group
@@ -1301,15 +1302,14 @@ func TestFeedbackPRParity_GoVsPython(t *testing.T) {
 
 // TestStaffPermsParity_GoVsInlinePython pins the Go->Python leg of the
 // staff-team repo-permission mirror. configrepo.StaffTeamRepoPermissions (the
-// student-assignment-repo / private-template axis) is the source of truth;
-// collect_scores.py hand-mirrors it as STAFF_TEAM_PERMISSIONS with no
-// compile-time link, so a role added on only one side would otherwise pass CI
-// while the collector silently grants the wrong set. The non-owner staff roles
-// (head-TA and TA) map to `pull` here; the teacher role is absent
-// (owners get repo access via ownership). Note this template-repo axis is
-// SEPARATE from configrepo.ConfigRepoPermission (config-repo write), which the
-// collector does not manage. Assert every Go entry appears verbatim as a Python
-// dict literal in the embedded script.
+// student-assignment-repo axis) is the source of truth; collect_scores.py
+// hand-mirrors it as STAFF_TEAM_PERMISSIONS with no compile-time link, so a
+// role added on only one side would otherwise pass CI while the collector
+// silently grants the wrong set. Head-TA and TA both map to `push`; the
+// teacher role is absent (owners get repo access via ownership). Note this
+// axis is SEPARATE from configrepo.ConfigRepoPermission (config-repo write),
+// which the collector does not manage. Assert every Go entry appears verbatim
+// as a Python dict literal in the embedded script.
 func TestStaffPermsParity_GoVsInlinePython(t *testing.T) {
 	files, err := skeletonFiles("main")
 	if err != nil {
@@ -1323,7 +1323,7 @@ func TestStaffPermsParity_GoVsInlinePython(t *testing.T) {
 		t.Fatal("configrepo.StaffTeamRepoPermissions is empty; the parity check would be vacuous")
 	}
 	for role, perm := range configrepo.StaffTeamRepoPermissions {
-		// The Python literal is `"ta": "pull"` (double-quoted, per the mirror
+		// The Python literal is `"ta": "push"` (double-quoted, per the mirror
 		// in collect_scores.py). A Go-side role/perm change that isn't mirrored
 		// drops its literal from the script and fails here.
 		want := fmt.Sprintf("%q: %q", string(role), perm)

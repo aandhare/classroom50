@@ -12,6 +12,7 @@ import (
 	"github.com/foundation50/gh-teacher/internal/configrepo"
 	"github.com/foundation50/gh-teacher/internal/githubapi"
 	"github.com/foundation50/gh-teacher/internal/orgpolicy"
+	"github.com/foundation50/gh-teacher/internal/orgrules"
 	"github.com/foundation50/gh-teacher/internal/ui"
 )
 
@@ -66,7 +67,7 @@ func initCmd() *cobra.Command {
 			"    write pushes submit/* tags; Actions write re-runs autograde\n" +
 			"    workflows when regrading; Workflows write lets regrade tag a\n" +
 			"    commit pushed before a submission-mode change; Administration\n" +
-			"    write lets collection grant staff teams read access to student\n" +
+			"    write lets collection grant staff teams access to student\n" +
 			"    repos; Members read lists the classroom team (collection is\n" +
 			"    team-driven).\n" +
 			"  - init validates the token before storing it. A re-run leaves an\n" +
@@ -237,9 +238,11 @@ func initCmd() *cobra.Command {
 
 			// Install the org-level rulesets protecting submission history and
 			// the Feedback PR base. Org-level so they auto-cover every
-			// current/future student repo; warn-and-continue if blocked.
+			// current/future student repo; warn-and-continue if blocked. The
+			// feedback-base bypass list is rebuilt from every classroom's
+			// staff teams, so a re-run also repairs a list that drifted.
 			step(initStepLabels[4])
-			rulesetsReady, err := ensureClassroomRulesets(client, stepOut, stepErr, org)
+			rulesetsReady, feedbackKept, err := orgrules.Reconcile(client, stepOut, stepErr, org)
 			if err != nil {
 				prog.Abort()
 				return err
@@ -326,6 +329,11 @@ func initCmd() *cobra.Command {
 				}
 				summary.addWarning("%s: Feedback PR prerequisites are incomplete: %s could not be applied. Assignments created with `--feedback-pr` may not open PRs or may leave submissions unprotected until you apply these at https://github.com/organizations/%s/settings, then re-run `gh teacher init`.",
 					org, strings.Join(missing, " and "), org)
+			}
+			if feedbackKept {
+				// Not a failure to apply: the lock is in place with whatever
+				// staff teams it already had. The step's warnings say why.
+				summary.addNote("%s: the feedback-base ruleset was left unchanged because the classroom staff teams could not be read. Re-run `gh teacher init` once the classroom50 repository is readable to refresh which staff can merge feedback PRs.", org)
 			}
 
 			// Pages takes a few seconds after the first publish-pages run

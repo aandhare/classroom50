@@ -17,7 +17,7 @@ import {
   RECOMMENDED_ORG_DEFAULT_BRANCH,
   type CheckVerdict,
 } from "@/github-core/orgChecks"
-import { checkRulesets } from "@/github-core/rulesets"
+import { auditRulesets } from "@/github-core/rulesets"
 import { CONFIG_REPO } from "@/util/configRepo"
 import {
   manualHardeningSteps,
@@ -185,7 +185,7 @@ export async function buildOrgAuditReport(
     checkWorkflowPermissions(client, org),
     checkReusableWorkflowAccess(client, org),
     checkPages(client, org),
-    checkRulesets(client, org),
+    auditRulesets(client, org),
     checkOrgDefaultBranch(client, org),
     checkConfigRepoDefaultBranch(client, org),
   ])

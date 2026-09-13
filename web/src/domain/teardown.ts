@@ -7,21 +7,17 @@
 // lists exactly what will be deleted.
 
 import type { GitHubClient } from "@/github-core/client"
-import { getClassroomJson } from "@/github-core/configRepoReads"
+import { forEachClassroom } from "@/github-core/configRepoReads"
 import { GitHubAPIError } from "@/github-core/errors"
 import {
   deleteClassroomTeam,
   deleteRepo,
-  isDeletableClassroomTeamRef,
+  ownedClassroomTeamRefs,
   type ClassroomTeamRef,
 } from "@/github-core/mutations"
-import {
-  getOrgRepos,
-  listClassroomDirs,
-  REPO_READ_CONCURRENCY,
-  sleep,
-} from "@/github-core/queries"
+import { getOrgRepos, sleep } from "@/github-core/queries"
 import { getRepo } from "@/github-core/repoReads"
+import { revokeStaffTeams } from "@/github-core/rulesets"
 import { CONFIG_REPO } from "@/util/configRepo"
 import { mapWithConcurrency } from "@/util/concurrency"
 import { DELETE_REPO_SCOPE } from "@/auth/constants"
@@ -149,49 +145,30 @@ async function collectClassroomTeams(
   client: GitHubClient,
   org: string,
 ): Promise<ClassroomTeamRef[]> {
-  let dirs: { name: string }[]
-  try {
-    dirs = await listClassroomDirs(client, org)
-  } catch {
-    log.debug(
-      "teardown: no readable classroom dirs, skipping team collection",
-      {
-        org,
-      },
-    )
-    // No readable classroom dirs (e.g., marker already partially gone) — nothing
-    // to resolve; let the repo flow proceed.
-    return []
-  }
-
   const bySlug = new Map<string, ClassroomTeamRef>()
-  await mapWithConcurrency(dirs, REPO_READ_CONCURRENCY, async (dir) => {
-    try {
-      const json = await getClassroomJson(client, { org, classroom: dir.name })
-      // classroom.json is anyone-with-config-repo-write authored and parsed
-      // without schema validation, so its team refs are untrusted input to a
-      // destructive bulk DELETE. Only queue refs the app owns and can safely
-      // delete — see isDeletableClassroomTeamRef.
-      const candidates = [
-        json.team,
-        json.teams?.teacher,
-        json.teams?.hta,
-        json.teams?.ta,
-      ]
-      for (const team of candidates) {
-        if (isDeletableClassroomTeamRef(team)) {
-          bySlug.set(team.slug, { id: team.id, slug: team.slug })
-        }
-      }
-    } catch {
+  await forEachClassroom(
+    client,
+    org,
+    // Best-effort: a classroom whose classroom.json can't be read contributes
+    // nothing, and an unlistable config repo (marker partially gone) lets the
+    // repo flow proceed with no teams to sweep.
+    (classroom, err) => {
       log.debug("teardown: classroom.json unreadable, no team ref", {
         org,
-        classroom: dir.name,
+        classroom,
+        err,
       })
-      // Missing/unreadable classroom.json or no team block: contributes nothing.
-    }
-  })
-
+    },
+    (classroom, json) => {
+      // classroom.json is anyone-with-config-repo-write authored and parsed
+      // without schema validation, so its team refs are untrusted input to a
+      // destructive bulk DELETE. Only queue the teams the app itself created
+      // for this classroom — see isOwnedClassroomTeamRef.
+      for (const team of ownedClassroomTeamRefs(classroom, json)) {
+        bySlug.set(team.slug, team)
+      }
+    },
+  )
   return [...bySlug.values()]
 }
 
@@ -359,6 +336,14 @@ async function deleteClassroomTeams(
   const teamsDeleted: string[] = []
   const teamsFailed: string[] = []
   let teamsRecoverable = false
+
+  // The feedback-base ruleset outlives teardown; drop the teams from its
+  // bypass list rather than leave it pointing at deleted ones.
+  await revokeStaffTeams(
+    client,
+    org,
+    teams.map((t) => t.id),
+  )
 
   await mapWithConcurrency(teams, 4, async (team) => {
     const outcome = await deleteClassroomTeamWithRetry(client, org, team)

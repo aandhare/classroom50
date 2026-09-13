@@ -11,6 +11,7 @@ import (
 
 	"github.com/foundation50/gh-teacher/internal/configrepo"
 	"github.com/foundation50/gh-teacher/internal/githubtest"
+	"github.com/foundation50/gh-teacher/internal/orgrules"
 )
 
 // staffMock serves the minimal <org>/classroom50 surface the staff
@@ -26,6 +27,7 @@ type staffMock struct {
 	teamsCreated  []string          // team names POSTed to /orgs/o/teams
 	grantedRepo   map[string]string // team slug -> permission granted on config repo
 	committed     map[string]string // committed tree path -> content (self-heal RMW)
+	bypassTeamIDs []int64           // Team actors PUT onto the feedback-base ruleset
 }
 
 func (m *staffMock) handler(t *testing.T) http.Handler {
@@ -42,6 +44,25 @@ func (m *staffMock) handler(t *testing.T) http.Handler {
 		switch {
 		case path == "/repos/o/classroom50" && r.Method == http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{"default_branch": "main"})
+		// --- feedback-base ruleset: the self-healed team gets exempted ---
+		case path == "/orgs/o/rulesets" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":22,"name":"` + orgrules.NameFeedbackBase + `"}]`))
+		case path == "/orgs/o/rulesets/22" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"id":22,"bypass_actors":[{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"exempt"}]}`))
+		case path == "/orgs/o/rulesets/22" && r.Method == http.MethodPut:
+			var body struct {
+				BypassActors []struct {
+					ActorID   int64  `json:"actor_id"`
+					ActorType string `json:"actor_type"`
+				} `json:"bypass_actors"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, a := range body.BypassActors {
+				if a.ActorType == "Team" {
+					m.bypassTeamIDs = append(m.bypassTeamIDs, a.ActorID)
+				}
+			}
+			_, _ = w.Write([]byte(`{}`))
 		case strings.HasPrefix(path, "/users/") && r.Method == http.MethodGet:
 			if m.userNotFound {
 				w.WriteHeader(http.StatusNotFound)
@@ -142,8 +163,8 @@ func TestRunStaffAdd(t *testing.T) {
 		t.Cleanup(server.Close)
 		client := githubtest.NewTestClient(t, server)
 
-		var out bytes.Buffer
-		if err := runStaffAdd(client, &out, "o", "cs-principles", "alice", configrepo.RoleTeacher); err != nil {
+		var out, errOut bytes.Buffer
+		if err := runStaffAdd(client, &out, &errOut, "o", "cs-principles", "alice", configrepo.RoleTeacher); err != nil {
 			t.Fatalf("runStaffAdd: %v", err)
 		}
 		if len(mock.membershipPUT) != 1 || !strings.Contains(mock.membershipPUT[0], "classroom50-cs-principles-teacher/memberships/alice") {
@@ -160,12 +181,38 @@ func TestRunStaffAdd(t *testing.T) {
 		t.Cleanup(server.Close)
 		client := githubtest.NewTestClient(t, server)
 
-		var out bytes.Buffer
-		if err := runStaffAdd(client, &out, "o", "cs-principles", "bob", configrepo.RoleTA); err != nil {
+		var out, errOut bytes.Buffer
+		if err := runStaffAdd(client, &out, &errOut, "o", "cs-principles", "bob", configrepo.RoleTA); err != nil {
 			t.Fatalf("runStaffAdd ta: %v", err)
 		}
 		if len(mock.membershipPUT) != 1 || !strings.Contains(mock.membershipPUT[0], "classroom50-cs-principles-ta/memberships/bob") {
 			t.Errorf("membership PUTs = %v, want one for the ta team + bob", mock.membershipPUT)
+		}
+	})
+
+	t.Run("re-records a non-canonical staff team ref instead of honoring it", func(t *testing.T) {
+		// A head TA can edit classroom.json; a `teams.ta` entry naming another
+		// team must not receive the member, and the ref is rewritten to the
+		// canonical slug (the step collect_scores.py's warning points at).
+		mock := &staffMock{classroomJSON: `{"schema":"classroom50/classroom/v1","short_name":"cs-principles","org":"o",
+  "teams": {"ta": {"id": 9, "slug": "classroom50-other-ta"}}}`}
+		server := httptest.NewServer(mock.handler(t))
+		t.Cleanup(server.Close)
+		client := githubtest.NewTestClient(t, server)
+
+		var out, errOut bytes.Buffer
+		if err := runStaffAdd(client, &out, &errOut, "o", "cs-principles", "bob", configrepo.RoleTA); err != nil {
+			t.Fatalf("runStaffAdd: %v", err)
+		}
+		if !strings.Contains(errOut.String(), `records "classroom50-other-ta" as the ta staff team`) {
+			t.Errorf("stderr = %q, want a warning naming the rejected ref", errOut.String())
+		}
+		committed, ok := mock.committed["cs-principles/classroom.json"]
+		if !ok || !strings.Contains(committed, `"classroom50-cs-principles-ta"`) || strings.Contains(committed, "classroom50-other-ta") {
+			t.Errorf("committed classroom.json = %q, want teams.ta rewritten to the canonical slug", committed)
+		}
+		if len(mock.membershipPUT) != 1 || !strings.Contains(mock.membershipPUT[0], "classroom50-cs-principles-ta/memberships/bob") {
+			t.Errorf("membership PUTs = %v, want bob added to the canonical ta team only", mock.membershipPUT)
 		}
 	})
 
@@ -175,8 +222,8 @@ func TestRunStaffAdd(t *testing.T) {
 		t.Cleanup(server.Close)
 		client := githubtest.NewTestClient(t, server)
 
-		var out bytes.Buffer
-		if err := runStaffAdd(client, &out, "o", "cs-principles", "alice", configrepo.RoleTeacher); err != nil {
+		var out, errOut bytes.Buffer
+		if err := runStaffAdd(client, &out, &errOut, "o", "cs-principles", "alice", configrepo.RoleTeacher); err != nil {
 			t.Fatalf("runStaffAdd should self-heal, got err = %v", err)
 		}
 		if len(mock.teamsCreated) != 1 || mock.teamsCreated[0] != "classroom50-cs-principles-teacher" {
@@ -184,6 +231,11 @@ func TestRunStaffAdd(t *testing.T) {
 		}
 		if mock.grantedRepo["classroom50-cs-principles-teacher"] != "push" {
 			t.Errorf("grantedRepo = %v, want push on the teacher team", mock.grantedRepo)
+		}
+		// The minted team (id 101, per the mock) must be exempt from the
+		// feedback-base lock or its members can't merge feedback PRs.
+		if len(mock.bypassTeamIDs) != 1 || mock.bypassTeamIDs[0] != 101 {
+			t.Errorf("feedback-base bypass Team actors = %v, want [101]", mock.bypassTeamIDs)
 		}
 		if _, ok := mock.committed["cs-principles/classroom.json"]; !ok {
 			t.Errorf("committed = %v, want a classroom.json write recording the team ref", mock.committed)
@@ -199,8 +251,8 @@ func TestRunStaffAdd(t *testing.T) {
 		t.Cleanup(server.Close)
 		client := githubtest.NewTestClient(t, server)
 
-		var out bytes.Buffer
-		err := runStaffAdd(client, &out, "o", "cs-principles", "ghost", configrepo.RoleTeacher)
+		var out, errOut bytes.Buffer
+		err := runStaffAdd(client, &out, &errOut, "o", "cs-principles", "ghost", configrepo.RoleTeacher)
 		if err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Fatalf("err = %v, want a user-not-found error", err)
 		}
@@ -213,8 +265,8 @@ func TestRunStaffRemove(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := githubtest.NewTestClient(t, server)
 
-	var out bytes.Buffer
-	if err := runStaffRemove(client, &out, "o", "cs-principles", "alice", configrepo.RoleTA); err != nil {
+	var out, errOut bytes.Buffer
+	if err := runStaffRemove(client, &out, &errOut, "o", "cs-principles", "alice", configrepo.RoleTA); err != nil {
 		t.Fatalf("runStaffRemove: %v", err)
 	}
 	if len(mock.membershipDEL) != 1 || !strings.Contains(mock.membershipDEL[0], "classroom50-cs-principles-ta/memberships/alice") {
@@ -222,6 +274,27 @@ func TestRunStaffRemove(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "removed alice from ta team") {
 		t.Errorf("stdout = %q, want a ta remove confirmation", out.String())
+	}
+}
+
+func TestRunStaffRemove_NonCanonicalRef(t *testing.T) {
+	// The recorded ta ref names another team; the removal must hit the
+	// canonical team, never the recorded one.
+	mock := &staffMock{classroomJSON: `{"schema":"classroom50/classroom/v1","short_name":"cs-principles","org":"o",
+  "teams": {"ta": {"id": 9, "slug": "classroom50-other-ta"}}}`}
+	server := httptest.NewServer(mock.handler(t))
+	t.Cleanup(server.Close)
+	client := githubtest.NewTestClient(t, server)
+
+	var out, errOut bytes.Buffer
+	if err := runStaffRemove(client, &out, &errOut, "o", "cs-principles", "alice", configrepo.RoleTA); err != nil {
+		t.Fatalf("runStaffRemove: %v", err)
+	}
+	if !strings.Contains(errOut.String(), `records "classroom50-other-ta" as the ta staff team`) {
+		t.Errorf("stderr = %q, want a warning naming the rejected ref", errOut.String())
+	}
+	if len(mock.membershipDEL) != 1 || !strings.Contains(mock.membershipDEL[0], "classroom50-cs-principles-ta/memberships/alice") {
+		t.Errorf("membership DELETEs = %v, want alice removed from the canonical ta team only", mock.membershipDEL)
 	}
 }
 
