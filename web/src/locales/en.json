@@ -1197,6 +1197,7 @@
       "repositorySetupSection": "Repository setup",
       "submissionSection": "Submission and grading",
       "submissionSectionHelp": "Define what counts as a submission for this assignment: when the autograder runs and which tags a student can push to submit.",
+      "customAutograderNotice": "This assignment uses the custom autograder \"{{name}}\" from {{path}}. Saving keeps it. To switch to the built-in autograder, set \"autograder\" to \"default\" in assignments.json.",
       "scheduleSection": "Schedule and access",
       "reset": "Reset",
       "resetSection": "Reset this section to its default settings",
@@ -1762,6 +1763,12 @@
         "fixSatisfied": "The classroom team already has read access, so there's nothing to fix.",
         "ownerOnlyNote": "Only an organization owner can grant team access. Ask an owner to run this, or grant the teams read on the template in GitHub.",
         "close": "Close"
+      }
+    },
+    "edit": {
+      "error": {
+        "customAutograderNoAutograder": "\"{{slug}}\" uses the custom autograder \"{{name}}\", which needs the built-in autograder setting on. Turn the built-in autograder back on, or set \"autograder\" to \"default\" in {{classroom}}/assignments.json first.",
+        "customAutograderInitShim": "\"{{slug}}\" uses the custom autograder \"{{name}}\", which needs starter content to run. Choose a template or turn \"Add a README\" back on, or set \"autograder\" to \"default\" in {{classroom}}/assignments.json first."
       }
     },
     "rename": {
