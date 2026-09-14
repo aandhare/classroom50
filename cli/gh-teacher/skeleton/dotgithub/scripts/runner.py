@@ -1629,8 +1629,9 @@ def _make_outcome(name: str, points: int, passed: bool, detail: str,
     """One test's outcome. Carries the v1 result-row fields plus rendering-only
     fields stripped before result.json: a `detail` summary line (the failure
     kind -- safe under every failure-details level) and a `capture` dict of raw
-    streams (stdout/stderr/setup-stdout/setup-stderr/expected) that the
-    renderers clip and policy-filter per surface."""
+    streams (`output` and `setup-output` for run/python tests, `stdout` /
+    `stderr` / `expected` for io tests) that the renderers clip and
+    policy-filter per surface."""
     if score is None:
         score = points if passed else 0
     return {
@@ -1680,16 +1681,24 @@ def _command_env(bundle_dir: pathlib.Path | None) -> dict[str, str]:
 
 def _run_command(command: str, cwd: pathlib.Path, timeout: int,
                  stdin: str = "",
-                 bundle_dir: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
+                 bundle_dir: pathlib.Path | None = None,
+                 merge_streams: bool = False) -> subprocess.CompletedProcess[str]:
     """Run a shell command in the student checkout with captured text output
-    and an empty-by-default stdin."""
+    and an empty-by-default stdin. With merge_streams, stderr is folded into
+    stdout (`2>&1`) in the order the two streams reached the pipe, the way a
+    terminal or a CI log shows them, so a diff a Makefile prints to stdout
+    lands next to the compiler error on stderr. A program that block-buffers
+    stdout when piped may still show its errors first, exactly as
+    `cmd 2>&1 | cat` does locally. io tests keep the streams apart because
+    the comparison needs a clean stdout."""
     return subprocess.run(
         command,
         shell=True,
         cwd=str(cwd),
         env=_command_env(bundle_dir),
         input=stdin,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -1702,10 +1711,10 @@ def _run_setup(setup: str, cwd: pathlib.Path, timeout: int,
                ) -> tuple[str | None, subprocess.CompletedProcess[str] | None]:
     """Run a test's setup command. Returns (error-summary, process): the
     summary is None on success; the process is None when the command never
-    produced one (timeout / failed start). Captured streams travel back raw so
-    the renderers can clip and policy-filter them per surface."""
+    produced one (timeout / failed start). The combined output travels back raw
+    so the renderers can clip and policy-filter it per surface."""
     try:
-        sp = _run_command(setup, cwd, timeout, bundle_dir=bundle_dir)
+        sp = _run_command(setup, cwd, timeout, bundle_dir=bundle_dir, merge_streams=True)
     except subprocess.TimeoutExpired:
         return f"setup timed out after {timeout}s", None
     except OSError as exc:
@@ -1755,7 +1764,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
     else:
         cmd = f"{spec['run']} --json-report --json-report-file={shlex.quote(str(report))}"
     try:
-        rp = _run_command(cmd, cwd, timeout, bundle_dir=bundle_dir)
+        rp = _run_command(cmd, cwd, timeout, bundle_dir=bundle_dir, merge_streams=True)
     except subprocess.TimeoutExpired:
         shutil.rmtree(report_dir, ignore_errors=True)
         return _make_outcome(name, points, False, f"timed out after {timeout}s")
@@ -1784,7 +1793,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
             score = min(score, max(0, points - 1))
         detail = f"pytest: {passed_n}/{total_n} cases passed"
         return _make_outcome(name, points, passed, detail, score=score,
-                             capture={"stdout": rp.stdout, "stderr": rp.stderr})
+                             capture={"output": rp.stdout})
 
     # Fallback: no parseable report -> all-or-nothing on the exit code
     # (e.g., an offline runner couldn't load pytest-json-report).
@@ -1792,7 +1801,7 @@ def _grade_python(spec: dict[str, Any], cwd: pathlib.Path, timeout: int,
     detail = (f"pytest exit {rp.returncode} "
               f"(no JSON report from pytest-json-report; scored on exit code)")
     return _make_outcome(name, points, passed, detail,
-                         capture={"stdout": rp.stdout, "stderr": rp.stderr})
+                         capture={"output": rp.stdout})
 
 
 def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
@@ -1811,9 +1820,8 @@ def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
     setup = spec.get("setup") or ""
     if setup:
         err, sp = _run_setup(setup, cwd, timeout, bundle_dir=fixtures_dir)
-        if sp is not None:
-            setup_capture = {k: v for k, v in
-                             (("setup-stdout", sp.stdout), ("setup-stderr", sp.stderr)) if v}
+        if sp is not None and sp.stdout:
+            setup_capture = {"setup-output": sp.stdout}
         if err:
             outcome = _make_outcome(name, points, False, err)
             outcome["failure-kind"] = "setup"
@@ -1821,8 +1829,8 @@ def execute_test(spec: dict[str, Any], *, cwd: pathlib.Path,
         outcome = _execute_spec(spec, cwd=cwd, fixtures_dir=fixtures_dir,
                                 name=name, points=points, timeout=timeout)
 
-    # Setup streams ride every outcome: a setup failure's details show them,
-    # and show-output includes them even on a pass (#764).
+    # Setup output rides every outcome: a setup failure's details show it,
+    # and show-output includes it even on a pass (#764).
     outcome["capture"] = {**setup_capture, **outcome.get("capture", {})}
     outcome["type"] = spec["type"]
     if spec["type"] == TEST_TYPE_IO:
@@ -1852,14 +1860,15 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
     except TestFixtureError as exc:
         return _make_outcome(name, points, False, str(exc))
 
+    # io compares stdout, so only run tests merge streams (see _run_command).
+    merge = ttype == TEST_TYPE_RUN
     try:
-        rp = _run_command(spec["run"], cwd, timeout, stdin=stdin, bundle_dir=fixtures_dir)
+        rp = _run_command(spec["run"], cwd, timeout, stdin=stdin,
+                          bundle_dir=fixtures_dir, merge_streams=merge)
     except subprocess.TimeoutExpired:
         return _make_outcome(name, points, False, f"timed out after {timeout}s")
     except OSError as exc:
         return _make_outcome(name, points, False, f"failed to start: {exc}")
-
-    capture = {"stdout": rp.stdout, "stderr": rp.stderr}
 
     if ttype == TEST_TYPE_RUN:
         want = spec.get("exit-code")
@@ -1867,12 +1876,13 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
         passed = rp.returncode == want
         outcome = _make_outcome(name, points, passed,
                                 f"exit {rp.returncode} (wanted {want})",
-                                capture=capture)
+                                capture={"output": rp.stdout})
         if not passed:
             outcome["failure-kind"] = "exit"
         return outcome
 
     # io test.
+    capture = {"stdout": rp.stdout, "stderr": rp.stderr}
     try:
         expected = _resolve_expected(spec, fixtures_dir)
     except TestFixtureError as exc:
@@ -2031,16 +2041,13 @@ def _command_lines(outcome: dict[str, Any], *, include_run: bool = True) -> str:
     return "\n".join(parts)
 
 
-def _setup_stream_blocks(outcome: dict[str, Any], limit: int) -> str:
-    """The labelled `--- setup stdout --- / --- setup stderr ---` blocks of an
-    outcome's setup command; empty when neither stream has content."""
-    cap = outcome.get("capture") or {}
-    parts = []
-    for key, label in (("setup-stdout", "setup stdout"), ("setup-stderr", "setup stderr")):
-        text = cap.get(key) or ""
-        if text.strip():
-            parts.append(f"--- {label} ---\n{_clip(text, limit)}")
-    return "\n".join(parts)
+def _setup_output_block(outcome: dict[str, Any], limit: int) -> str:
+    """The labelled `--- setup output ---` block of an outcome's setup command;
+    empty when it printed nothing."""
+    text = (outcome.get("capture") or {}).get("setup-output") or ""
+    if not text.strip():
+        return ""
+    return f"--- setup output ---\n{_clip(text, limit)}"
 
 
 def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) -> str:
@@ -2059,34 +2066,21 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
     if commands:
         detail += f"\n{commands}"
     if kind == "setup":
-        # Both setup streams, labelled: an `apt-get install` or `make deps`
-        # reports on stdout, so showing stderr alone hid the useful half.
-        blocks = _setup_stream_blocks(outcome, limit)
-        return detail + (f"\n{blocks}" if blocks else "")
+        block = _setup_output_block(outcome, limit)
+        return detail + (f"\n{block}" if block else "")
     # A test that fails in its run phase skips the output section, so under
-    # show-output the setup streams ride along here instead of vanishing.
+    # show-output the setup output rides along here instead of vanishing.
     if outcome.get("show-output"):
-        blocks = _setup_stream_blocks(outcome, limit)
-        if blocks:
-            detail += f"\n{blocks}"
-    if kind == "cases":
-        out = cap.get("stdout") or cap.get("stderr") or ""
-        return detail + (f"\n{_clip(out, limit)}" if out else "")
-    if kind == "exit":
-        # A run test's signal is what its command printed, and commands commonly
-        # write their verdict to stdout (a diff, a self-check message) while
-        # stderr carries only tool noise. Show BOTH streams, labelled, so neither
-        # is dropped: the old `stderr or stdout` hid stdout whenever stderr had
-        # anything at all. Safe at every failure-details level here because a run
-        # test has no expected side to redact (only `none` suppresses, above).
-        stdout = cap.get("stdout") or ""
-        stderr = cap.get("stderr") or ""
-        parts = []
-        if stdout.strip():
-            parts.append(f"--- stdout ---\n{_clip(stdout, limit)}")
-        if stderr.strip():
-            parts.append(f"--- stderr ---\n{_clip(stderr, limit)}")
-        return detail + ("\n" + "\n".join(parts) if parts else "")
+        block = _setup_output_block(outcome, limit)
+        if block:
+            detail += f"\n{block}"
+    if kind in ("cases", "exit"):
+        # One stream, as the terminal showed it: a run test's verdict often
+        # goes to stdout (a diff, a self-check) while the tool complains on
+        # stderr, and neither half may be dropped. Safe at every
+        # failure-details level: these tests have no expected side to redact.
+        out = cap.get("output") or ""
+        return detail + (f"\n--- output ---\n{_clip(out, limit)}" if out.strip() else "")
     if kind == "output":
         comparison = outcome.get("comparison") or ""
         stdout = cap.get("stdout") or ""
@@ -2121,14 +2115,15 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
 
 
 def compose_output(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) -> str:
-    """Captured setup/run streams of one outcome for the opt-in show-output
+    """Captured setup/run output of one outcome for the opt-in show-output
     section (#764) -- rendered for passing tests, since failing ones already
-    surface their output through the failure details. The commands lead when
-    the test also opted in via show-command."""
+    surface their output through the failure details. Run and python tests
+    carry one combined stream; io tests keep stdout and stderr apart. The
+    commands lead when the test also opted in via show-command."""
     cap = outcome.get("capture") or {}
     outputs = []
-    for key, label in (("setup-stdout", "setup stdout"),
-                       ("setup-stderr", "setup stderr"),
+    for key, label in (("setup-output", "setup output"),
+                       ("output", "output"),
                        ("stdout", "stdout"),
                        ("stderr", "stderr")):
         text = cap.get(key) or ""
