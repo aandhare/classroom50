@@ -126,9 +126,9 @@ func assignmentReuseCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&from, "from", "", "Source classroom short-name to copy the assignment from (required)")
 	cmd.Flags().StringVar(&to, "to", "", "Target classroom short-name to copy the assignment into, same org (required)")
-	cmd.Flags().StringVar(&newSlug, "slug", "", "Slug for the copy in the target classroom (default: the source slug, auto-suffixed -2/-3/... on a case-insensitive collision)")
+	cmd.Flags().StringVar(&newSlug, "slug", "", "Slug for the copy (default: the source slug, with -2, -3, and so on added on a collision)")
 	cmd.Flags().StringVar(&newName, "name", "", "Display name for the copy (default: the source name)")
-	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the resolved copy as JSON ({org, classroom, slug, source_slug, auto_suffixed, template}) on stdout instead of the human summary")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Output the resolved copy as JSON instead of the human summary")
 	return cmd
 }
 

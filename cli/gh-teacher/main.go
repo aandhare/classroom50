@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/foundation50/classroom50-cli-shared/ghhelp"
 	"github.com/foundation50/gh-teacher/internal/assignmentcmd"
 	"github.com/foundation50/gh-teacher/internal/audit"
 	"github.com/foundation50/gh-teacher/internal/auth"
@@ -42,7 +43,7 @@ var (
 	verbose bool
 )
 
-func main() {
+func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:     "gh-teacher",
 		Short:   "Manage Classroom 50 classrooms, rosters, and assignments",
@@ -68,6 +69,12 @@ func main() {
 	root.AddCommand(member.NewCmd())
 	root.AddCommand(download.NewCmd())
 	root.AddCommand(teardown.NewCmd())
+	ghhelp.Install(root)
+	return root
+}
+
+func main() {
+	root := newRootCmd()
 
 	// Signal-aware root context: subcommands see cmd.Context() cancel on
 	// Ctrl-C / SIGTERM so in-flight HTTP unwinds.

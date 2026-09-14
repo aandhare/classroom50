@@ -154,7 +154,7 @@ func rosterInviteCmd() *cobra.Command {
 	cmd.Flags().StringVar(&firstName, "first-name", "", "Student's first name (single invite only; written into the first_name column)")
 	cmd.Flags().StringVar(&lastName, "last-name", "", "Student's last name (single invite only; written into the last_name column)")
 	cmd.Flags().StringVar(&section, "section", "", "Section identifier (single invite only; free-form text, written into the section column)")
-	cmd.Flags().StringVar(&file, "file", "", "Path to a plaintext list of email addresses (one per line; # comments and blank lines ignored) to invite in bulk")
+	cmd.Flags().StringVar(&file, "file", "", "File with one email address per line to invite in bulk (# comments and blank lines ignored)")
 	return cmd
 }
 

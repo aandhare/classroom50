@@ -110,7 +110,7 @@ func autograderSetDefaultCmd() *cobra.Command {
 			return setClassroomDefaultAutograder(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, classroom, label, content)
 		},
 	}
-	cmd.Flags().StringVar(&fromPath, "from", "", "Path to the autograder.py to upload, or `-` to read from stdin; omit to install the shipped diagnostic stub")
+	cmd.Flags().StringVar(&fromPath, "from", "", "Path to the autograder.py to upload, or - to read stdin (default: the shipped diagnostic stub)")
 	return cmd
 }
 

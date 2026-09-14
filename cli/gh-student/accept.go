@@ -243,8 +243,8 @@ func acceptCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&key, "key", "", "Access key from your teacher for a classroom that uses an unlisted URL; omit for normal classrooms")
-	cmd.Flags().BoolVar(&newTeam, "new-team", false, "Team assignments with student-formed groups only: create a new group for this assignment and become its founder; add teammates afterward with `gh student team add`")
+	cmd.Flags().StringVar(&key, "key", "", "Access key from your teacher, only for a classroom with an unlisted URL")
+	cmd.Flags().BoolVar(&newTeam, "new-team", false, "Create a new group for a team assignment and become its founder")
 	cmd.Flags().StringVar(&teamName, "team-name", "", `Display name for the group created by --new-team, for example "The Sharks"`)
 	return cmd
 }
