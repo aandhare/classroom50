@@ -115,10 +115,12 @@ func assignmentAddCmd() *cobra.Command {
 			"  - Students always get its default branch; an @<branch> suffix is\n" +
 			"    accepted but ignored.\n\n" +
 			"Release and access:\n" +
-			"  - An assignment is hidden from the student list until\n" +
-			"    --available-from passes (invite-link accept still works). That\n" +
-			"    is listing only: pair it with --locked to keep a private\n" +
-			"    template unreadable until release.\n" +
+			"  - Assignments are hidden from the student list by default;\n" +
+			"    students reach them only through the invite link. Set\n" +
+			"    --available-from to list one for everyone once that date passes\n" +
+			"    (students who already accepted always see it). That is listing\n" +
+			"    only: pair it with --locked to keep a private template\n" +
+			"    unreadable until release.\n" +
 			"  - --locked hides the assignment from every student, the same as\n" +
 			"    `gh teacher assignment lock`. Use it to stage a timed\n" +
 			"    assessment, then unlock when the session starts. On a re-add,\n" +
@@ -379,7 +381,7 @@ func assignmentAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&template, "template", "", "Template repository as <owner>/<repo>; omit for a template-less assignment")
 	cmd.Flags().StringVar(&description, "description", "", "One-line description")
 	cmd.Flags().StringVar(&due, "due", "", "Due date, for example 2026-09-15T23:59:00-04:00 (no offset means local time)")
-	cmd.Flags().StringVar(&availableFrom, "available-from", "", "Release date in the same format as --due; hidden from the student list until then")
+	cmd.Flags().StringVar(&availableFrom, "available-from", "", "Date after which students see the assignment listed (same format as --due; unlisted until set)")
 	cmd.Flags().StringVar(&mode, "mode", assignment.ModeIndividual, "Assignment mode: {individual|group|team}")
 	cmd.Flags().IntVar(&maxGroupSize, "max-group-size", 0, "Maximum group size, at least 2 (required with --mode group or team)")
 	cmd.Flags().StringVar(&teamFormation, "team-formation", "", "Who forms the teams: {teacher|student} (required with --mode team)")

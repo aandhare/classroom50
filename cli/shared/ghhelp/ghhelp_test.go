@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func newTree() (*cobra.Command, *cobra.Command) {
@@ -87,18 +88,23 @@ func TestLintFlagUsage(t *testing.T) {
 	}{
 		"clean":                {"Filter by state: {open|closed}", ""},
 		"placeholder":          {"Repository home page `URL`", ""},
+		"digit start":          {"3 retries before giving up", ""},
 		"empty":                {"", "empty"},
 		"lowercase":            {"filter by state", "capital"},
 		"period":               {"Filter by state.", "period"},
 		"decorative backticks": {"Requires `gh teacher init` first", "not a type placeholder"},
+		"long placeholder":     {"Mode `" + strings.Repeat("x", 25) + "`", "not a type placeholder"},
 		"three backticks":      {"Use `a` or `b", "one pair"},
 		"too long":             {strings.Repeat("Word ", 25), "max"},
 		"em dash":              {"Filter \u2014 by state", "em dash"},
 		"please":               {"Please pass a value", `"please"`},
+		"successfully":         {"Report successfully sent", `"successfully"`},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := lintFlagUsage(tc.usage)
+			fs := pflag.NewFlagSet("t", pflag.ContinueOnError)
+			fs.String("x", "", tc.usage)
+			got := lintFlagUsage(fs.Lookup("x"))
 			if tc.want == "" {
 				if len(got) != 0 {
 					t.Fatalf("expected clean, got %v", got)
@@ -113,9 +119,51 @@ func TestLintFlagUsage(t *testing.T) {
 }
 
 func TestLintShort(t *testing.T) {
-	c := &cobra.Command{Use: "x", Short: "lowercase start."}
-	got := strings.Join(lintShort(c), "\n")
-	if !strings.Contains(got, "capital") {
-		t.Fatalf("expected capital-letter violation, got %q", got)
+	cases := map[string]struct {
+		short string
+		want  []string
+	}{
+		"clean":     {"Add a thing", nil},
+		"empty":     {"", []string{"empty"}},
+		"lowercase": {"add a thing", []string{"capital"}},
+		"period":    {"Add a thing.", []string{"period"}},
+		"too long":  {strings.Repeat("A", maxShort+1), []string{"max"}},
+		// Every violation is reported at once, not just the first.
+		"lowercase and period": {"add a thing.", []string{"capital", "period"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := lintShort(&cobra.Command{Use: "x", Short: tc.short})
+			if len(got) != len(tc.want) {
+				t.Fatalf("expected %d violation(s) %v, got %v", len(tc.want), tc.want, got)
+			}
+			for i, w := range tc.want {
+				if !strings.Contains(got[i], w) {
+					t.Errorf("violation %d: expected %q in %q", i, w, got[i])
+				}
+			}
+		})
+	}
+}
+
+func TestWrapFlagUsagesBoundsEveryLine(t *testing.T) {
+	const desc = "Ordered gitignore-style pattern deciding which files count as the submission, last match wins"
+	fs := pflag.NewFlagSet("t", pflag.ContinueOnError)
+	fs.StringArray("allowed-files", nil, desc)
+
+	lines := strings.Split(strings.TrimRight(wrapFlagUsages(fs, 60), "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected the %d-char description to wrap at width 60, got:\n%s", len(desc), strings.Join(lines, "\n"))
+	}
+	for _, l := range lines {
+		if n := len([]rune(l)); n > 60 {
+			t.Errorf("line exceeds width 60 (%d): %q", n, l)
+		}
+	}
+	if !strings.Contains(lines[len(lines)-1], "wins") {
+		t.Errorf("wrapping dropped the end of the description:\n%s", strings.Join(lines, "\n"))
+	}
+	if unwrapped := fs.FlagUsages(); strings.Count(unwrapped, "\n") != 1 {
+		t.Fatalf("test premise broken: pflag's FlagUsages should print one line, got %q", unwrapped)
 	}
 }
