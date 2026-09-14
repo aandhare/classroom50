@@ -1,3 +1,4 @@
+import { cx } from "./cx"
 import { fieldLabelClass, HelpTooltip } from "./FormField"
 import { Toggle } from "./Toggle"
 
@@ -15,6 +16,7 @@ export function ToggleField({
   onBlur,
   label,
   help,
+  disabled = false,
 }: {
   id: string
   checked: boolean
@@ -22,16 +24,28 @@ export function ToggleField({
   onBlur?: () => void
   label: string
   help?: string
+  disabled?: boolean
 }) {
   return (
-    <label htmlFor={id} className="flex cursor-pointer items-center gap-3">
+    // Mute the text, never the label's opacity: opacity < 1 opens a stacking
+    // context that traps the HelpTooltip bubble under later form controls.
+    <label
+      htmlFor={id}
+      className={cx(
+        "flex items-center gap-3",
+        disabled ? "cursor-not-allowed" : "cursor-pointer",
+      )}
+    >
       <Toggle
         id={id}
         checked={checked}
+        disabled={disabled}
         onBlur={onBlur}
         onChange={(e) => onChange(e.target.checked)}
       />
-      <span className={fieldLabelClass}>{label}</span>
+      <span className={cx(fieldLabelClass, disabled && "text-base-content/30")}>
+        {label}
+      </span>
       {help ? <HelpTooltip help={help} /> : null}
     </label>
   )
