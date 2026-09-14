@@ -2,6 +2,7 @@ package ghhelp
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 
@@ -47,7 +48,10 @@ func TestHelpTemplateDerivesFromCobra(t *testing.T) {
 	if got := strings.Count(tmpl, "wrappedFlagUsages"); got != 2 {
 		t.Fatalf("expected both flag sections swapped for wrappedFlagUsages, found %d; Cobra's default template may have changed", got)
 	}
-	for _, leftover := range []string{".FlagUsages", "{{.UsageString}}"} {
+	if !strings.Contains(tmpl, "Usage:{{if and .Runnable (not .HasAvailableSubCommands)}}") {
+		t.Errorf("usage line is not guarded against runnable groups; Cobra's default template may have changed")
+	}
+	for _, leftover := range []string{".FlagUsages", "{{.UsageString}}", "Usage:{{if .Runnable}}"} {
 		if strings.Contains(tmpl, leftover) {
 			t.Errorf("%s survived the replacement; Cobra's default template may have changed", leftover)
 		}
@@ -79,7 +83,8 @@ func TestHelpIsFull(t *testing.T) {
 		t.Errorf("description should precede Usage (gh order):\n%s", out)
 	}
 	// The flag column is wrapped: the long description never renders on one
-	// line and nothing exceeds the width cap.
+	// line and nothing exceeds the width cap. Help went to a buffer, so the
+	// width is MaxWrapWidth regardless of the terminal running the tests.
 	if strings.Contains(out, longFlagDescription) {
 		t.Errorf("long flag description was not wrapped:\n%s", out)
 	}
@@ -87,9 +92,44 @@ func TestHelpIsFull(t *testing.T) {
 		t.Errorf("wrapping dropped the end of the description:\n%s", out)
 	}
 	for _, l := range strings.Split(out, "\n") {
-		if n := len([]rune(l)); n > maxWrapWidth {
-			t.Errorf("line exceeds %d columns (%d): %q", maxWrapWidth, n, l)
+		if n := len([]rune(l)); n > MaxWrapWidth {
+			t.Errorf("line exceeds %d columns (%d): %q", MaxWrapWidth, n, l)
 		}
+	}
+}
+
+func TestHelpWrapsToTerminalWidth(t *testing.T) {
+	// 72 leaves room for the fixture's enum token: pflag stops wrapping a
+	// description once a single word no longer fits the remaining width.
+	const cols = 72
+	orig := terminalWidth
+	terminalWidth = func(io.Writer) int { return cols }
+	t.Cleanup(func() { terminalWidth = orig })
+
+	out, _ := run(t, newTree(), "add", "--help")
+	if strings.Contains(out, longFlagDescription) {
+		t.Fatalf("long flag description was not wrapped at %d columns:\n%s", cols, out)
+	}
+	if !strings.Contains(out, "match wins") {
+		t.Fatalf("wrapping dropped the end of the description:\n%s", out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if n := len([]rune(l)); n > cols {
+			t.Errorf("line exceeds %d columns (%d): %q", cols, n, l)
+		}
+	}
+}
+
+func TestGroupHelpHasNoFlagsUsageLine(t *testing.T) {
+	out, err := run(t, newTree(), "group", "--help")
+	if err != nil {
+		t.Fatalf("group --help failed: %v", err)
+	}
+	if strings.Contains(out, "tool group [flags]") {
+		t.Errorf("a group made runnable by the typo guard must not gain a [flags] usage line:\n%s", out)
+	}
+	if !strings.Contains(out, "tool group [command]") {
+		t.Errorf("group help missing the [command] usage line:\n%s", out)
 	}
 }
 
@@ -142,6 +182,7 @@ func TestLintFlagUsage(t *testing.T) {
 		"three backticks":      {"Use `a` or `b", "one pair"},
 		"too long":             {strings.Repeat("Word ", 25), "max"},
 		"em dash":              {"Filter \u2014 by state", "em dash"},
+		"ellipsis":             {"Suffixed -2/-3/... on a collision", `"..."`},
 		"please":               {"Please pass a value", `"please"`},
 		"successfully":         {"Report successfully sent", `"successfully"`},
 	}

@@ -10,6 +10,7 @@ package ghhelp
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"unicode"
@@ -20,9 +21,10 @@ import (
 	"golang.org/x/term"
 )
 
-// maxWrapWidth caps the Flags column on a very wide terminal; past it the
-// descriptions get hard to scan.
-const maxWrapWidth = 100
+// MaxWrapWidth caps the Flags column on a very wide terminal; past it the
+// descriptions get hard to scan. Help written to anything but a terminal
+// (a pipe, a test buffer) wraps at exactly this width.
+const MaxWrapWidth = 100
 
 // usageTemplate prints on a usage error (wrong arg count, unknown flag).
 // Cobra's default also dumps every flag here, which is what buried the usage
@@ -80,32 +82,54 @@ func rejectUnknownSubcommands(c *cobra.Command) {
 // swapped for the wrapping variant. Both halves are read off a bare Command
 // so upstream template changes (groups, help topics) flow through instead of
 // being frozen in a copy.
+//
+// The usage line gets the same guard as usageTemplate: a group made runnable
+// by rejectUnknownSubcommands must not gain a `group [flags]` line above its
+// `group [command]` line.
 func helpTemplate() string {
 	bare := &cobra.Command{}
 	usage := strings.NewReplacer(
-		"{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages .LocalFlags | trimTrailingWhitespaces}}",
-		"{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages .InheritedFlags | trimTrailingWhitespaces}}",
+		"Usage:{{if .Runnable}}", "Usage:{{if and .Runnable (not .HasAvailableSubCommands)}}",
+		"{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages . .LocalFlags | trimTrailingWhitespaces}}",
+		"{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages . .InheritedFlags | trimTrailingWhitespaces}}",
 	).Replace(bare.UsageTemplate())
 	return strings.Replace(bare.HelpTemplate(), "{{.UsageString}}", usage, 1)
 }
 
-// wrappedFlagUsages renders a flag set wrapped to the terminal width (capped
-// at maxWrapWidth). pflag's FlagUsages never wraps, so a long description
-// prints as one line that runs off the screen.
-func wrappedFlagUsages(fs *pflag.FlagSet) string {
-	width, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || width <= 0 || width > maxWrapWidth {
-		width = maxWrapWidth
+// wrappedFlagUsages renders a flag set wrapped to the width of the terminal
+// that receives the help, capped at MaxWrapWidth. pflag's FlagUsages never
+// wraps, so a long description prints as one line that runs off the screen.
+func wrappedFlagUsages(c *cobra.Command, fs *pflag.FlagSet) string {
+	width := terminalWidth(c.OutOrStdout())
+	if width <= 0 || width > MaxWrapWidth {
+		width = MaxWrapWidth
 	}
 	return fs.FlagUsagesWrapped(width)
 }
 
+// terminalWidth reports the column count of w when it is a terminal, else 0.
+// A variable so tests can pin a width without a pty.
+var terminalWidth = func(w io.Writer) int {
+	f, ok := w.(*os.File)
+	if !ok {
+		return 0
+	}
+	width, _, err := term.GetSize(int(f.Fd()))
+	if err != nil {
+		return 0
+	}
+	return width
+}
+
 // Copy limits, chosen to match the official gh CLI: a flag description is a
 // single fragment that fits beside the flag column, and Short is a one-line
-// summary for the command list.
+// summary for the command list. A backtick pair longer than
+// maxPlaceholderLen is a quoted phrase, not a type name like `URL` or
+// `duration`.
 const (
 	maxFlagDescription = 100
 	maxShort           = 70
+	maxPlaceholderLen  = 24
 )
 
 // Lint walks the command tree and returns one line per copy violation, empty
@@ -166,7 +190,7 @@ func lintFlagUsage(f *pflag.Flag) []string {
 	placeholder, desc := pflag.UnquoteUsage(f)
 	if n := strings.Count(f.Usage, "`"); n != 0 && n != 2 {
 		out = append(out, "backticks must come as one pair (a pflag type placeholder) or not at all")
-	} else if n == 2 && (strings.ContainsAny(placeholder, " \t") || len(placeholder) > 24) {
+	} else if n == 2 && (strings.ContainsAny(placeholder, " \t") || len(placeholder) > maxPlaceholderLen) {
 		out = append(out, fmt.Sprintf("backtick pair %q is not a type placeholder; pflag prints it in the type column", placeholder))
 	}
 	if !startsCapitalized(desc) {
@@ -180,6 +204,9 @@ func lintFlagUsage(f *pflag.Flag) []string {
 	}
 	if strings.ContainsRune(desc, '\u2014') {
 		out = append(out, "no em dashes")
+	}
+	if strings.Contains(desc, "...") {
+		out = append(out, `no "..." (write "and so on")`)
 	}
 	for _, banned := range []string{"please", "sorry", "successfully"} {
 		if strings.Contains(strings.ToLower(desc), banned) {

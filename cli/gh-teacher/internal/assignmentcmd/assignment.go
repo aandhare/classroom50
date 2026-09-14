@@ -65,9 +65,8 @@ func NewCmd() *cobra.Command {
 	return cmd
 }
 
-// assignmentAddCmd: `--mode` accepts `individual` (default) or `group`. Group
-// mode requires `--max-group-size` (>= 2), enforced within the CLI when
-// students join (direct GitHub-UI invites can bypass it — documented).
+// --max-group-size is enforced by the CLI when students join; a direct
+// GitHub-UI invite bypasses it.
 func assignmentAddCmd() *cobra.Command {
 	var (
 		name           string
@@ -112,11 +111,13 @@ func assignmentAddCmd() *cobra.Command {
 			"    --available-from passes (omit it to keep invite-link only). That\n" +
 			"    is listing only: --locked also blocks accept and hides a private\n" +
 			"    template, so use it to stage a timed assessment.\n\n" +
-			"Grading is one of: declarative tests (--tests, or `gh teacher\n" +
-			"assignment test add`), a per-assignment autograder at\n" +
-			"<classroom>/autograders/<slug>/ in the classroom50 repository, or a\n" +
-			"classroom default from `gh teacher autograder set-default`. Grading\n" +
-			"runs on every push unless --submission-mode tag limits it to\n" +
+			"Grading is one of:\n" +
+			"  - Declarative tests: --tests here, or `gh teacher assignment test\n" +
+			"    add` later.\n" +
+			"  - A per-assignment autograder at <classroom>/autograders/<slug>/ in\n" +
+			"    the classroom50 repository.\n" +
+			"  - The classroom default from `gh teacher autograder set-default`.\n\n" +
+			"Grading runs on every push unless --submission-mode tag limits it to\n" +
 			"`gh student submit`; change that later with\n" +
 			"`gh teacher assignment submission-mode`, which retrofits existing\n" +
 			"repos.\n\n" +
@@ -130,8 +131,10 @@ func assignmentAddCmd() *cobra.Command {
 			"  - --student-permission admin lets students change repo settings\n" +
 			"    and collaborators; the org lockdown from `gh teacher init` still\n" +
 			"    blocks visibility changes.\n" +
-			"  - --empty-repo turns off autograding and the feedback pull request\n" +
-			"    and excludes every grading flag.\n\n" +
+			"  - --empty-repo turns off autograding and the feedback pull request.\n" +
+			"    It cannot be combined with --template, --pages, --submission-mode,\n" +
+			"    --submission-tag, or a grading flag (--tests, --allowed-files,\n" +
+			"    --pass-threshold).\n\n" +
 			"Every flag, its defaults, and its interactions are documented on the\n" +
 			"gh-teacher wiki page (https://github.com/foundation50/classroom50/wiki/gh-teacher).",
 		Example: "  gh teacher assignment add cs50-fall-2026 cs-principles hello \\\n" +
