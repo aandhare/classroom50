@@ -90,7 +90,7 @@ func NewCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&user, "user", "", "Repair a single student's repo (their <classroom>-<assignment>-<user> repo) instead of every team member's")
+	cmd.Flags().StringVar(&user, "user", "", "Repair only this student's <classroom>-<assignment>-<user> repo")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress informational output (per-repo and summary lines); errors still go to stderr")
 	return cmd
 }

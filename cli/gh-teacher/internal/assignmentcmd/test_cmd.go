@@ -165,20 +165,20 @@ func assignmentTestAddCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&name, "name", "", "Test name, unique within the assignment (required)")
-	cmd.Flags().StringVar(&ttype, "type", "", "Test type: io | run | python (required)")
+	cmd.Flags().StringVar(&ttype, "type", "", "Test type: {io|run|python} (required)")
 	cmd.Flags().StringVar(&run, "run", "", "Command to run (required)")
-	cmd.Flags().StringVar(&setup, "setup", "", "Optional command run before --run (a compile step, for example)")
-	cmd.Flags().StringVar(&input, "input", "", "io only: inline stdin for the run command")
-	cmd.Flags().StringVar(&inputFile, "input-file", "", "io only: bundled fixture file fed on stdin")
-	cmd.Flags().StringVar(&expected, "expected", "", "io only: inline expected stdout")
-	cmd.Flags().StringVar(&expectedFile, "expected-file", "", "io only: bundled fixture file holding expected stdout")
-	cmd.Flags().StringVar(&comparison, "comparison", "", "io only, required: included | exact | regex")
+	cmd.Flags().StringVar(&setup, "setup", "", "Command run before --run, for example a compile step")
+	cmd.Flags().StringVar(&input, "input", "", "Inline stdin for the run command (io tests)")
+	cmd.Flags().StringVar(&inputFile, "input-file", "", "Bundled fixture file fed on stdin (io tests)")
+	cmd.Flags().StringVar(&expected, "expected", "", "Inline expected stdout (io tests)")
+	cmd.Flags().StringVar(&expectedFile, "expected-file", "", "Bundled fixture file holding the expected stdout (io tests)")
+	cmd.Flags().StringVar(&comparison, "comparison", "", "How stdout is compared: {included|exact|regex} (required for io tests)")
 	cmd.Flags().IntVar(&timeout, "timeout", 0, "Seconds before the test fails (0 = default of 10s)")
-	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "run only: required exit code (default 0); pass to require a specific code")
+	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "Exit code the command must return (run tests)")
 	cmd.Flags().IntVar(&points, "points", 0, "Points the test is worth")
-	cmd.Flags().StringVar(&failureDetails, "failure-details", "", "How much failure detail students see: full | actual-only | none (empty = the assignment default)")
+	cmd.Flags().StringVar(&failureDetails, "failure-details", "", "How much failure detail students see: {full|actual-only|none} (default: assignment setting)")
 	cmd.Flags().BoolVar(&showOutput, "show-output", false, "Include captured setup/run output in the report even when the test passes")
-	cmd.Flags().BoolVar(&showCommand, "show-command", false, "Print the setup and run command lines in the report (off by default: a command can reveal how the test checks the work)")
+	cmd.Flags().BoolVar(&showCommand, "show-command", false, "Show the setup and run commands in the report (they can reveal how the test checks)")
 	return cmd
 }
 
@@ -288,7 +288,7 @@ func assignmentTestSetCmd() *cobra.Command {
 			return runAssignmentTestSet(client, cmd.OutOrStdout(), org, classroom, slug, parsed)
 		},
 	}
-	cmd.Flags().StringVar(&testsFile, "tests", "", "Path to a JSON file of test specs (bare array or generated tests.json envelope), or '-' to read from stdin (required)")
+	cmd.Flags().StringVar(&testsFile, "tests", "", "JSON file of test specs (bare array or tests.json envelope), or - to read stdin (required)")
 	return cmd
 }
 

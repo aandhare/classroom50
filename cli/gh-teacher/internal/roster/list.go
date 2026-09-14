@@ -84,8 +84,8 @@ func rosterListCmd() *cobra.Command {
 			return runRosterList(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, classroom, asJSON, quiet)
 		},
 	}
-	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the full JSON array of {username, first_name, last_name, email, section, github_id, role} objects instead of the table")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Print one username per line (no table, no stderr summary); students awaiting an email invite are omitted, as they have no username yet")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Output the roster as a JSON array instead of the table")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Print one username per line; students awaiting an email invite are omitted")
 	return cmd
 }
 

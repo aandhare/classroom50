@@ -95,7 +95,7 @@ func classroomAddCmd() *cobra.Command {
 			"  - This is obscurity, not access control: anyone who has the\n" +
 			"    link can read the files, and links can leak.\n" +
 			"  - You'll be shown a generated key to accept or replace, or\n" +
-			"    supply your own with --key <value>.\n" +
+			"    supply your own with --key <value> (" + configrepo.SecretPatternDescription + ").\n" +
 			"  - Off by default.\n\n" +
 			"If <org>/classroom50 doesn't exist yet, run `gh teacher init\n" +
 			"<org>` first. If <short-name> already exists in the repository,\n" +
@@ -145,8 +145,8 @@ func classroomAddCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&name, "name", "", `Full display name for the classroom, for example "CS Principles"`)
 	cmd.Flags().StringVar(&term, "term", "", "Term identifier, for example Spring-2026")
-	cmd.Flags().BoolVar(&unlisted, "unlisted", false, "Publish this classroom's resources at an unguessable URL path segment (obscurity, not access control; prompts to accept a generated key)")
-	cmd.Flags().StringVar(&key, "key", "", "Supply a specific access key for the unlisted URL (implies --unlisted); must match "+configrepo.SecretPatternDescription)
+	cmd.Flags().BoolVar(&unlisted, "unlisted", false, "Publish the classroom's resources at an unguessable URL (obscurity, not access control)")
+	cmd.Flags().StringVar(&key, "key", "", "Access key for the unlisted URL instead of a generated one (implies --unlisted)")
 	return cmd
 }
 
@@ -407,8 +407,8 @@ func classroomListCmd() *cobra.Command {
 			"    --json it carries `\"active\": false`.\n" +
 			"  - Default output is one short-name per line on stdout, pipeable\n" +
 			"    into `xargs`, `grep`, or an agent loop.\n" +
-			"  - Pass --json to emit the full array of {short_name, name, term}\n" +
-			"    objects instead.\n" +
+			"  - Pass --json to emit the full array of {short_name, name, term,\n" +
+			"    active} objects instead.\n" +
 			"  - A one-line `<org>/<repo>: N classroom(s)` summary goes to\n" +
 			"    stderr unless --quiet is set.\n\n" +
 			"This is a read-only command; no commit lands on the repository.",
@@ -429,7 +429,7 @@ func classroomListCmd() *cobra.Command {
 			return runClassroomList(client, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, asJSON, quiet, all)
 		},
 	}
-	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit the full JSON array of {short_name, name, term, active} objects instead of one short-name per line")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Output the classrooms as a JSON array instead of one short-name per line")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress the stderr summary so stdout is the only output stream")
 	cmd.Flags().BoolVar(&all, "all", false, "Include archived classrooms (active:false), which are hidden by default")
 	return cmd

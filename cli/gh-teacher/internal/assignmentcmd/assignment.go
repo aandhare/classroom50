@@ -98,76 +98,86 @@ func assignmentAddCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "add <org> <classroom> <slug>",
 		Short: "Add or upsert an assignment in assignments.json",
-		Long: "Register an assignment (its template repository and the autograder\n" +
-			"it runs against) in <org>/classroom50/<classroom>/assignments.json.\n\n" +
-			"  - `<slug>` must match ^[a-z0-9][a-z0-9-]{1,99}$ (the same shape\n" +
-			"    as classroom short-names) because student repos are named\n" +
-			"    `<classroom>-<slug>-<username>`.\n" +
-			"  - Only --name is required; --template is optional (omit it for\n" +
-			"    a template-less assignment).\n" +
-			"  - If the slug already exists in assignments.json, the entry is\n" +
-			"    replaced in place (idempotent for repeated edits to the same\n" +
-			"    assignment).\n\n" +
-			"--locked registers the assignment locked, the same as\n" +
-			"`gh teacher assignment lock`:\n" +
-			"  - Students can't see or accept it.\n" +
-			"  - A private template in the org stays unreadable to the\n" +
-			"    classroom team until you unlock.\n" +
-			"  - Use it to stage a timed assessment, then unlock when the\n" +
-			"    session starts.\n\n" +
-			"--empty-repo creates truly bare student repos:\n" +
-			"  - No README, no .classroom50.yaml marker, no autograde workflow:\n" +
-			"    for assignments where students build everything (including\n" +
-			"    their own GitHub Actions) from scratch.\n" +
-			"  - Autograding and the Feedback PR are disabled.\n" +
-			"  - Changing this on a same-slug re-add applies only to accepts\n" +
-			"    from now on; repositories students already accepted are not\n" +
-			"    retrofitted (a warning is printed).\n" +
-			"  - Mutually exclusive with --template, --tests, --feedback-pr,\n" +
+		Long: "Register an assignment (its template repository and how it is\n" +
+			"graded) in <org>/classroom50/<classroom>/assignments.json.\n\n" +
+			"  - <slug> must match ^[a-z0-9][a-z0-9-]{1,99}$ because student\n" +
+			"    repos are named <classroom>-<slug>-<username>.\n" +
+			"  - Only --name is required. Omit --template for a template-less\n" +
+			"    assignment: students get a README plus the autograding setup.\n" +
+			"  - Re-adding an existing slug replaces the entry in place. Settings\n" +
+			"    that shape a student repo (--repo-visibility, --pages,\n" +
+			"    --student-permission, --submission-mode, --submission-tag,\n" +
+			"    --empty-repo) apply to accepts from then on; repos students\n" +
+			"    already accepted are unchanged.\n\n" +
+			"Template (--template <owner>/<repo>):\n" +
+			"  - The repository must be marked as a template (Settings >\n" +
+			"    \"Template repository\") and be visible to your account.\n" +
+			"  - Students always get its default branch; an @<branch> suffix is\n" +
+			"    accepted but ignored.\n\n" +
+			"Release and access:\n" +
+			"  - An assignment is hidden from the student list until\n" +
+			"    --available-from passes (invite-link accept still works). That\n" +
+			"    is listing only: pair it with --locked to keep a private\n" +
+			"    template unreadable until release.\n" +
+			"  - --locked hides the assignment from every student, the same as\n" +
+			"    `gh teacher assignment lock`. Use it to stage a timed\n" +
+			"    assessment, then unlock when the session starts. On a re-add,\n" +
+			"    --locked=false unlocks and omitting the flag keeps the stored\n" +
+			"    lock.\n\n" +
+			"Grading, one of:\n" +
+			"  1. Declarative tests: --tests <file.json> (or `gh teacher\n" +
+			"     assignment test add`) describes io/run/python checks the\n" +
+			"     runner grades with no autograder script.\n" +
+			"  2. A per-assignment autograder at <classroom>/autograders/<slug>/\n" +
+			"     in the classroom50 repository (mutually exclusive with --tests).\n" +
+			"  3. A classroom default installed by\n" +
+			"     `gh teacher autograder set-default <org> <classroom>`.\n" +
+			"  --runtime picks the runner label(s), language toolchains, apt\n" +
+			"  packages, or container image (default ubuntu-latest and Python\n" +
+			"  3.14). --autograder swaps the reusable workflow itself and is\n" +
+			"  rarely needed. See the Advanced-Autograding wiki page for the\n" +
+			"  JSON schemas and the result.json contract.\n\n" +
+			"Submissions:\n" +
+			"  - --submission-mode tag grades only submit/* tag pushes (what\n" +
+			"    `gh student submit` creates), so plain pushes cost no Actions\n" +
+			"    minutes. --submission-tag adds milestone tag patterns that also\n" +
+			"    grade; a broad glob like 'v*' grades every matching tag. Both\n" +
+			"    are baked into each student repo at accept;\n" +
+			"    `gh teacher assignment submission-mode` changes them later and\n" +
+			"    retrofits existing repos.\n" +
+			"  - --allowed-files patterns (gitignore-style, last match wins, !\n" +
+			"    re-includes) decide which files the runner grades and\n" +
+			"    `gh student submit` uploads. Omit to allow every file.\n" +
+			"  - --pass-threshold marks submissions at or above that percentage\n" +
+			"    as passing in the submissions page. It never changes a score.\n" +
+			"    Omit it for no passing bar; --pass-threshold 0 is an explicit 0%.\n\n" +
+			"Student repos:\n" +
+			"  - --repo-visibility public makes every student's work (names,\n" +
+			"    emails, history) visible to anyone. Public repos are also not\n" +
+			"    autograded: GitHub blocks them from running the grading\n" +
+			"    workflow in the private classroom50 repository, so keep repos\n" +
+			"    private while grading. If org policy blocks public repos, accept\n" +
+			"    falls back to private and tells the student.\n" +
+			"  - --pages publishes a site from each repo: workflow lets a GitHub\n" +
+			"    Actions workflow in the repo deploy it (it needs pages: write and\n" +
+			"    id-token: write permissions), branch has GitHub serve a branch\n" +
+			"    directly. The site is public even when the repo is private.\n" +
+			"    Pages on private repos needs a paid GitHub plan; on GitHub Free\n" +
+			"    for organizations, pair it with --repo-visibility public.\n" +
+			"  - --student-permission admin lets students change repo settings\n" +
+			"    and collaborators (for example to manage Pages themselves). The\n" +
+			"    org lockdown from `gh teacher init` still blocks visibility\n" +
+			"    changes; verify with `gh teacher audit`.\n" +
+			"  - --feedback-pr (on by default) opens one feedback pull request\n" +
+			"    per student repo for inline review of the starter-to-submission\n" +
+			"    diff; --feedback-pr=false turns it off. Requires the org\n" +
+			"    prerequisites from `gh teacher init`.\n" +
+			"  - --empty-repo creates bare repos (no README, .classroom50.yaml\n" +
+			"    marker, or autograde workflow) for students who build everything\n" +
+			"    from scratch. Autograding and the feedback pull request are off.\n" +
+			"    Mutually exclusive with --template, --tests, --feedback-pr,\n" +
 			"    --allowed-files, --pass-threshold, --submission-mode, and\n" +
-			"    --submission-tag.\n\n" +
-			"--template parses `<owner>/<repo>` (or `<owner>/<repo>@<branch>`):\n" +
-			"  - A custom source branch is tolerated but ignored; the\n" +
-			"    assignment uses the template repository's default branch. To\n" +
-			"    use a different branch, change the template repository's\n" +
-			"    default branch first.\n" +
-			"  - The template repository must be marked `is_template: true`\n" +
-			"    (set in Settings -> \"Template repository\").\n" +
-			"  - If your account can't see the repository, the CLI returns the\n" +
-			"    cross-org visibility message.\n\n" +
-			"--runtime points at a JSON file describing the runtime environment\n" +
-			"for this assignment's autograde job:\n" +
-			"  - Which runner label(s), optional language toolchains\n" +
-			"    (python/node/java/go/rust), optional apt packages, or a custom\n" +
-			"    container image.\n" +
-			"  - `runs-on` mirrors GitHub Actions itself: a single label\n" +
-			"    (\"ubuntu-latest\") or an array of labels\n" +
-			"    ([\"self-hosted\", \"gpu\"]) for a custom or self-hosted runner.\n" +
-			"  - Pass `-` to read the JSON from stdin instead of a file\n" +
-			"    (one-shot agent flows).\n" +
-			"  - Omit for the defaults (ubuntu-latest and Python 3.14). See the\n" +
-			"    Advanced-Autograding wiki page for the JSON schema and worked\n" +
-			"    examples.\n\n" +
-			"--autograder is reserved for the rare case where you need to call\n" +
-			"a different reusable workflow entirely (for different language\n" +
-			"toolchains, use --runtime instead):\n" +
-			"  - The name resolves to <classroom>/autograders/<name>.yaml; the\n" +
-			"    referenced file must exist at write time.\n" +
-			"  - The default is `default`, the universal shim embedded in\n" +
-			"    gh-student, which `uses:` the autograde-runner workflow in the\n" +
-			"    classroom50 repository.\n\n" +
-			"There are three ways to grade:\n" +
-			"  1. Declarative tests: pass --tests <file.json> here (or use\n" +
-			"     `gh teacher assignment test add`) to describe io/run/python\n" +
-			"     checks that the runner grades with no autograder script.\n" +
-			"  2. A per-assignment autograder: drop an entrypoint plus any\n" +
-			"     sibling fixtures at <classroom>/autograders/<slug>/ in the\n" +
-			"     classroom50 repository (mutually exclusive with --tests).\n" +
-			"  3. A classroom default: run\n" +
-			"     `gh teacher autograder set-default <org> <classroom>` to\n" +
-			"     install <classroom>/autograder.py for every assignment.\n\n" +
-			"See the Advanced-Autograding wiki page for the result.json\n" +
-			"contract and templates (pytest, custom).",
+			"    --submission-tag.",
 		Example: "  gh teacher assignment add cs50-fall-2026 cs-principles hello \\\n" +
 			"      --name \"Hello\" --template cs50/hello-template \\\n" +
 			"      --due 2026-09-15T23:59:00-04:00\n" +
@@ -365,29 +375,29 @@ func assignmentAddCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&name, "name", "", `Display name written into the assignment entry, for example "Hello" (required)`)
-	cmd.Flags().StringVar(&template, "template", "", "Optional template repository as <owner>/<repo> (or <owner>/<repo>@<branch>). Omit for a template-less assignment (students get an initialized repo: a README plus the autograding setup). A custom source branch (@<branch>) is tolerated but ignored; the assignment uses the template's default branch, so change that to use a different one")
-	cmd.Flags().StringVar(&description, "description", "", "Optional one-line description")
-	cmd.Flags().StringVar(&due, "due", "", "Optional due date, for example 2026-09-15T23:59:00-04:00; stored as UTC. Omit the offset to use the machine's local timezone")
-	cmd.Flags().StringVar(&availableFrom, "available-from", "", "Optional release date, for example 2026-09-15T00:00:00-04:00; stored as UTC. Assignments are hidden from the student list by default (invite-link accept only); set this to list it for everyone once the date passes. Students who already accepted always see it. Listing only, not access control: a private in-org template stays readable to the classroom team, so pair it with --locked to hide the template until release. Omit the offset to use the machine's local timezone")
-	cmd.Flags().StringVar(&mode, "mode", assignment.ModeIndividual, "Assignment mode: 'individual' (default), 'group' (legacy shared repo through collaborators), or 'team' (shared repo owned by a GitHub Team). Group and team modes require --max-group-size; team mode also requires --team-formation")
-	cmd.Flags().IntVar(&maxGroupSize, "max-group-size", 0, "Maximum group size (>= 2; required with --mode group or --mode team). Enforced within Classroom 50 clients when groups form; direct GitHub-UI changes can bypass it")
-	cmd.Flags().StringVar(&teamFormation, "team-formation", "", "Who forms the groups of a team assignment: 'teacher' (you create the teams) or 'student' (the first student founds a team and adds teammates). Required with --mode team")
-	cmd.Flags().StringVar(&autograder, "autograder", contract.DefaultAutograderName, "Autograder workflow shim this assignment opts into; resolves to <classroom>/autograders/<name>.yaml in the classroom50 repository")
-	cmd.Flags().StringVar(&runtimeFile, "runtime", "", "Path to a JSON file describing the runtime environment (runs-on as a single label or an array of labels for self-hosted runners, python/node/java/go/rust versions, apt packages, or container image), or '-' to read from stdin. Omit for ubuntu-latest and Python 3.14")
-	cmd.Flags().StringVar(&testsFile, "tests", "", "Path to a JSON file of declarative test specs (io/run/python), or '-' to read from stdin: either a bare array or the generated tests.json envelope ({\"schema\": \"classroom50/tests/v1\", \"tests\": [...]}). Sets the assignment's 'tests' block; mutually exclusive with a per-assignment autograder. To change only the tests on an existing assignment, use 'gh teacher assignment test set'")
-	cmd.Flags().BoolVar(&feedbackPR, "feedback-pr", true, "Open one long-lived Feedback pull request per student repo so you can leave inline review comments on the full starter-to-submission diff. Accept freezes a base branch at the baseline commit and opens the PR right away, so it exists even with GitHub Actions disabled; the autograde runner then adopts and maintains it (and opens it on the first submission if accept could not). Default on; pass --feedback-pr=false to disable. Requires 'gh teacher init' to have set up the org prerequisites")
-	cmd.Flags().BoolVar(&emptyRepo, "empty-repo", false, "Create truly bare student repos (no README or initial commit, no .classroom50.yaml marker, no autograde workflow) for assignments where students build the repo, including their own GitHub Actions, from scratch. Autograding and the Feedback PR are disabled. Changing this on a same-slug re-add applies only to accepts from now on (repositories students already accepted are not retrofitted; a warning is printed). Mutually exclusive with --template, --tests, --feedback-pr, --allowed-files, --pass-threshold, --submission-mode, and --submission-tag")
-	cmd.Flags().StringArrayVar(&allowedFiles, "allowed-files", nil, "Ordered .gitignore-style pattern (repeatable, order preserved) defining which files belong to the submission. Last match wins; ! re-includes. Pass --allowed-files '*' --allowed-files '!hello.py' to allow only hello.py. The autograde runner removes disallowed files before grading (control files are always kept); 'gh student submit' filters them too. Omit to allow every file")
-	cmd.Flags().IntVar(&passThreshold, "pass-threshold", 0, "Opt-in passing bar as a percentage of max score (0-100): at or above it the submissions page shows a submission as passing. Advisory and display-only: it does not change a student's score. Omit to leave it off (no passing concept); pass --pass-threshold 0 for an explicit 0%")
-	cmd.Flags().StringVar(&studentPerm, "student-permission", "", "Optional collaborator role each student gets on their own assignment repo at accept time: one of pull, triage, push, maintain, admin. Omit for the default (push for individual, admin for group). Choose admin to let students manage repo settings and enable GitHub Pages. Applies to students who accept from now on; existing repos are unchanged. Caution: admin lets the student manage the repo's settings and collaborators; the org lockdown from 'gh teacher init' still blocks members from changing repo visibility (verify with 'gh teacher audit')")
-	cmd.Flags().StringVar(&submissionMd, "submission-mode", contract.SubmissionModeEveryPush, "When the autograder fires: 'every-push' (default; every push to the default branch grades) or 'tag' (only submit/* tag pushes grade: 'gh student submit' pushes the tag, or push any submit/* tag by hand; plain 'git push' costs no Actions minutes). Baked into each student repo's shim at accept time; change it later with 'gh teacher assignment submission-mode', which also retrofits existing repos. Mutually exclusive with --empty-repo")
-	cmd.Flags().StringArrayVar(&submissionTags, "submission-tag", nil, "Milestone tag pattern (repeatable) that also triggers grading, for example --submission-tag phase1 --submission-tag phase2, or a glob like 'v*'. A student pushing a matching tag ('git tag phase1 && git push origin phase1') gets that commit graded; the grading record still lives at the canonical submit/* tag the runner mints, so history and collection are unchanged. The canonical submit/* namespace always triggers too. Baked into the shim at accept time like --submission-mode (same retrofit to change later). Caution: a broad glob like 'v*' grades every matching tag a student pushes. Mutually exclusive with --empty-repo")
-	cmd.Flags().StringVar(&repoVisibility, "repo-visibility", contract.RepoVisibilityPrivate, "Visibility each student repo is created with at accept time: 'private' (default) or 'public' (for peer-review, portfolio, or showcase assignments; students are told upfront their work will be publicly visible). Applies to students who accept from now on; existing repos are unchanged (flip those from the gradebook's visibility actions). Caution with public: student work (names, emails, commit history) is visible to anyone on the internet from the moment the repo is created. Public repos are also not autograded: GitHub blocks them from running the grading workflow in the private classroom50 repo, so every grading run fails with \"workflow was not found\". Keep repos private while grading, or turn off the built-in autograder in the web app. If org policy blocks members from creating public repos, accept falls back to a private repo and tells the student")
-	cmd.Flags().StringVar(&pagesSource, "pages", pagesOff, "GitHub Pages site configured on each student repo at accept time, so students never need admin to publish: 'off' (default), 'workflow' (a GitHub Actions workflow in the student repo deploys the site; it needs pages: write and id-token: write permissions and comes from the template or the student), or 'branch' (GitHub publishes a branch directly, no workflow needed). The site is public on the internet even when the repo is private, and every file in the published branch and folder is served. Applies to students who accept from now on; enable it on existing repos from the gradebook. Pages on private repos needs a GitHub plan that includes it; on GitHub Free for organizations, pair it with --repo-visibility public (public repos are not autograded; see that flag). Mutually exclusive with --empty-repo")
-	cmd.Flags().StringVar(&pagesBranch, "pages-branch", "", "Branch GitHub publishes with --pages branch. Omit for each student repo's default branch. A named branch must exist in the generated repo (for example, copied from the template with include_all_branches)")
-	cmd.Flags().StringVar(&pagesPath, "pages-path", contract.PagesPathRoot, "Folder GitHub publishes with --pages branch: '/' (default) or '/docs'")
-	cmd.Flags().BoolVar(&locked, "locked", false, "Lock the assignment so students can't see or accept it, including students who already accepted. For a private template in the org, the classroom team gets no read access until you unlock. Same effect as 'gh teacher assignment lock'. On a same-slug re-add, --locked=false unlocks and omitting the flag keeps the stored lock")
+	cmd.Flags().StringVar(&name, "name", "", `Display name shown to students, for example "Hello" (required)`)
+	cmd.Flags().StringVar(&template, "template", "", "Template repository as <owner>/<repo>; omit for a template-less assignment")
+	cmd.Flags().StringVar(&description, "description", "", "One-line description")
+	cmd.Flags().StringVar(&due, "due", "", "Due date, for example 2026-09-15T23:59:00-04:00 (no offset means local time)")
+	cmd.Flags().StringVar(&availableFrom, "available-from", "", "Release date in the same format as --due; hidden from the student list until then")
+	cmd.Flags().StringVar(&mode, "mode", assignment.ModeIndividual, "Assignment mode: {individual|group|team}")
+	cmd.Flags().IntVar(&maxGroupSize, "max-group-size", 0, "Maximum group size, at least 2 (required with --mode group or team)")
+	cmd.Flags().StringVar(&teamFormation, "team-formation", "", "Who forms the teams: {teacher|student} (required with --mode team)")
+	cmd.Flags().StringVar(&autograder, "autograder", contract.DefaultAutograderName, "Autograder workflow shim, resolved to <classroom>/autograders/<name>.yaml")
+	cmd.Flags().StringVar(&runtimeFile, "runtime", "", "JSON file describing the runner and toolchain, or - to read stdin")
+	cmd.Flags().StringVar(&testsFile, "tests", "", "JSON file of declarative test specs, or - to read stdin")
+	cmd.Flags().BoolVar(&feedbackPR, "feedback-pr", true, "Open a feedback pull request on each student repo")
+	cmd.Flags().BoolVar(&emptyRepo, "empty-repo", false, "Create bare student repos with no README, marker, or autograde workflow")
+	cmd.Flags().StringArrayVar(&allowedFiles, "allowed-files", nil, "Gitignore-style pattern for the files that count as the submission (repeatable)")
+	cmd.Flags().IntVar(&passThreshold, "pass-threshold", 0, "Percentage of the max score at or above which a submission shows as passing")
+	cmd.Flags().StringVar(&studentPerm, "student-permission", "", "Student's role on their repo: {pull|triage|push|maintain|admin} (default push; admin for group)")
+	cmd.Flags().StringVar(&submissionMd, "submission-mode", contract.SubmissionModeEveryPush, "When grading runs: {every-push|tag}")
+	cmd.Flags().StringArrayVar(&submissionTags, "submission-tag", nil, "Extra tag pattern that also triggers grading, for example phase1 or 'v*' (repeatable)")
+	cmd.Flags().StringVar(&repoVisibility, "repo-visibility", contract.RepoVisibilityPrivate, "Visibility of new student repos: {private|public}; public repos are not autograded")
+	cmd.Flags().StringVar(&pagesSource, "pages", pagesOff, "GitHub Pages source for new student repos: {off|workflow|branch}")
+	cmd.Flags().StringVar(&pagesBranch, "pages-branch", "", "Branch to publish with --pages branch; must exist in the student repo (default: default branch)")
+	cmd.Flags().StringVar(&pagesPath, "pages-path", contract.PagesPathRoot, "Folder to publish with --pages branch: {/|/docs}")
+	cmd.Flags().BoolVar(&locked, "locked", false, "Register the assignment locked so students can't see or accept it")
 	return cmd
 }
 

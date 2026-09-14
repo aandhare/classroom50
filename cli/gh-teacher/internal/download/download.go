@@ -188,7 +188,7 @@ func NewCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&dir, "dir", "d", "", "Directory to clone repos into (default: <classroom>-<assignment>_submissions_<timestamp>)")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress informational output and pass --quiet to git clone and git pull (errors still go to stderr)")
-	cmd.Flags().BoolVar(&byPattern, "by-pattern", false, "Skip the team lookup and clone every <org> repo matching <classroom>-<assignment>-* (no scores.csv, no result.json fetch)")
+	cmd.Flags().BoolVar(&byPattern, "by-pattern", false, "Clone every <org> repo named <classroom>-<assignment>-* instead of looking up the team")
 	cmd.Flags().BoolVar(&pull, "pull", false, "Update clones already on disk with git pull --ff-only instead of skipping them")
 	return cmd
 }
