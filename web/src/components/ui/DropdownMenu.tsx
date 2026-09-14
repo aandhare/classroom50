@@ -1,10 +1,11 @@
 import type { ComponentPropsWithRef, ComponentType, ReactNode } from "react"
 
+import { Button, type ButtonProps } from "./Button"
 import { cx } from "./cx"
 
 // Single source for the DaisyUI dropdown menu surface so the popover chrome
-// can't drift. Callers own the `dropdown` wrapper and trigger; pass sizing
-// utilities (width, max-height, overflow) via className.
+// can't drift. Callers own the `dropdown` wrapper and put a `DropdownMenu.Trigger`
+// in it; pass sizing utilities (width, max-height, overflow) via className.
 export type DropdownMenuProps = ComponentPropsWithRef<"ul">
 
 // The one popover-surface recipe (chrome only, no layout), shared by
@@ -37,6 +38,16 @@ function DropdownMenuSeparator() {
   )
 }
 DropdownMenu.Separator = DropdownMenuSeparator
+
+export type DropdownTriggerProps = Omit<ButtonProps, "tabIndex">
+
+// The one trigger recipe. Safari only focuses a button on click when tabindex
+// is set explicitly (#987), and daisyUI opens the menu on focus. Applied after
+// the spread so a spread-in tabIndex cannot displace it.
+function DropdownTrigger(props: DropdownTriggerProps) {
+  return <Button {...props} tabIndex={0} />
+}
+DropdownMenu.Trigger = DropdownTrigger
 
 // daisyUI dropdowns are focus-driven, so "close the menu" is "blur the focused
 // item". The single helper for every menu item's onClick.

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { page } from "vitest/browser"
+import { page, userEvent } from "vitest/browser"
 import { render, screen } from "@testing-library/react"
 
 import { SubmissionsActionsMenu } from "@/pages/submissions/SubmissionsActionsMenu"
@@ -66,6 +66,29 @@ describe("SubmissionsActionsMenu pointer interaction", () => {
     await expect.element(menu).not.toBeVisible()
     await trigger.click()
     await expect.element(menu).toBeVisible()
+  })
+
+  it("opens when tabbed onto and selects an item with Enter", async () => {
+    const onLockToggle = vi.fn()
+    const { menu } = renderMenu({ onLockToggle })
+    await page.getByRole("button", { name: "Outside", exact: true }).click()
+    await userEvent.tab()
+    await expect.element(menu).toBeVisible()
+    // The list is itself a tab stop, so the first item is two Tabs away.
+    await userEvent.tab()
+    await userEvent.tab()
+    await expect
+      .element(
+        page.getByRole("button", {
+          name: "submissions.lock.lockLabel",
+          exact: true,
+        }),
+      )
+      .toHaveFocus()
+    await expect.element(menu).toBeVisible()
+    await userEvent.keyboard("{Enter}")
+    expect(onLockToggle).toHaveBeenCalledOnce()
+    await expect.element(menu).not.toBeVisible()
   })
 
   it("keeps the trigger unavailable while regrading", async () => {
