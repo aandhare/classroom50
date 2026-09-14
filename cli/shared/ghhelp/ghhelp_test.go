@@ -9,7 +9,9 @@ import (
 	"github.com/spf13/pflag"
 )
 
-func newTree() (*cobra.Command, *cobra.Command) {
+const longFlagDescription = "Ordered gitignore-style pattern deciding which files count as the submission, last match wins"
+
+func newTree() *cobra.Command {
 	root := &cobra.Command{Use: "tool", Short: "Do tool things"}
 	root.PersistentFlags().Bool("verbose", false, "Show operational details")
 	leaf := &cobra.Command{
@@ -21,21 +23,16 @@ func newTree() (*cobra.Command, *cobra.Command) {
 		RunE:    func(*cobra.Command, []string) error { return nil },
 	}
 	leaf.Flags().String("mode", "individual", "Assignment mode: {individual|group|team}")
+	leaf.Flags().StringArray("allowed-files", nil, longFlagDescription)
 	root.AddCommand(leaf)
 	group := &cobra.Command{Use: "group", Short: "Manage things", Long: "Long description of group."}
 	group.AddCommand(&cobra.Command{Use: "list", Short: "List things", RunE: func(*cobra.Command, []string) error { return nil }})
 	root.AddCommand(group)
 	Install(root)
-	return root, leaf
+	return root
 }
 
-func run(t *testing.T, root *cobra.Command, args ...string) string {
-	t.Helper()
-	out, _ := runErr(t, root, args...)
-	return out
-}
-
-func runErr(t *testing.T, root *cobra.Command, args ...string) (string, error) {
+func run(t *testing.T, root *cobra.Command, args ...string) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -45,9 +42,59 @@ func runErr(t *testing.T, root *cobra.Command, args ...string) (string, error) {
 	return buf.String(), err
 }
 
+func TestHelpTemplateDerivesFromCobra(t *testing.T) {
+	tmpl := helpTemplate()
+	if got := strings.Count(tmpl, "wrappedFlagUsages"); got != 2 {
+		t.Fatalf("expected both flag sections swapped for wrappedFlagUsages, found %d; Cobra's default template may have changed", got)
+	}
+	for _, leftover := range []string{".FlagUsages", "{{.UsageString}}"} {
+		if strings.Contains(tmpl, leftover) {
+			t.Errorf("%s survived the replacement; Cobra's default template may have changed", leftover)
+		}
+	}
+}
+
+func TestUsageErrorIsConcise(t *testing.T) {
+	out, _ := run(t, newTree(), "add")
+	for _, want := range []string{"tool add <name> [flags]", "Run 'tool add --help' for details and examples."} {
+		if !strings.Contains(out, want) {
+			t.Errorf("usage error output missing %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"Flags:", "--mode", "Long description"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("usage error output should not contain %q:\n%s", unwanted, out)
+		}
+	}
+}
+
+func TestHelpIsFull(t *testing.T) {
+	out, _ := run(t, newTree(), "add", "--help")
+	for _, want := range []string{"Long description of add.", "Usage:", "Examples:", "tool add hello", "Flags:", "--mode string", "{individual|group|team}", "Global Flags:", "--verbose"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("--help output missing %q:\n%s", want, out)
+		}
+	}
+	if i, j := strings.Index(out, "Long description"), strings.Index(out, "Usage:"); i > j {
+		t.Errorf("description should precede Usage (gh order):\n%s", out)
+	}
+	// The flag column is wrapped: the long description never renders on one
+	// line and nothing exceeds the width cap.
+	if strings.Contains(out, longFlagDescription) {
+		t.Errorf("long flag description was not wrapped:\n%s", out)
+	}
+	if !strings.Contains(out, "last match wins") {
+		t.Errorf("wrapping dropped the end of the description:\n%s", out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if n := len([]rune(l)); n > maxWrapWidth {
+			t.Errorf("line exceeds %d columns (%d): %q", maxWrapWidth, n, l)
+		}
+	}
+}
+
 func TestGroupRejectsUnknownSubcommand(t *testing.T) {
-	root, _ := newTree()
-	out, err := runErr(t, root, "group", "lst")
+	out, err := run(t, newTree(), "group", "lst")
 	if err == nil {
 		t.Fatalf("a mistyped subcommand must fail, got exit 0 with:\n%s", out)
 	}
@@ -62,8 +109,7 @@ func TestGroupRejectsUnknownSubcommand(t *testing.T) {
 }
 
 func TestBareGroupStillPrintsHelp(t *testing.T) {
-	root, _ := newTree()
-	out, err := runErr(t, root, "group")
+	out, err := run(t, newTree(), "group")
 	if err != nil {
 		t.Fatalf("bare group should succeed, got %v", err)
 	}
@@ -74,47 +120,8 @@ func TestBareGroupStillPrintsHelp(t *testing.T) {
 	}
 }
 
-func TestHelpTemplateDerivesFromCobra(t *testing.T) {
-	tmpl := helpTemplate()
-	if got := strings.Count(tmpl, "wrappedFlagUsages"); got != 2 {
-		t.Fatalf("expected both flag sections swapped for wrappedFlagUsages, found %d; Cobra's default template may have changed", got)
-	}
-	if strings.Contains(tmpl, ".FlagUsages") {
-		t.Fatal("an unwrapped FlagUsages call survived the replacement")
-	}
-}
-
-func TestUsageErrorIsConcise(t *testing.T) {
-	root, _ := newTree()
-	out := run(t, root, "add")
-	for _, want := range []string{"tool add <name> [flags]", "Run 'tool add --help' for details and examples."} {
-		if !strings.Contains(out, want) {
-			t.Errorf("usage error output missing %q:\n%s", want, out)
-		}
-	}
-	for _, unwanted := range []string{"Flags:", "--mode", "Long description"} {
-		if strings.Contains(out, unwanted) {
-			t.Errorf("usage error output should not contain %q:\n%s", unwanted, out)
-		}
-	}
-}
-
-func TestHelpIsFull(t *testing.T) {
-	root, _ := newTree()
-	out := run(t, root, "add", "--help")
-	for _, want := range []string{"Long description of add.", "Usage:", "Examples:", "tool add hello", "Flags:", "--mode string", "{individual|group|team}", "Global Flags:", "--verbose"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("--help output missing %q:\n%s", want, out)
-		}
-	}
-	if i, j := strings.Index(out, "Long description"), strings.Index(out, "Usage:"); i > j {
-		t.Errorf("description should precede Usage (gh order):\n%s", out)
-	}
-}
-
 func TestLintPassesCleanTree(t *testing.T) {
-	root, _ := newTree()
-	if got := Lint(root); len(got) != 0 {
+	if got := Lint(newTree()); len(got) != 0 {
 		t.Fatalf("clean tree reported violations: %v", got)
 	}
 }
@@ -171,7 +178,7 @@ func TestLintShort(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := lintShort(&cobra.Command{Use: "x", Short: tc.short})
+			got := lintShort(tc.short)
 			if len(got) != len(tc.want) {
 				t.Fatalf("expected %d violation(s) %v, got %v", len(tc.want), tc.want, got)
 			}
@@ -181,27 +188,5 @@ func TestLintShort(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestWrapFlagUsagesBoundsEveryLine(t *testing.T) {
-	const desc = "Ordered gitignore-style pattern deciding which files count as the submission, last match wins"
-	fs := pflag.NewFlagSet("t", pflag.ContinueOnError)
-	fs.StringArray("allowed-files", nil, desc)
-
-	lines := strings.Split(strings.TrimRight(wrapFlagUsages(fs, 60), "\n"), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("expected the %d-char description to wrap at width 60, got:\n%s", len(desc), strings.Join(lines, "\n"))
-	}
-	for _, l := range lines {
-		if n := len([]rune(l)); n > 60 {
-			t.Errorf("line exceeds width 60 (%d): %q", n, l)
-		}
-	}
-	if !strings.Contains(lines[len(lines)-1], "wins") {
-		t.Errorf("wrapping dropped the end of the description:\n%s", strings.Join(lines, "\n"))
-	}
-	if unwrapped := fs.FlagUsages(); strings.Count(unwrapped, "\n") != 1 {
-		t.Fatalf("test premise broken: pflag's FlagUsages should print one line, got %q", unwrapped)
 	}
 }

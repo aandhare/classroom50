@@ -9,11 +9,11 @@
 package ghhelp
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -37,13 +37,10 @@ Available Commands:{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "he
 Run '{{.CommandPath}} --help' for details and examples.
 `
 
-// Install applies the templates to root. Cobra resolves templates through the
-// parent chain at render time, so subcommands inherit them regardless of when
-// they are added.
-//
-// It also makes every command group reject a mistyped subcommand. Cobra only
-// does that for the root; a bare group is not runnable, so `tool group bogus`
-// prints the group's full help and exits 0 without ever validating args.
+// Install applies the templates to root and the unknown-subcommand guard to
+// every group under it. Call it after the last AddCommand: templates are
+// inherited at render time, but the guard is attached to the tree as it
+// exists now.
 func Install(root *cobra.Command) {
 	cobra.AddTemplateFunc("wrappedFlagUsages", wrappedFlagUsages)
 	root.SetUsageTemplate(usageTemplate)
@@ -53,21 +50,25 @@ func Install(root *cobra.Command) {
 	}
 }
 
+// rejectUnknownSubcommands makes a command group fail on a mistyped
+// subcommand. Cobra only does that for the root; a bare group is not
+// runnable, so `tool group bogus` prints the group's full help and exits 0
+// without ever validating args.
 func rejectUnknownSubcommands(c *cobra.Command) {
-	if c.HasSubCommands() && !c.Runnable() && c.Args == nil {
+	if c.HasSubCommands() && !c.Runnable() {
+		// Cobra applies this default only on its own root-command path.
+		if c.SuggestionsMinimumDistance <= 0 {
+			c.SuggestionsMinimumDistance = 2
+		}
 		c.RunE = func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return cmd.Help()
 			}
-			msg := fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath())
-			// Cobra applies this default only on its own root-command path.
-			if cmd.SuggestionsMinimumDistance <= 0 {
-				cmd.SuggestionsMinimumDistance = 2
-			}
+			var hint string
 			if s := cmd.SuggestionsFor(args[0]); len(s) > 0 {
-				msg += "\n\nDid you mean this?\n\t" + strings.Join(s, "\n\t")
+				hint = "\n\nDid you mean this?\n\t" + strings.Join(s, "\n\t")
 			}
-			return errors.New(msg)
+			return fmt.Errorf("unknown command %q for %q%s", args[0], cmd.CommandPath(), hint)
 		}
 	}
 	for _, sub := range c.Commands() {
@@ -75,24 +76,17 @@ func rejectUnknownSubcommands(c *cobra.Command) {
 	}
 }
 
-// helpTemplate is Cobra's stock help output (description, usage, examples,
-// commands, flags) with the two flag sections swapped for the wrapping
-// variant. Deriving it from Cobra's own template keeps future upstream
-// changes (groups, help topics) instead of freezing a copy.
+// helpTemplate is Cobra's stock help output with the two flag sections
+// swapped for the wrapping variant. Both halves are read off a bare Command
+// so upstream template changes (groups, help topics) flow through instead of
+// being frozen in a copy.
 func helpTemplate() string {
-	full := strings.NewReplacer(
+	bare := &cobra.Command{}
+	usage := strings.NewReplacer(
 		"{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages .LocalFlags | trimTrailingWhitespaces}}",
 		"{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}", "{{wrappedFlagUsages .InheritedFlags | trimTrailingWhitespaces}}",
-	).Replace(cobraDefaultUsageTemplate())
-	return `{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
-
-{{end}}{{if or .Runnable .HasSubCommands}}` + full + `{{end}}`
-}
-
-// cobraDefaultUsageTemplate reads Cobra's unexported default off a bare
-// command, which is the only public way to get it.
-func cobraDefaultUsageTemplate() string {
-	return (&cobra.Command{}).UsageTemplate()
+	).Replace(bare.UsageTemplate())
+	return strings.Replace(bare.HelpTemplate(), "{{.UsageString}}", usage, 1)
 }
 
 // wrappedFlagUsages renders a flag set wrapped to the terminal width (capped
@@ -103,10 +97,6 @@ func wrappedFlagUsages(fs *pflag.FlagSet) string {
 	if err != nil || width <= 0 || width > maxWrapWidth {
 		width = maxWrapWidth
 	}
-	return wrapFlagUsages(fs, width)
-}
-
-func wrapFlagUsages(fs *pflag.FlagSet, width int) string {
 	return fs.FlagUsagesWrapped(width)
 }
 
@@ -124,8 +114,12 @@ func Lint(root *cobra.Command) []string {
 	var out []string
 	var walk func(c *cobra.Command)
 	walk = func(c *cobra.Command) {
+		// Cobra's own help/completion commands and help/version flags are
+		// not our copy; they exist once the tree has been executed.
 		if c.Name() != "help" && c.Name() != "completion" {
-			out = append(out, lintShort(c)...)
+			for _, v := range lintShort(c.Short) {
+				out = append(out, c.CommandPath()+": "+v)
+			}
 			c.LocalFlags().VisitAll(func(f *pflag.Flag) {
 				if f.Name == "help" || f.Name == "version" {
 					return
@@ -143,20 +137,19 @@ func Lint(root *cobra.Command) []string {
 	return out
 }
 
-func lintShort(c *cobra.Command) []string {
-	s := c.Short
+func lintShort(s string) []string {
 	if s == "" {
-		return []string{c.CommandPath() + ": Short is empty"}
+		return []string{"Short is empty"}
 	}
 	var out []string
-	if !startsUpper(s) {
-		out = append(out, c.CommandPath()+": Short must start with a capital letter")
+	if !startsCapitalized(s) {
+		out = append(out, "Short must start with a capital letter")
 	}
 	if strings.HasSuffix(s, ".") {
-		out = append(out, c.CommandPath()+": Short must not end with a period")
+		out = append(out, "Short must not end with a period")
 	}
 	if len(s) > maxShort {
-		out = append(out, fmt.Sprintf("%s: Short is %d chars, max %d", c.CommandPath(), len(s), maxShort))
+		out = append(out, fmt.Sprintf("Short is %d chars, max %d", len(s), maxShort))
 	}
 	return out
 }
@@ -166,22 +159,17 @@ func lintShort(c *cobra.Command) []string {
 // (`--team name`), not as inline code, so a backtick-quoted command like
 // `gh teacher init` hijacks the type column and misaligns every other flag.
 func lintFlagUsage(f *pflag.Flag) []string {
-	usage := f.Usage
-	if usage == "" {
+	if f.Usage == "" {
 		return []string{"description is empty"}
 	}
 	var out []string
-	if n := strings.Count(usage, "`"); n != 0 && n != 2 {
+	placeholder, desc := pflag.UnquoteUsage(f)
+	if n := strings.Count(f.Usage, "`"); n != 0 && n != 2 {
 		out = append(out, "backticks must come as one pair (a pflag type placeholder) or not at all")
-	} else if n == 2 {
-		start := strings.Index(usage, "`")
-		end := strings.LastIndex(usage, "`")
-		if ph := usage[start+1 : end]; strings.ContainsAny(ph, " \t") || len(ph) > 24 {
-			out = append(out, fmt.Sprintf("backtick pair %q is not a type placeholder; pflag prints it in the type column", ph))
-		}
+	} else if n == 2 && (strings.ContainsAny(placeholder, " \t") || len(placeholder) > 24) {
+		out = append(out, fmt.Sprintf("backtick pair %q is not a type placeholder; pflag prints it in the type column", placeholder))
 	}
-	_, desc := pflag.UnquoteUsage(f)
-	if !startsUpper(desc) {
+	if !startsCapitalized(desc) {
 		out = append(out, "description must start with a capital letter")
 	}
 	if strings.HasSuffix(strings.TrimSpace(desc), ".") {
@@ -201,9 +189,8 @@ func lintFlagUsage(f *pflag.Flag) []string {
 	return out
 }
 
-func startsUpper(s string) bool {
-	for _, r := range s {
-		return unicode.IsUpper(r) || unicode.IsDigit(r)
-	}
-	return false
+// startsCapitalized accepts a leading digit too ("3 retries ...").
+func startsCapitalized(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsUpper(r) || unicode.IsDigit(r)
 }
