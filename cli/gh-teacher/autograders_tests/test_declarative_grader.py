@@ -323,6 +323,10 @@ class TestExecutePython:
         assert o["score"] == 6
         assert not o["passed"]
         assert "2/3" in o["detail"]
+        # Students see which case failed, same as the no-report fallback.
+        assert "stderr" not in o["capture"]
+        detail = ag.compose_detail(o)
+        assert "--- output ---" in detail and "test_c" in detail
 
     def test_all_pass_full_points(self, tmp_path):
         o = _pytest_run("def test_a():\n    assert True\n", tmp_path, points=5)
@@ -569,15 +573,14 @@ class TestComposeDetail:
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         assert "oops" in ag.compose_detail(o)
 
-    def test_setup_failure_shows_both_streams_labelled(self, tmp_path):
+    def test_setup_failure_shows_both_streams_in_order(self, tmp_path):
         # An apt-get or make step reports on stdout, so a setup failure that
         # showed stderr alone hid the half a teacher needs to debug it.
         spec = {"name": "t", "type": "run", "setup": "echo dep-out; echo dep-err >&2; false",
                 "run": "true", "points": 1}
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         detail = ag.compose_detail(o)
-        assert detail == ("setup exited 1\n--- setup stdout ---\ndep-out\n\n"
-                          "--- setup stderr ---\ndep-err\n")
+        assert detail == "setup exited 1\n--- setup output ---\ndep-out\ndep-err\n"
 
     def test_setup_failure_with_show_command_omits_the_run_command(self, tmp_path):
         # The run step never executed, so listing its command above the error
@@ -587,7 +590,7 @@ class TestComposeDetail:
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         detail = ag.compose_detail(o)
         assert detail == ("setup exited 1\n--- setup command ---\necho dep-err >&2; false\n"
-                          "--- setup stderr ---\ndep-err\n")
+                          "--- setup output ---\ndep-err\n")
         assert "run command" not in detail
 
     def test_run_failure_hides_setup_output_by_default(self, tmp_path):
@@ -603,7 +606,7 @@ class TestComposeDetail:
                 "run": "echo broke >&2; false", "points": 1, "show-output": True}
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         detail = ag.compose_detail(o)
-        assert "--- setup stdout ---\ninstalling" in detail
+        assert "--- setup output ---\ninstalling" in detail
         assert detail.index("installing") < detail.index("broke")
 
     def test_io_failure_shows_setup_output_under_show_output(self, tmp_path):
@@ -612,7 +615,7 @@ class TestComposeDetail:
                 "points": 1, "show-output": True}
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         detail = ag.compose_detail(o)
-        assert "--- setup stderr ---\nprep" in detail
+        assert "--- setup output ---\nprep" in detail
         assert detail.index("prep") < detail.index("nope")
 
     def test_show_command_prepends_commands(self, tmp_path):
@@ -648,10 +651,12 @@ class TestComposeDetail:
     def test_python_shows_teachers_run_not_augmented_one(self, tmp_path, monkeypatch):
         seen = {}
 
-        def fake_run(command, cwd, timeout, stdin="", bundle_dir=None):
+        def fake_run(command, cwd, timeout, stdin="", bundle_dir=None,
+                     merge_streams=False):
             seen["command"] = command
+            seen["merge"] = merge_streams
             return subprocess.CompletedProcess(args="", returncode=1,
-                                               stdout="boom\n", stderr="")
+                                               stdout="boom\n", stderr=None)
 
         monkeypatch.setattr(ag, "_ensure_pytest", lambda cwd, timeout: None)
         monkeypatch.setattr(ag, "_run_command", fake_run)
@@ -659,10 +664,35 @@ class TestComposeDetail:
                 "show-command": True}
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         assert "--json-report" in seen["command"]
+        # pytest merges streams; the combined text is the failure detail.
+        assert seen["merge"] is True
         detail = ag.compose_detail(o)
         assert "--- run command ---\npytest -q\n" in detail
         assert "--json-report" not in detail
-        assert "boom" in detail
+        assert "--- output ---\nboom" in detail
+
+    def test_exit_shows_both_stdout_and_stderr_in_order(self, tmp_path):
+        # #910: a run command's verdict often goes to stdout while stderr carries
+        # tool noise, so a failure shows both in the order they were written.
+        spec = {"name": "t", "type": "run",
+                "run": "echo the-diff; echo tool-noise >&2; echo verdict; false",
+                "points": 1}
+        o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
+        assert not o["passed"] and o["failure-kind"] == "exit"
+        detail = ag.compose_detail(o)
+        assert "--- output ---\nthe-diff\ntool-noise\nverdict" in detail
+
+    def test_run_failure_with_only_stdout_is_shown(self, tmp_path):
+        spec = {"name": "t", "type": "run", "run": "echo only-stdout; exit 3",
+                "points": 1}
+        o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
+        assert "only-stdout" in ag.compose_detail(o)
+
+    def test_io_failure_keeps_streams_apart(self, tmp_path):
+        # The comparison reads stdout, so an io test never merges.
+        detail = ag.compose_detail(self._io_fail(tmp_path, "full"))
+        assert "--- stderr ---\nwarn" in detail
+        assert "--- output ---" not in detail
 
     def test_surface_limits_clip_independently(self, tmp_path):
         # #612: the same outcome renders clipped for the release body but far
@@ -687,10 +717,18 @@ class TestComposeOutput:
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         assert o["passed"]
         output = ag.compose_output(o)
-        assert "--- setup stdout ---\nsetup-out" in output
-        assert "--- setup stderr ---\nsetup-err" in output
-        assert "--- stdout ---\nrun-out" in output
-        assert "--- stderr ---\nrun-err" in output
+        assert "--- setup output ---\nsetup-out\nsetup-err" in output
+        assert "--- output ---\nrun-out\nrun-err" in output
+        assert "stderr" not in output
+
+    def test_io_keeps_stdout_and_stderr_apart(self, tmp_path):
+        spec = {"name": "t", "type": "io", "run": "echo hello; echo warn >&2",
+                "expected": "hello", "comparison": "included", "points": 1,
+                "show-output": True}
+        o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
+        output = ag.compose_output(o)
+        assert "--- stdout ---\nhello" in output
+        assert "--- stderr ---\nwarn" in output
 
     def test_show_command_leads_the_output(self, tmp_path):
         spec = {"name": "t", "type": "run", "setup": "echo prep", "run": "echo go",
@@ -699,7 +737,7 @@ class TestComposeOutput:
         output = ag.compose_output(o)
         assert output.startswith("--- setup command ---\necho prep\n"
                                  "--- run command ---\necho go\n")
-        assert "--- setup stdout ---\nprep" in output
+        assert "--- setup output ---\nprep" in output
 
     def test_show_command_with_silent_pass(self, tmp_path):
         spec = {"name": "t", "type": "run", "run": "true", "points": 1,
@@ -910,7 +948,7 @@ class TestRenderLogReport:
         long_out = "y" * (ag.MAX_CAPTURED_CHARS * 3)
         outcomes = [{"test-name": "t", "passed": False, "score": 0, "max-score": 1,
                      "detail": "exit 1 (wanted 0)", "type": "run",
-                     "failure-kind": "exit", "capture": {"stderr": long_out}}]
+                     "failure-kind": "exit", "capture": {"output": long_out}}]
         report = ag.render_log_report(outcomes, color=False)
         assert long_out in report
         assert "... (truncated)" not in report

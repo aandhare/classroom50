@@ -205,12 +205,23 @@ value overrides the default.
 
 | Value | Students see |
 |---|---|
-| `full` (default) | A unified diff for `exact` comparisons, otherwise the expected and actual output, plus stderr. |
-| `actual-only` | The student's own stdout/stderr only, never the expected output and never a diff, since either would reveal the answer. |
+| `full` (default) | For an `io` test, a unified diff for `exact` comparisons, otherwise the expected and actual output, plus stderr. For a `run` or `python` test, the command's combined output. |
+| `actual-only` | The student's own output only, never the expected output and never a diff, since either would reveal the answer. |
 | `none` | Only the failure kind: wrong output, wrong exit code, timeout, or setup failed. |
 
-A failed `setup` command shows both of its streams, labelled `setup stdout`
-and `setup stderr`, since an install or build step reports on stdout.
+A `run` or `python` test, and every `setup` command, captures stdout and
+stderr as one stream in the order they reached the grader, the way a terminal
+or a CI log shows them. A diff that a Makefile prints to stdout lands next to
+the compiler error on stderr. A program that buffers stdout when it is not
+writing to a terminal (Python and C programs do by default) can show its
+errors before its earlier output, exactly as `cmd 2>&1 | cat` does locally. An
+`io` test keeps the two apart because the comparison reads stdout on its own.
+
+The Release body and Summary keep the first 2,000 characters of the combined
+stream, so a verbose build that ends in the error line can lose that line
+there. The grade job log keeps 100,000 characters. Send students to the log
+for long output, or quiet the command (`make -s`, `pytest -q`) so the verdict
+fits.
 
 **`show-output`** set to `true` adds a passing test's captured setup and run
 output to the report and the GitHub Actions log, in a collapsed section. Off by
