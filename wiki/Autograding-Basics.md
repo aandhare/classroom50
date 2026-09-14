@@ -217,6 +217,11 @@ to a terminal (Python and C programs do by default) may show its errors before
 its earlier output, exactly as `cmd 2>&1 | cat` does locally. An `io` test
 keeps the two apart because the comparison reads stdout on its own.
 
+The Release body and Summary keep the first 2,000 characters of that combined
+stream, so a verbose build that ends in the error line can lose it there. The
+grade job log keeps 100,000 characters; send students to it for long output,
+or quiet the command (`make -s`, `pytest -q`) so the verdict fits.
+
 **`show-output`** set to `true` adds a passing test's captured setup and run
 output to the report and the GitHub Actions log, in a collapsed section. Off by
 default (passing output is discarded). Turn it on while authoring or

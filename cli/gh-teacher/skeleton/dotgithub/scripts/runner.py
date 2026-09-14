@@ -2075,10 +2075,8 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
         if block:
             detail += f"\n{block}"
     if kind in ("cases", "exit"):
-        # One stream, as the terminal showed it: a run test's verdict often
-        # goes to stdout (a diff, a self-check) while the tool complains on
-        # stderr, and neither half may be dropped. Safe at every
-        # failure-details level: these tests have no expected side to redact.
+        # Safe at every failure-details level: these tests have no expected
+        # side to redact.
         out = cap.get("output") or ""
         return detail + (f"\n--- output ---\n{_clip(out, limit)}" if out.strip() else "")
     if kind == "output":

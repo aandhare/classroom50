@@ -323,6 +323,11 @@ class TestExecutePython:
         assert o["score"] == 6
         assert not o["passed"]
         assert "2/3" in o["detail"]
+        # The per-case path carries pytest's merged output so the student sees
+        # which case failed, same as the no-report fallback.
+        assert "stderr" not in o["capture"]
+        detail = ag.compose_detail(o)
+        assert "--- output ---" in detail and "test_c" in detail
 
     def test_all_pass_full_points(self, tmp_path):
         o = _pytest_run("def test_a():\n    assert True\n", tmp_path, points=5)
