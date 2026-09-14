@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/foundation50/classroom50-cli-shared/ghhelp"
 	"github.com/foundation50/gh-student/internal/auth"
 	"github.com/foundation50/gh-student/internal/invitecmd"
 	"github.com/foundation50/gh-student/internal/submitcmd"
@@ -26,7 +27,7 @@ var (
 	verbose bool
 )
 
-func main() {
+func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:     "gh-student",
 		Short:   "Accept and submit Classroom 50 assignments",
@@ -42,6 +43,12 @@ func main() {
 	root.AddCommand(invitecmd.NewCmd())
 	root.AddCommand(teamcmd.NewCmd())
 	root.AddCommand(submitcmd.NewCmd())
+	ghhelp.Install(root)
+	return root
+}
+
+func main() {
+	root := newRootCmd()
 
 	// Signal-aware root context: subcommands see cmd.Context() cancel on
 	// Ctrl-C / SIGTERM so in-flight HTTP (the Pages fetches in accept and
