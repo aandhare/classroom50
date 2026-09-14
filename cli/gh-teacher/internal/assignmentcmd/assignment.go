@@ -103,83 +103,37 @@ func assignmentAddCmd() *cobra.Command {
 			"  - <slug> must match ^[a-z0-9][a-z0-9-]{1,99}$ because student\n" +
 			"    repos are named <classroom>-<slug>-<username>.\n" +
 			"  - Only --name is required. Omit --template for a template-less\n" +
-			"    assignment: students get a README plus the autograding setup.\n" +
+			"    assignment; a template must be marked as one in its settings,\n" +
+			"    and students always get its default branch.\n" +
 			"  - Re-adding an existing slug replaces the entry in place. Settings\n" +
-			"    that shape a student repo (--repo-visibility, --pages,\n" +
-			"    --student-permission, --submission-mode, --submission-tag,\n" +
-			"    --empty-repo) apply to accepts from then on; repos students\n" +
-			"    already accepted are unchanged.\n\n" +
-			"Template (--template <owner>/<repo>):\n" +
-			"  - The repository must be marked as a template (Settings >\n" +
-			"    \"Template repository\") and be visible to your account.\n" +
-			"  - Students always get its default branch; an @<branch> suffix is\n" +
-			"    accepted but ignored.\n\n" +
-			"Release and access:\n" +
-			"  - Assignments are hidden from the student list by default;\n" +
-			"    students reach them only through the invite link. Set\n" +
-			"    --available-from to list one for everyone once that date passes\n" +
-			"    (students who already accepted always see it). That is listing\n" +
-			"    only: pair it with --locked to keep a private template\n" +
-			"    unreadable until release.\n" +
-			"  - --locked hides the assignment from every student, the same as\n" +
-			"    `gh teacher assignment lock`. Use it to stage a timed\n" +
-			"    assessment, then unlock when the session starts. On a re-add,\n" +
-			"    --locked=false unlocks and omitting the flag keeps the stored\n" +
-			"    lock.\n\n" +
-			"Grading, one of:\n" +
-			"  1. Declarative tests: --tests <file.json> (or `gh teacher\n" +
-			"     assignment test add`) describes io/run/python checks the\n" +
-			"     runner grades with no autograder script.\n" +
-			"  2. A per-assignment autograder at <classroom>/autograders/<slug>/\n" +
-			"     in the classroom50 repository (mutually exclusive with --tests).\n" +
-			"  3. A classroom default installed by\n" +
-			"     `gh teacher autograder set-default <org> <classroom>`.\n" +
-			"  --runtime picks the runner label(s), language toolchains, apt\n" +
-			"  packages, or container image (default ubuntu-latest and Python\n" +
-			"  3.14). --autograder swaps the reusable workflow itself and is\n" +
-			"  rarely needed. See the Advanced-Autograding wiki page for the\n" +
-			"  JSON schemas and the result.json contract.\n\n" +
-			"Submissions:\n" +
-			"  - --submission-mode tag grades only submit/* tag pushes (what\n" +
-			"    `gh student submit` creates), so plain pushes cost no Actions\n" +
-			"    minutes. --submission-tag adds milestone tag patterns that also\n" +
-			"    grade; a broad glob like 'v*' grades every matching tag. Both\n" +
-			"    are baked into each student repo at accept;\n" +
-			"    `gh teacher assignment submission-mode` changes them later and\n" +
-			"    retrofits existing repos.\n" +
-			"  - --allowed-files patterns (gitignore-style, last match wins, !\n" +
-			"    re-includes) decide which files the runner grades and\n" +
-			"    `gh student submit` uploads. Omit to allow every file.\n" +
-			"  - --pass-threshold marks submissions at or above that percentage\n" +
-			"    as passing in the submissions page. It never changes a score.\n" +
-			"    Omit it for no passing bar; --pass-threshold 0 is an explicit 0%.\n\n" +
-			"Student repos:\n" +
-			"  - --repo-visibility public makes every student's work (names,\n" +
-			"    emails, history) visible to anyone. Public repos are also not\n" +
-			"    autograded: GitHub blocks them from running the grading\n" +
-			"    workflow in the private classroom50 repository, so keep repos\n" +
-			"    private while grading. If org policy blocks public repos, accept\n" +
-			"    falls back to private and tells the student.\n" +
-			"  - --pages publishes a site from each repo: workflow lets a GitHub\n" +
-			"    Actions workflow in the repo deploy it (it needs pages: write and\n" +
-			"    id-token: write permissions), branch has GitHub serve a branch\n" +
-			"    directly. The site is public even when the repo is private.\n" +
-			"    Pages on private repos needs a paid GitHub plan; on GitHub Free\n" +
-			"    for organizations, pair it with --repo-visibility public.\n" +
+			"    that shape a student repo apply to accepts from then on; repos\n" +
+			"    students already accepted are unchanged.\n" +
+			"  - Assignments are hidden from the student list until\n" +
+			"    --available-from passes (omit it to keep invite-link only). That\n" +
+			"    is listing only: --locked also blocks accept and hides a private\n" +
+			"    template, so use it to stage a timed assessment.\n\n" +
+			"Grading is one of: declarative tests (--tests, or `gh teacher\n" +
+			"assignment test add`), a per-assignment autograder at\n" +
+			"<classroom>/autograders/<slug>/ in the classroom50 repository, or a\n" +
+			"classroom default from `gh teacher autograder set-default`. Grading\n" +
+			"runs on every push unless --submission-mode tag limits it to\n" +
+			"`gh student submit`; change that later with\n" +
+			"`gh teacher assignment submission-mode`, which retrofits existing\n" +
+			"repos.\n\n" +
+			"Before you make student repos public or publish them:\n" +
+			"  - --repo-visibility public exposes every student's work (names,\n" +
+			"    emails, history) to anyone, and public repos are not autograded:\n" +
+			"    GitHub blocks them from the grading workflow in the private\n" +
+			"    classroom50 repository. Keep repos private while grading.\n" +
+			"  - A --pages site is public even when the repo is private. Pages on\n" +
+			"    private repos needs a paid GitHub plan.\n" +
 			"  - --student-permission admin lets students change repo settings\n" +
-			"    and collaborators (for example to manage Pages themselves). The\n" +
-			"    org lockdown from `gh teacher init` still blocks visibility\n" +
-			"    changes; verify with `gh teacher audit`.\n" +
-			"  - --feedback-pr (on by default) opens one feedback pull request\n" +
-			"    per student repo for inline review of the starter-to-submission\n" +
-			"    diff; --feedback-pr=false turns it off. Requires the org\n" +
-			"    prerequisites from `gh teacher init`.\n" +
-			"  - --empty-repo creates bare repos (no README, .classroom50.yaml\n" +
-			"    marker, or autograde workflow) for students who build everything\n" +
-			"    from scratch. Autograding and the feedback pull request are off.\n" +
-			"    Mutually exclusive with --template, --tests, --feedback-pr,\n" +
-			"    --allowed-files, --pass-threshold, --submission-mode, and\n" +
-			"    --submission-tag.",
+			"    and collaborators; the org lockdown from `gh teacher init` still\n" +
+			"    blocks visibility changes.\n" +
+			"  - --empty-repo turns off autograding and the feedback pull request\n" +
+			"    and excludes every grading flag.\n\n" +
+			"Every flag, its defaults, and its interactions are documented on the\n" +
+			"gh-teacher wiki page (https://github.com/foundation50/classroom50/wiki/gh-teacher).",
 		Example: "  gh teacher assignment add cs50-fall-2026 cs-principles hello \\\n" +
 			"      --name \"Hello\" --template cs50/hello-template \\\n" +
 			"      --due 2026-09-15T23:59:00-04:00\n" +

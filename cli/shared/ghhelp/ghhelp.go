@@ -9,6 +9,7 @@
 package ghhelp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -26,7 +27,7 @@ const maxWrapWidth = 100
 // usageTemplate prints on a usage error (wrong arg count, unknown flag).
 // Cobra's default also dumps every flag here, which is what buried the usage
 // line in issue #948.
-const usageTemplate = `Usage:{{if .Runnable}}
+const usageTemplate = `Usage:{{if and .Runnable (not .HasAvailableSubCommands)}}
   {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
   {{.CommandPath}} [command]
 
@@ -39,10 +40,39 @@ Run '{{.CommandPath}} --help' for details and examples.
 // Install applies the templates to root. Cobra resolves templates through the
 // parent chain at render time, so subcommands inherit them regardless of when
 // they are added.
+//
+// It also makes every command group reject a mistyped subcommand. Cobra only
+// does that for the root; a bare group is not runnable, so `tool group bogus`
+// prints the group's full help and exits 0 without ever validating args.
 func Install(root *cobra.Command) {
 	cobra.AddTemplateFunc("wrappedFlagUsages", wrappedFlagUsages)
 	root.SetUsageTemplate(usageTemplate)
 	root.SetHelpTemplate(helpTemplate())
+	for _, c := range root.Commands() {
+		rejectUnknownSubcommands(c)
+	}
+}
+
+func rejectUnknownSubcommands(c *cobra.Command) {
+	if c.HasSubCommands() && !c.Runnable() && c.Args == nil {
+		c.RunE = func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return cmd.Help()
+			}
+			msg := fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath())
+			// Cobra applies this default only on its own root-command path.
+			if cmd.SuggestionsMinimumDistance <= 0 {
+				cmd.SuggestionsMinimumDistance = 2
+			}
+			if s := cmd.SuggestionsFor(args[0]); len(s) > 0 {
+				msg += "\n\nDid you mean this?\n\t" + strings.Join(s, "\n\t")
+			}
+			return errors.New(msg)
+		}
+	}
+	for _, sub := range c.Commands() {
+		rejectUnknownSubcommands(sub)
+	}
 }
 
 // helpTemplate is Cobra's stock help output (description, usage, examples,

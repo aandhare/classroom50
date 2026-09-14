@@ -22,18 +22,56 @@ func newTree() (*cobra.Command, *cobra.Command) {
 	}
 	leaf.Flags().String("mode", "individual", "Assignment mode: {individual|group|team}")
 	root.AddCommand(leaf)
+	group := &cobra.Command{Use: "group", Short: "Manage things", Long: "Long description of group."}
+	group.AddCommand(&cobra.Command{Use: "list", Short: "List things", RunE: func(*cobra.Command, []string) error { return nil }})
+	root.AddCommand(group)
 	Install(root)
 	return root, leaf
 }
 
 func run(t *testing.T, root *cobra.Command, args ...string) string {
 	t.Helper()
+	out, _ := runErr(t, root, args...)
+	return out
+}
+
+func runErr(t *testing.T, root *cobra.Command, args ...string) (string, error) {
+	t.Helper()
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
 	root.SetArgs(args)
-	_ = root.Execute()
-	return buf.String()
+	err := root.Execute()
+	return buf.String(), err
+}
+
+func TestGroupRejectsUnknownSubcommand(t *testing.T) {
+	root, _ := newTree()
+	out, err := runErr(t, root, "group", "lst")
+	if err == nil {
+		t.Fatalf("a mistyped subcommand must fail, got exit 0 with:\n%s", out)
+	}
+	for _, want := range []string{`unknown command "lst" for "tool group"`, "Did you mean this?", "list", "Available Commands:"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Long description of group.") {
+		t.Errorf("a typo should print the concise usage, not the group's full help:\n%s", out)
+	}
+}
+
+func TestBareGroupStillPrintsHelp(t *testing.T) {
+	root, _ := newTree()
+	out, err := runErr(t, root, "group")
+	if err != nil {
+		t.Fatalf("bare group should succeed, got %v", err)
+	}
+	for _, want := range []string{"Long description of group.", "Available Commands:", "list"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("bare group help missing %q:\n%s", want, out)
+		}
+	}
 }
 
 func TestHelpTemplateDerivesFromCobra(t *testing.T) {

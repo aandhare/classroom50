@@ -45,7 +45,7 @@ func TestHelpRendersWrappedFlagsOnRealTree(t *testing.T) {
 	out := runRoot(t, "assignment", "add", "--help")
 	for _, want := range []string{"Usage:", "Examples:", "Flags:", "--repo-visibility string", "Global Flags:", "--verbose",
 		// Safety caveats that moved from flag descriptions into Long must still render.
-		"visible to anyone", "Pages on private repos needs a paid", "--student-permission admin lets students change repo settings"} {
+		"public repos are not autograded", "needs a paid GitHub plan", "--student-permission admin lets students change repo settings"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("--help missing %q", want)
 		}
