@@ -310,7 +310,12 @@ function RepositoryAdvancedFields({
         </form.Subscribe>
       ) : null}
 
-      <RepoVisibilityField form={form} edit={edit} />
+      <RepoVisibilityField
+        form={form}
+        edit={edit}
+        autograded={shape.autogradingState === "built-in"}
+        autograderToggleShown={shape.showAutogradingConfig}
+      />
 
       <PagesField form={form} edit={edit} emptyRepo={shape.emptyRepo} />
 
@@ -413,13 +418,21 @@ function StudentPermissionField({ form }: { form: AssignmentForm }) {
 // The accept-time repo visibility choice (private default / public for
 // showcase work). A public pick shows a persistent exposure warning, plus the
 // accept-time-only caveat on edit (existing repos are flipped from the
-// submissions page, not here).
+// submissions page, not here) and, with the built-in autograder on, that
+// grading stops (a public repo can't call the private classroom50 repo's
+// reusable workflow, issue #995).
 function RepoVisibilityField({
   form,
   edit,
+  autograded,
+  autograderToggleShown,
 }: {
   form: AssignmentForm
   edit: boolean
+  autograded: boolean
+  // The "Do not use the built-in autograder" toggle only renders under
+  // Autograded grading, so the hint naming it must not appear otherwise.
+  autograderToggleShown: boolean
 }) {
   const { t } = useTranslation()
   return (
@@ -451,12 +464,27 @@ function RepoVisibilityField({
               </Select>
               {field.state.value === "public" ? (
                 <Alert tone="warning" role="status" className="mt-2 text-sm">
-                  <span>
-                    {t("assignments.form.repoVisibility.publicWarning")}
-                    {edit ? (
-                      <> {t("assignments.form.repoVisibility.editHelp")}</>
-                    ) : null}
-                  </span>
+                  <div className="flex flex-col gap-2">
+                    <p>
+                      {t("assignments.form.repoVisibility.publicWarning")}
+                      {edit ? (
+                        <> {t("assignments.form.repoVisibility.editHelp")}</>
+                      ) : null}
+                    </p>
+                    {autograded && (
+                      <p>
+                        {t("assignments.form.repoVisibility.autograderWarning")}
+                        {autograderToggleShown ? (
+                          <>
+                            {" "}
+                            {t(
+                              "assignments.form.repoVisibility.autograderWarningToggleHint",
+                            )}
+                          </>
+                        ) : null}
+                      </p>
+                    )}
+                  </div>
                 </Alert>
               ) : null}
             </>

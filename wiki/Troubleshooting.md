@@ -900,6 +900,35 @@ assignment is tag-mode (or vice versa). Run
 (or `--every-push`), or use **Update autograding triggers** on the submissions
 page, to update the repositories, and have students `git pull` afterward.
 
+### `Invalid workflow file` with `workflow was not found` after a repository was made public
+
+The student repository is public, and public repositories aren't autograded.
+Each student repository's `autograde.yaml` calls the grading workflow in your
+private `classroom50` repository, and GitHub only lets a public repository
+call workflows in other public repositories. The `classroom50` repository
+stays private because it holds the roster. The run fails before any job
+starts, with the annotation `error parsing called workflow ... workflow was
+not found`; the same student's earlier runs passed because the repository was
+private then.
+
+To resume grading, make the repository private again on the submissions page:
+
+- For one repository, open the row's manage dialog and click **Make
+  repository private**.
+- For the whole assignment, click **Change repository visibility**, select
+  **Private**, then click **Apply to all**.
+- If the assignment's **Repository visibility** is **Public**, students who
+  accept later still get public repositories. Edit the assignment and set
+  **Repository visibility** to **Private** (or re-run
+  `gh teacher assignment add` with `--repo-visibility private`) so their
+  repositories are graded too.
+
+Make repositories public only after grading is done (for example, to showcase
+final projects), or pair **Public** with **Do not use the built-in
+autograder** for assignments graded another way. On GitHub Free for
+organizations, making a repository private also takes its GitHub Pages site
+offline; see [GitHub Pages](GitHub-Integration#5-github-pages).
+
 ### `pytest: not found` or exit code 127 in the grading log
 
 Exit code 127 means the shell couldn't find a command. For Python assignments
