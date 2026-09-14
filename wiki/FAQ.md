@@ -256,10 +256,10 @@ GitHub-hosted runners preinstall but the runner agent doesn't install. See
 ### Can the autograder show students *why* a test failed?
 
 Yes. Each submission's Release and the Actions run summary include a per-test
-breakdown (expected against actual output for I/O tests, the command's captured
-output for run and pytest tests), unless you limit it with the assignment's
-failure-details setting. A custom `autograder.py` can add its own diagnostic
-messages to `result.json`.
+breakdown (expected against actual output for `io` tests, the command's
+captured output for `run` and `python` tests), unless you limit it with the
+assignment's failure-details setting. A custom `autograder.py` can add its own
+diagnostic messages to `result.json`.
 
 ### Can students use GitHub Codespaces?
 

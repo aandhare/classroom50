@@ -323,8 +323,7 @@ class TestExecutePython:
         assert o["score"] == 6
         assert not o["passed"]
         assert "2/3" in o["detail"]
-        # The per-case path carries pytest's merged output so the student sees
-        # which case failed, same as the no-report fallback.
+        # Students see which case failed, same as the no-report fallback.
         assert "stderr" not in o["capture"]
         detail = ag.compose_detail(o)
         assert "--- output ---" in detail and "test_c" in detail
@@ -665,8 +664,7 @@ class TestComposeDetail:
                 "show-command": True}
         o = ag.execute_test(spec, cwd=tmp_path, fixtures_dir=tmp_path)
         assert "--json-report" in seen["command"]
-        # pytest runs with merged streams, and the combined text is what the
-        # student reads under the failure.
+        # pytest merges streams; the combined text is the failure detail.
         assert seen["merge"] is True
         detail = ag.compose_detail(o)
         assert "--- run command ---\npytest -q\n" in detail
@@ -674,10 +672,8 @@ class TestComposeDetail:
         assert "--- output ---\nboom" in detail
 
     def test_exit_shows_both_stdout_and_stderr_in_order(self, tmp_path):
-        # #910: a run command commonly prints its verdict (a diff, a self-check
-        # message) to stdout while stderr carries tool noise. A failure must show
-        # BOTH, in the order the command wrote them, not drop stdout because
-        # stderr is non-empty.
+        # #910: a run command's verdict often goes to stdout while stderr carries
+        # tool noise, so a failure shows both in the order they were written.
         spec = {"name": "t", "type": "run",
                 "run": "echo the-diff; echo tool-noise >&2; echo verdict; false",
                 "points": 1}
@@ -693,8 +689,7 @@ class TestComposeDetail:
         assert "only-stdout" in ag.compose_detail(o)
 
     def test_io_failure_keeps_streams_apart(self, tmp_path):
-        # The comparison reads stdout, so an io test never merges; its detail
-        # still labels the two streams separately.
+        # The comparison reads stdout, so an io test never merges.
         detail = ag.compose_detail(self._io_fail(tmp_path, "full"))
         assert "--- stderr ---\nwarn" in detail
         assert "--- output ---" not in detail

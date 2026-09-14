@@ -1684,13 +1684,10 @@ def _run_command(command: str, cwd: pathlib.Path, timeout: int,
                  bundle_dir: pathlib.Path | None = None,
                  merge_streams: bool = False) -> subprocess.CompletedProcess[str]:
     """Run a shell command in the student checkout with captured text output
-    and an empty-by-default stdin. With merge_streams, stderr is folded into
-    stdout (`2>&1`) in the order the two streams reached the pipe, the way a
-    terminal or a CI log shows them, so a diff a Makefile prints to stdout
-    lands next to the compiler error on stderr. A program that block-buffers
-    stdout when piped may still show its errors first, exactly as
-    `cmd 2>&1 | cat` does locally. io tests keep the streams apart because
-    the comparison needs a clean stdout."""
+    and an empty-by-default stdin. merge_streams folds stderr into stdout
+    (`2>&1`) so a failure reads as it did in the terminal; ordering still
+    follows the child's own buffering. io tests keep the streams apart because
+    the comparison reads stdout."""
     return subprocess.run(
         command,
         shell=True,
@@ -1860,7 +1857,7 @@ def _execute_spec(spec: dict[str, Any], *, cwd: pathlib.Path,
     except TestFixtureError as exc:
         return _make_outcome(name, points, False, str(exc))
 
-    # io compares stdout, so only run tests merge streams (see _run_command).
+    # io compares stdout, so only run tests merge streams.
     merge = ttype == TEST_TYPE_RUN
     try:
         rp = _run_command(spec["run"], cwd, timeout, stdin=stdin,
@@ -2115,9 +2112,8 @@ def compose_detail(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) 
 def compose_output(outcome: dict[str, Any], *, limit: int = MAX_CAPTURED_CHARS) -> str:
     """Captured setup/run output of one outcome for the opt-in show-output
     section (#764) -- rendered for passing tests, since failing ones already
-    surface their output through the failure details. Run and python tests
-    carry one combined stream; io tests keep stdout and stderr apart. The
-    commands lead when the test also opted in via show-command."""
+    surface their output through the failure details. The commands lead when
+    the test also opted in via show-command."""
     cap = outcome.get("capture") or {}
     outputs = []
     for key, label in (("setup-output", "setup output"),
