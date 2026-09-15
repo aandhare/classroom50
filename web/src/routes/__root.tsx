@@ -10,6 +10,7 @@ import { useEffect } from "react"
 import { useTranslation } from "react-i18next"
 import { RoleViewProvider } from "@/context/roleView/RoleViewProvider"
 import { Button, Heading } from "@/components/ui"
+import NotFound from "@/components/NotFound"
 import { logger } from "@/lib/logger"
 import { LOG_SCOPE_ROUTER } from "@/lib/logScopes"
 
@@ -65,7 +66,11 @@ const RootErrorComponent = ({ error }: ErrorComponentProps) => {
   )
 }
 
+// Unknown URLs land here instead of TanStack's unstyled, untranslated default.
+const RootNotFoundComponent = () => <NotFound fullHeight />
+
 export const Route = createRootRouteWithContext<RouterContext>()({
   component: RootComponent,
   errorComponent: RootErrorComponent,
+  notFoundComponent: RootNotFoundComponent,
 })
