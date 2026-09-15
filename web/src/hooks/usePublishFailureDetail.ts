@@ -60,6 +60,8 @@ export function usePublishFailureDetail(
     enabled: enabled && blockerSha !== undefined,
     staleTime: 0,
     refetchInterval: (query) => {
+      // With retry: false a failed read leaves data undefined for good.
+      if (query.state.status === "error") return false
       const status = query.state.data
       if (status === undefined) return BLOCKER_POLL_MS
       return status !== null && isPagesDeploymentInProgress(status)

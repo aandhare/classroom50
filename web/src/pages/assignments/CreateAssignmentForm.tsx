@@ -1,10 +1,15 @@
 import { useState } from "react"
+import { useStore } from "@tanstack/react-form"
 import { useTranslation } from "react-i18next"
 import { Alert, AnimatedAlert, Button } from "@/components/ui"
 import { DetailsSection } from "./sections/DetailsSection"
 import { RepositorySetupSection } from "./sections/RepositorySetupSection"
 import { SubmissionGradingSection } from "./sections/SubmissionGradingSection"
-import { ScheduleSection } from "./sections/ScheduleSection"
+import {
+  SCHEDULE_PICKER_FIELDS,
+  ScheduleSection,
+  type SchedulePickerField,
+} from "./sections/ScheduleSection"
 import {
   SECTION_FIELDS,
   sectionIsConfigured,
@@ -108,18 +113,32 @@ const CreateAssignmentForm = ({
   // Feedback for an unchanged edit-mode submit (the button stays enabled per
   // Primer; the submit itself no-ops). Rendered only while still pristine.
   const [noChangesNotice, setNoChangesNotice] = useState(false)
-  // Whether the due-date picker is shown. Seeded from the initial value (Edit of
-  // an assignment with a due starts checked); a due date is opt-in otherwise.
-  // Unchecking clears due_date so the write path omits it (#195).
-  const [dueDateEnabled, setDueDateEnabled] = useState(
+  // Explicitly opened. Visibility is this OR a present value: a refetch can
+  // swap in a due date set elsewhere, and a hidden date would still be written
+  // on Save. Unchecking clears due_date so the write path omits it (#195).
+  const [dueDateOpened, setDueDateOpened] = useState(
     Boolean(form.state.values.due_date),
   )
-  // Whether the release-date picker is shown. Seeded from the initial value;
-  // a release date is opt-in. Unchecking clears available_from_date so the
-  // write path omits it (mirrors the due-date toggle).
-  const [availableFromEnabled, setAvailableFromEnabled] = useState(
+  const dueValue = useStore(form.store, (state) => state.values.due_date)
+  // Latch so a segment edit that momentarily reads as "" can't unmount the
+  // focused picker.
+  if (dueValue && !dueDateOpened) setDueDateOpened(true)
+  const dueDateEnabled = dueDateOpened || Boolean(dueValue)
+  // Same shape as the due-date toggle.
+  const [availableFromOpened, setAvailableFromOpened] = useState(
     Boolean(form.state.values.available_from_date),
   )
+  const availableFromValue = useStore(
+    form.store,
+    (state) => state.values.available_from_date,
+  )
+  if (availableFromValue && !availableFromOpened) setAvailableFromOpened(true)
+  const availableFromEnabled =
+    availableFromOpened || Boolean(availableFromValue)
+  // A picker left half-edited at submit: its DOM value is "" while the toggle
+  // reads on, so saving would silently drop the date.
+  const [incompletePicker, setIncompletePicker] =
+    useState<SchedulePickerField | null>(null)
 
   // Restore one section's fields to their create defaults. Because
   // deriveFormShape is a pure view over values, resetting the owned fields also
@@ -137,20 +156,18 @@ const CreateAssignmentForm = ({
     if (section === "schedule") {
       // The date pickers are opt-in; a reset clears the dates, so collapse the
       // pickers to match (they seed from a present value otherwise).
-      setDueDateEnabled(false)
-      setAvailableFromEnabled(false)
+      setDueDateOpened(false)
+      setAvailableFromOpened(false)
     }
   }
 
-  // Edit-mode discard: revert all unsaved edits to the stored assignment. The
-  // schedule pickers' shown/hidden state lives in local state (seeded on mount),
-  // so re-sync it from the restored values or a discard would leave a stored
-  // date hidden behind a collapsed, out-of-sync picker.
+  // Edit-mode discard. Collapse a picker opened but left empty; a restored date
+  // shows on its own since visibility is derived from the value.
   const discardChanges = () => {
     form.reset()
-    const restored = form.options.defaultValues as CreateAssignmentFormValues
-    setDueDateEnabled(Boolean(restored.due_date))
-    setAvailableFromEnabled(Boolean(restored.available_from_date))
+    setDueDateOpened(false)
+    setAvailableFromOpened(false)
+    setIncompletePicker(null)
   }
 
   return (
@@ -163,10 +180,25 @@ const CreateAssignmentForm = ({
       // events rather than the form model, so controls that sync through
       // local state (pickers, toggles) still clear it.
       onInput={() => setNoChangesNotice(false)}
-      onChange={() => setNoChangesNotice(false)}
+      onChange={() => {
+        setNoChangesNotice(false)
+        setIncompletePicker(null)
+      }}
       onSubmit={(e) => {
         e.preventDefault()
         e.stopPropagation()
+        // A half-edited picker exists only in the DOM (the model sees "").
+        const partial = SCHEDULE_PICKER_FIELDS.find((id) => {
+          const el = document.getElementById(id)
+          return el instanceof HTMLInputElement && el.validity.badInput
+        })
+        if (partial) {
+          setIncompletePicker(partial)
+          const target = document.getElementById(partial)
+          target?.scrollIntoView({ behavior: "smooth", block: "center" })
+          target?.focus({ preventScroll: true })
+          return
+        }
         // Unchanged edit-mode submit: a no-op with feedback, never a re-run.
         // The button stays enabled (Primer), but this form's save has side
         // effects (the publish workflow re-triggers), so "idempotent" must be
@@ -257,9 +289,10 @@ const CreateAssignmentForm = ({
                   org={org}
                   onReset={onReset("schedule")}
                   dueDateEnabled={dueDateEnabled}
-                  setDueDateEnabled={setDueDateEnabled}
+                  setDueDateOpened={setDueDateOpened}
                   availableFromEnabled={availableFromEnabled}
-                  setAvailableFromEnabled={setAvailableFromEnabled}
+                  setAvailableFromOpened={setAvailableFromOpened}
+                  incompletePicker={incompletePicker}
                 />
               </>
             )

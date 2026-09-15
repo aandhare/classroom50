@@ -217,24 +217,28 @@ export function getRawFile(
 
 // The contents-API read behind every config-repo file: base64 body decoded to
 // text, pinned to `ref` when given. A directory at the path is an error, not
-// a file.
+// a file. GitHub inlines at most 1 MB in the JSON shape (`encoding: "none"`,
+// empty `content` beyond that), so larger files fall back to the raw media type.
 async function readConfigFileText(
   client: GitHubClient,
   org: string,
   path: string,
   ref?: string,
 ): Promise<string> {
+  const url = `/repos/${org}/${CONFIG_REPO}/contents/${path}${
+    ref ? `?ref=${encodeURIComponent(ref)}` : ""
+  }`
   const file = await client.request<{
     type: "file"
-    encoding: "base64"
+    encoding: "base64" | "none"
     content: string
-  }>(
-    `/repos/${org}/${CONFIG_REPO}/contents/${path}${
-      ref ? `?ref=${encodeURIComponent(ref)}` : ""
-    }`,
-  )
+    size?: number
+  }>(url)
   if (file.type !== "file") {
     throw new Error(`${path} is not a file`)
+  }
+  if (file.encoding !== "base64" || (!file.content && (file.size ?? 0) > 0)) {
+    return client.requestRaw(url)
   }
   return decodeBase64Utf8(file.content)
 }
@@ -256,6 +260,8 @@ export async function readConfigJson<T>(
   return JSON.parse(text) as T
 }
 
+// Read at the default branch: a `master`-default org yields `master` repos, so
+// pinning `main` would 404 on every one of them.
 export async function getClassroom50Yaml(
   client: GitHubClient,
   org: string,
@@ -265,7 +271,9 @@ export async function getClassroom50Yaml(
     type: "file"
     encoding: "base64"
     content: string
-  }>(`/repos/${org}/${repo}/contents/.classroom50.yaml?ref=main`)
+  }>(
+    `/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/contents/.classroom50.yaml`,
+  )
 
   if (file.type !== "file") {
     throw new Error(`.classroom50.yaml not found in ${repo}`)

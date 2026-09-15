@@ -18,3 +18,17 @@ export function localStorageOrNull(): Storage | null {
 export function sessionStorageOrNull(): Storage | null {
   return probe("sessionStorage")
 }
+
+// setItem throws on quota or read-only storage; a failed preference write must
+// not abort the action that triggered it.
+export function setItemOrIgnore(
+  storage: Storage | null,
+  key: string,
+  value: string,
+): void {
+  try {
+    storage?.setItem(key, value)
+  } catch {
+    // Persistence is best-effort.
+  }
+}

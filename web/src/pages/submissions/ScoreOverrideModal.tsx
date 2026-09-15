@@ -1,4 +1,4 @@
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 
 import { Alert, Button, FormField, Input, Modal } from "@/components/ui"
@@ -95,6 +95,16 @@ export function ScoreOverrideModal({
   // A synchronous latch so two submits in the SAME tick (before mutation
   // .isPending flips on the next render) can't both fire mutate.
   const inFlightRef = useRef(false)
+  // An empty or browser-rejected entry (Firefox reports "12a" as "") shows its
+  // error only after a Save attempt, so Save is never a silent no-op.
+  const [attempted, setAttempted] = useState(false)
+  // `autoFocus` fires before Modal's showModal(), so focus landed on the close
+  // X instead (Enter would dismiss). Child effects run first: the dialog is
+  // open by now.
+  const scoreInputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (open) scoreInputRef.current?.focus()
+  }, [open])
 
   const saving = mutation.isPending
 
@@ -131,7 +141,10 @@ export function ScoreOverrideModal({
     Boolean(validationError) || Boolean(maxError) || effectiveMax === null
 
   const save = () => {
-    if (saveBlocked || effectiveMax === null) return
+    if (saveBlocked || effectiveMax === null) {
+      setAttempted(true)
+      return
+    }
     if (inFlightRef.current || mutation.isPending) return
     inFlightRef.current = true
     mutation.mutate(
@@ -264,7 +277,9 @@ export function ScoreOverrideModal({
         <FormField
           label={t("submissions.scoreOverride.inputLabel")}
           error={
-            validationError && draft.trim() !== "" ? validationError : undefined
+            validationError && (attempted || draft.trim() !== "")
+              ? validationError
+              : undefined
           }
         >
           {({ id, describedById, invalid }) => (
@@ -277,7 +292,7 @@ export function ScoreOverrideModal({
                 max={effectiveMax ?? undefined}
                 step={1}
                 className="w-24"
-                autoFocus
+                ref={scoreInputRef}
                 disabled={saving}
                 aria-describedby={describedById}
                 aria-invalid={invalid || undefined}
@@ -300,7 +315,11 @@ export function ScoreOverrideModal({
         {maxEditable ? (
           <FormField
             label={t("submissions.scoreOverride.maxLabel")}
-            error={maxError && maxDraft.trim() !== "" ? maxError : undefined}
+            error={
+              maxError && (attempted || maxDraft.trim() !== "")
+                ? maxError
+                : undefined
+            }
             hint={t("submissions.scoreOverride.maxHint")}
           >
             {({ id, describedById, invalid }) => (

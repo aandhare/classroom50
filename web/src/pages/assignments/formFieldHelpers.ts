@@ -1,6 +1,7 @@
 // Re-exported from the shared hooks location so existing imports here keep
 // working; the canonical definition lives in hooks/useDebouncedValue.
 export { useDebouncedValue } from "@/hooks/useDebouncedValue"
+import { dueDeadlineInstant } from "@/util/formatDate"
 
 // Minimal subset of a TanStack form field for a string-valued input.
 export type StringField = {
@@ -49,7 +50,7 @@ export const normalizeOnBlur = (
 }
 
 // Format a Date as a `datetime-local` input value (local wall-clock, no zone).
-const toDatetimeLocalValue = (date: Date) => {
+export const toDatetimeLocalValue = (date: Date) => {
   const pad = (value: number) => String(value).padStart(2, "0")
 
   const year = date.getFullYear()
@@ -62,15 +63,39 @@ const toDatetimeLocalValue = (date: Date) => {
 }
 
 // Parse a stored UTC ISO instant into a `datetime-local` value; "" when absent
-// or unparseable.
+// or unparseable. A legacy bare YYYY-MM-DD is that day's end (23:59 local), as
+// every reader treats it; `new Date` alone would read it as UTC midnight.
 export const utcIsoToDatetimeLocalValue = (value?: string) => {
   if (!value) return ""
 
-  const date = new Date(value)
+  const date = dueDeadlineInstant(value)
 
-  if (Number.isNaN(date.getTime())) {
+  if (!date) {
     return ""
   }
 
   return toDatetimeLocalValue(date)
 }
+
+// Seed for a picker just switched on. An empty `datetime-local` reads "" until
+// every segment is filled, and Safari paints a placeholder date into the empty
+// segments, so editing only the time never produced a value (#999).
+export const dueDateSeed = (now = new Date()) => {
+  const d = new Date(now)
+  d.setDate(d.getDate() + 7)
+  d.setHours(23, 59, 0, 0)
+  return toDatetimeLocalValue(d)
+}
+
+// Top of the next hour: near future, so the release-date notice is truthful.
+export const releaseDateSeed = (now = new Date()) => {
+  const d = new Date(now)
+  d.setHours(d.getHours() + 1, 0, 0, 0)
+  return toDatetimeLocalValue(d)
+}
+
+// Deliberately emptied, as opposed to half-edited: a partial entry also reads
+// "" but sets `validity.badInput`, and collapsing on it threw away the edit
+// (#999). Older Safari reports partial input as valid; the seed avoids that.
+export const isDeliberatelyCleared = (input: HTMLInputElement) =>
+  input.value === "" && !input.validity?.badInput

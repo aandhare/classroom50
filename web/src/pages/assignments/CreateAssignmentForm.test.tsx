@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { render, screen, cleanup } from "@testing-library/react"
+import { render, screen, cleanup, fireEvent } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import type { ReactElement } from "react"
@@ -154,6 +154,111 @@ describe("Set a due date toggle (issue #195)", () => {
     expect(screen.queryByLabelText("assignments.form.dueDate")).toBeNull()
   })
 
+  // #999: an empty datetime-local reads "" until every segment is filled (and
+  // Safari paints a placeholder date into it), so the toggle seeds a full value.
+  it("switching the due-date toggle on seeds a complete value (#999)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    vi.setSystemTime(new Date(2026, 8, 15, 10, 50))
+    try {
+      const user = userEvent.setup()
+      const { container } = renderForm(
+        <CreateAssignmentForm onSubmit={() => {}} />,
+      )
+      await user.click(container.querySelector("#due_date-enabled")!)
+      const picker = screen.getByLabelText<HTMLInputElement>(
+        "assignments.form.dueDate",
+      )
+      expect(picker.value).toBe("2026-09-22T23:59")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("switching the release-date toggle on seeds a complete value (#999)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    vi.setSystemTime(new Date(2026, 8, 15, 10, 50))
+    try {
+      const user = userEvent.setup()
+      const { container } = renderForm(
+        <CreateAssignmentForm onSubmit={() => {}} />,
+      )
+      await user.click(container.querySelector("#available_from_date-enabled")!)
+      const picker = screen.getByLabelText<HTMLInputElement>(
+        "assignments.form.availableFrom",
+      )
+      expect(picker.value).toBe("2026-09-15T11:00")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("re-enabling the toggle reseeds after the opt-out cleared the stored date", async () => {
+    const user = userEvent.setup()
+    const { container } = renderForm(
+      <CreateAssignmentForm
+        edit
+        defaultValues={assignmentToFormValues(withDue as Assignment)}
+        onSubmit={() => {}}
+      />,
+    )
+    const stored = utcIsoToDatetimeLocalValue(withDue.due)
+    expect(
+      screen.getByLabelText<HTMLInputElement>("assignments.form.dueDate").value,
+    ).toBe(stored)
+    // Off clears the value (unchecking is the opt-out), so on seeds afresh.
+    const toggle = container.querySelector("#due_date-enabled")!
+    await user.click(toggle)
+    await user.click(toggle)
+    const reseeded = screen.getByLabelText<HTMLInputElement>(
+      "assignments.form.dueDate",
+    ).value
+    expect(reseeded).not.toBe(stored)
+    expect(reseeded).toMatch(/^\d{4}-\d{2}-\d{2}T23:59$/)
+  })
+
+  it("blurring a half-edited picker keeps it open (#999)", async () => {
+    const user = userEvent.setup()
+    const { container } = renderForm(
+      <CreateAssignmentForm onSubmit={() => {}} />,
+    )
+    await user.click(container.querySelector("#due_date-enabled")!)
+    const picker = screen.getByLabelText<HTMLInputElement>(
+      "assignments.form.dueDate",
+    )
+    // A partial entry: the browser sanitizes value to "" but flags badInput.
+    Object.defineProperty(picker, "validity", {
+      value: { badInput: true, valid: false },
+      configurable: true,
+    })
+    picker.value = ""
+    fireEvent.blur(picker)
+    expect(screen.getByLabelText("assignments.form.dueDate")).not.toBeNull()
+    expect(
+      container.querySelector<HTMLInputElement>("#due_date-enabled")!.checked,
+    ).toBe(true)
+  })
+
+  it("blurring a deliberately emptied picker collapses it", async () => {
+    const user = userEvent.setup()
+    const { container } = renderForm(
+      <CreateAssignmentForm onSubmit={() => {}} />,
+    )
+    await user.click(container.querySelector("#due_date-enabled")!)
+    const picker = screen.getByLabelText<HTMLInputElement>(
+      "assignments.form.dueDate",
+    )
+    Object.defineProperty(picker, "validity", {
+      value: { badInput: false, valid: true },
+      configurable: true,
+    })
+    fireEvent.change(picker, { target: { value: "" } })
+    fireEvent.blur(picker)
+    expect(screen.queryByLabelText("assignments.form.dueDate")).toBeNull()
+    expect(
+      container.querySelector<HTMLInputElement>("#due_date-enabled")!.checked,
+    ).toBe(false)
+  })
+
   it("unchecking the toggle submits an empty due_date (the #195 opt-out)", async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -177,6 +282,38 @@ describe("Set a due date toggle (issue #195)", () => {
 
     expect(onSubmit).toHaveBeenCalledTimes(1)
     expect(onSubmit.mock.calls[0][0].due_date).toBe("")
+  })
+
+  it("refuses to save while a picker is half-edited, instead of dropping the date", async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    renderForm(
+      <CreateAssignmentForm
+        edit
+        defaultValues={assignmentToFormValues(withDue as Assignment)}
+        onSubmit={onSubmit}
+      />,
+    )
+    const picker = screen.getByLabelText<HTMLInputElement>(
+      "assignments.form.dueDate",
+    )
+    // A deleted segment: the browser reports "" with badInput set.
+    fireEvent.change(picker, { target: { value: "" } })
+    Object.defineProperty(picker, "validity", {
+      value: { badInput: true, valid: false },
+      configurable: true,
+    })
+
+    await user.click(
+      screen.getByRole("button", { name: "assignments.form.saveChanges" }),
+    )
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(
+      screen.getByText("assignments.form.validation.scheduleDateIncomplete"),
+    ).toBeTruthy()
+    expect(picker.getAttribute("aria-invalid")).toBe("true")
+    expect(screen.getByLabelText("assignments.form.dueDate")).toBe(picker)
   })
 })
 

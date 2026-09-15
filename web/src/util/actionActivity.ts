@@ -45,7 +45,13 @@ export function orgFromPathname(
   const segments = rest.split("/").filter(Boolean)
   const first = segments[0]
   if (!first || RESERVED_FIRST_SEGMENTS.has(first)) return undefined
-  return decodeURIComponent(first)
+  // A malformed escape (`/abc%`) stays in the pathname, and this runs above
+  // the router's error boundary.
+  try {
+    return decodeURIComponent(first)
+  } catch {
+    return undefined
+  }
 }
 
 // Wall-clock now via a named import, so callers can read the clock inside

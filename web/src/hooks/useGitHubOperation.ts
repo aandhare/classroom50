@@ -173,6 +173,9 @@ export function useGitHubOperation(config: GitHubOperationConfig) {
     retry: false,
     staleTime: 0,
     gcTime: 0,
+    // The deadline timer below runs in a hidden tab, so the poll must too, or
+    // a finished run reads as timed out.
+    refetchIntervalInBackground: true,
   })
 
   const run = runQuery.data

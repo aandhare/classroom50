@@ -5,6 +5,7 @@ import {
   readAssignmentsForWrite,
   requireAssignment,
 } from "./assignmentsWrite"
+import { withGitConflictRetry } from "../classrooms"
 
 export type DeleteAssignmentInput = {
   org: string
@@ -40,4 +41,13 @@ export async function deleteAssignment(
     baseTreeSha: ctx.baseTreeSha,
     ...written,
   }
+}
+
+// Re-reads the ref and assignments.json each attempt, so a 409 from a
+// concurrent commit is safe to retry (as every other assignments.json writer).
+export function deleteAssignmentWithConflictRetry(
+  client: GitHubClient,
+  input: DeleteAssignmentInput,
+) {
+  return withGitConflictRetry(() => deleteAssignment(client, input))
 }

@@ -46,7 +46,11 @@
       // in src/hooks/useTheme.ts.
       ;(function () {
         try {
-          var stored = localStorage.getItem("classroom50:theme")
+          // Blocked storage throws; the OS preference must still apply.
+          var stored = null
+          try {
+            stored = localStorage.getItem("classroom50:theme")
+          } catch (e) {}
           var theme =
             stored === "sumi" || stored === "sumi-dark"
               ? stored
