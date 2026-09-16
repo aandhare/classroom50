@@ -19,10 +19,8 @@ vi.mock("@/hooks/useTrackPublishDeploy", () => ({
 // repos gates the provisioning-change confirmation. `acceptedRepoNames` lets a
 // test set that count without wiring GitHub reads.
 let acceptedRepoNames: string[] = []
-// The args the component last passed to each. A team assignment must derive
-// its accepted count from the team repos (isTeam) and read the org repo list
-// unscoped (logins undefined), the same as a legacy group; capturing the args
-// pins that wiring without standing up GitHub reads.
+// The args the component last passed to each read; they pin the per-mode repo
+// wiring without standing up GitHub reads.
 let lastAssignmentReposArgs: { logins?: readonly string[] } | undefined
 let lastRepoNamesArgs: { isGroup?: boolean; isTeam?: boolean } | undefined
 vi.mock("@/hooks/useAssignmentRepos", () => ({
@@ -165,9 +163,8 @@ it.each([
         onSuccess={vi.fn()}
       />,
     )
-    // Both group flavours count one repo per group, so the derivation is told
-    // which shape to expect and the org repo read is left unscoped; only an
-    // individual assignment scopes the read to the per-student logins.
+    // Both group flavours read the org repo list unscoped; only an individual
+    // assignment scopes the read to the student logins.
     expect(lastRepoNamesArgs).toMatchObject(expected)
     if (mode === "individual") {
       expect(lastAssignmentReposArgs?.logins).toBeDefined()

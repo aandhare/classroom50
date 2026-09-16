@@ -368,10 +368,8 @@ describe("AssignmentsTable submission denominator", () => {
   })
 
   it("treats a team assignment like a group, not per student", () => {
-    // Regression: a team-mode ("Group") assignment was measured against the
-    // student roster, so its Accepted cell read "groups / students" with a
-    // fill bar (e.g. 31 groups / 95 students). It must be a bare group count,
-    // exactly like the legacy group mode above.
+    // Regression: a team assignment was measured against the roster
+    // (31 groups / 95 students). It is a bare group count, like legacy group.
     scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
     orgRepos.mockReturnValue({
       data: [
@@ -390,14 +388,13 @@ describe("AssignmentsTable submission denominator", () => {
         roster={roster(studentsOf(11))}
       />,
     )
-    // Bare accepted count of the 3 group-<n> repos, and the submitted bar
-    // measures against those 3 — never the 11 students.
+    // Both cells count the 3 group-<n> repos, never the 11 students.
     const accepted = screen.getByTitle("assignments.table.groupsAcceptedTitle")
     expect(accepted.textContent).toBe("3")
     expect(ratioText()).toContain("2 / 3")
     expect(ratioText()).not.toContain("/ 11")
-    // Groups have no acceptance filter, so the cell opens the dashboard
-    // unfiltered rather than on the per-student "not accepted" cohort.
+    // No per-student acceptance filter for groups: the cell opens the
+    // dashboard unfiltered.
     fireEvent.click(accepted.closest("td")!)
     expect(navigate).toHaveBeenCalledWith(
       expect.objectContaining({ search: undefined }),

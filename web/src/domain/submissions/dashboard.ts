@@ -1806,10 +1806,9 @@ export type FunnelRoster = {
 // detection existed has entries but no key.
 //
 // `accepted`: this assignment's existing repos, reverse-parsed from the org repo
-// list. Individual student repos and legacy group repos share the
-// <classroom>-<slug>-<owner> name shape, so one parse serves both; team repos
-// take the shape-exact `group-<n>` parse the Submissions page uses, so a stray
-// founder-named repo never counts as a team.
+// list: the `<classroom>-<slug>-<owner>` prefix for individual and legacy group
+// repos, the shape-exact `group-<n>` parse for team repos (a founder-named stray
+// never counts as a team).
 //
 // With a `roster`, an individual assignment's `accepted` and `submitted` count
 // only owners in `roster.counted`, so both stay within the denominator by
