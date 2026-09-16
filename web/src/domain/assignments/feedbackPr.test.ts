@@ -34,10 +34,16 @@ describe("feedback PR contract parity vs ensure_feedback_pr.py", () => {
   })
 
   it("pins the mode labels and colors to the python _LABELS", () => {
-    for (const mode of ["individual", "group"] as const) {
+    for (const mode of ["individual", "group", "team"] as const) {
       const { name, color } = feedbackLabelForMode(mode)
-      expect(ensureFeedbackPrPySource).toContain(`("${name}", "${color}")`)
+      // Anchor each label/color to the same mode key in the python _LABELS so
+      // the two can't drift: a team-only edit on either side fails here.
+      expect(ensureFeedbackPrPySource).toContain(
+        `"${mode}": ("${name}", "${color}")`,
+      )
     }
+    // Both shared-repo modes carry the Group label; only individual differs.
+    expect(feedbackLabelForMode("team")).toEqual(feedbackLabelForMode("group"))
     // Unknown modes fall back to individual, like python's label_for_mode.
     expect(feedbackLabelForMode("")).toEqual(feedbackLabelForMode("individual"))
     expect(feedbackLabelForMode(" GROUP ")).toEqual(
@@ -332,6 +338,21 @@ describe("ensureFeedbackPullRequest", () => {
       branch: "main",
       acceptCommitSha: "accept-sha",
       mode: "group",
+      autograded: true,
+    })
+    const labelAdd = calls.find((c) => c.url === "/repos/o/r/issues/1/labels")
+    expect(labelAdd?.body).toEqual({ labels: ["Group Assignment"] })
+  })
+
+  it("team mode applies the Group Assignment label", async () => {
+    const { client, calls } = fakeClient({})
+    await ensureFeedbackPullRequest({
+      client,
+      owner: "o",
+      repo: "r",
+      branch: "main",
+      acceptCommitSha: "accept-sha",
+      mode: "team",
       autograded: true,
     })
     const labelAdd = calls.find((c) => c.url === "/repos/o/r/issues/1/labels")
