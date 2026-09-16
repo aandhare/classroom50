@@ -7,6 +7,7 @@ import {
   formatRosterProblems,
   normalizeStudentRow,
   parseRosterCsv,
+  parseRosterForRewrite,
   parseStudentsCsv,
   splitName,
   stringifyStudentsCsv,
@@ -18,6 +19,7 @@ import { FORMULA_LEAD_SOURCE } from "./csv"
 // roster import, sync, and write goes through.
 
 const HEADER = STUDENT_CSV_FIELDS.join(",")
+const COLUMNS = [...STUDENT_CSV_FIELDS]
 
 // The Go teacher CLI reads the same roster.csv this module writes, and its
 // strict reader aborts the WHOLE file on a row it rejects. So the keep-rule is a
@@ -162,12 +164,14 @@ describe("parseRosterCsv", () => {
         },
       ],
       problems: [],
+      columns: COLUMNS,
     })
   })
 
   it("returns no rows and no problems for an empty or header-only file", () => {
-    expect(parseRosterCsv("")).toEqual({ rows: [], problems: [] })
-    expect(parseRosterCsv(`${HEADER}\n`)).toEqual({ rows: [], problems: [] })
+    const empty = { rows: [], problems: [], columns: COLUMNS }
+    expect(parseRosterCsv("")).toEqual(empty)
+    expect(parseRosterCsv(`${HEADER}\n`)).toEqual(empty)
   })
 
   it("honors quoted fields containing commas and trims padded headers", () => {
@@ -298,7 +302,7 @@ describe("parseStudentsCsv", () => {
 
 describe("stringifyStudentsCsv", () => {
   it("writes the canonical header and one line per row", () => {
-    const csv = stringifyStudentsCsv([row({ username: "octo" })])
+    const csv = stringifyStudentsCsv([row({ username: "octo" })], COLUMNS)
     const [header, first] = csv.split("\n")
     expect(header).toBe(HEADER)
     expect(first).toBe(
@@ -310,7 +314,7 @@ describe("stringifyStudentsCsv", () => {
   // Papa.unparse omits the header for an empty array, which would commit a
   // header-less file the CLI/skeleton readers reject.
   it("still writes the header for an emptied roster", () => {
-    expect(stringifyStudentsCsv([])).toBe(`${HEADER}\n`)
+    expect(stringifyStudentsCsv([], COLUMNS)).toBe(`${HEADER}\n`)
   })
 
   // The write-side keep-rule matches the parse side (shared vectors:
@@ -318,15 +322,18 @@ describe("stringifyStudentsCsv", () => {
   // identifies a student (username/github_id/email) OR describes one (a
   // name); only section/role noise or a fully blank row is dropped.
   it("keeps identity-less rows that describe a student, drops pure noise", () => {
-    const csv = stringifyStudentsCsv([
-      row({ username: "keep" }),
-      // name-only row: kept (describes a student).
-      normalizeStudentRow({ first_name: "Name", last_name: "Only" }),
-      // section/role noise only: dropped.
-      normalizeStudentRow({ section: "noise-section", role: "student" }),
-      // fully blank: dropped.
-      normalizeStudentRow({}),
-    ])
+    const csv = stringifyStudentsCsv(
+      [
+        row({ username: "keep" }),
+        // name-only row: kept (describes a student).
+        normalizeStudentRow({ first_name: "Name", last_name: "Only" }),
+        // section/role noise only: dropped.
+        normalizeStudentRow({ section: "noise-section", role: "student" }),
+        // fully blank: dropped.
+        normalizeStudentRow({}),
+      ],
+      COLUMNS,
+    )
     // header + keep + name-only
     expect(csv.trim().split("\n")).toHaveLength(3)
     expect(csv).toContain("keep")
@@ -339,14 +346,14 @@ describe("stringifyStudentsCsv", () => {
       row({ username: "octo", github_id: "1" }),
       row({ username: "mona", github_id: "2", role: "" }),
     ]
-    expect(parseStudentsCsv(stringifyStudentsCsv(rows))).toEqual(rows)
+    expect(parseStudentsCsv(stringifyStudentsCsv(rows, COLUMNS))).toEqual(rows)
   })
 
   it("round-trips values containing commas and quotes", () => {
     const rows = [
       row({ first_name: 'Grace "Amazing"', section: "Section A, B" }),
     ]
-    expect(parseStudentsCsv(stringifyStudentsCsv(rows))).toEqual(rows)
+    expect(parseStudentsCsv(stringifyStudentsCsv(rows, COLUMNS))).toEqual(rows)
   })
 
   // Every column except github_id is defanged, matching the Go writer's set. The
@@ -362,7 +369,7 @@ describe("stringifyStudentsCsv", () => {
       github_id: "583231",
       role: "=student",
     })
-    const csv = stringifyStudentsCsv([row])
+    const csv = stringifyStudentsCsv([row], COLUMNS)
     const data = csv.split("\n")[1]
     expect(data).toContain("'=1+1")
     expect(data).toContain("'-x")
@@ -374,18 +381,19 @@ describe("stringifyStudentsCsv", () => {
   })
 
   it("defangs a formula-leading username", () => {
-    const csv = stringifyStudentsCsv([
-      normalizeStudentRow({ username: "=cmd|'/c calc'!A1", email: "a@x.io" }),
-    ])
+    const csv = stringifyStudentsCsv(
+      [normalizeStudentRow({ username: "=cmd|'/c calc'!A1", email: "a@x.io" })],
+      COLUMNS,
+    )
     expect(csv.split("\n")[1]).toMatch(/^'=cmd/)
   })
 
   // A user-typed apostrophe is not our escaping, so it must survive the read.
   it("leaves a leading apostrophe that isn't a formula guard alone", () => {
     const row = normalizeStudentRow({ username: "user", last_name: "'tis" })
-    expect(parseStudentsCsv(stringifyStudentsCsv([row]))[0].last_name).toBe(
-      "'tis",
-    )
+    expect(
+      parseStudentsCsv(stringifyStudentsCsv([row], COLUMNS))[0].last_name,
+    ).toBe("'tis")
   })
 
   // github_id round-trips byte-exact, valid or not: the identity join compares the
@@ -393,11 +401,14 @@ describe("stringifyStudentsCsv", () => {
   // roster write touches EVERY row, so silently "fixing" one would corrupt the
   // rest). A malformed value is refused at the point of use instead.
   it("round-trips github_id byte-exact, including an unusable value", () => {
-    const csv = stringifyStudentsCsv([
-      normalizeStudentRow({ username: "valid", github_id: "583231" }),
-      normalizeStudentRow({ username: "bad", github_id: "1e3" }),
-      normalizeStudentRow({ username: "injected", github_id: "=99" }),
-    ])
+    const csv = stringifyStudentsCsv(
+      [
+        normalizeStudentRow({ username: "valid", github_id: "583231" }),
+        normalizeStudentRow({ username: "bad", github_id: "1e3" }),
+        normalizeStudentRow({ username: "injected", github_id: "=99" }),
+      ],
+      COLUMNS,
+    )
     expect(parseStudentsCsv(csv).map((r) => r.github_id)).toEqual([
       "583231",
       "1e3",
@@ -409,19 +420,225 @@ describe("stringifyStudentsCsv", () => {
   // for a row whose ONLY identity was that id, deleting the student on re-read
   // (and the blank-username line fails the Go reader outright).
   it("keeps a row whose only identity is an unusable github_id", () => {
-    const csv = stringifyStudentsCsv([
-      normalizeStudentRow({ username: "keep", github_id: "583231" }),
-      normalizeStudentRow({ github_id: "1e3" }),
-    ])
+    const csv = stringifyStudentsCsv(
+      [
+        normalizeStudentRow({ username: "keep", github_id: "583231" }),
+        normalizeStudentRow({ github_id: "1e3" }),
+      ],
+      COLUMNS,
+    )
     expect(csv).not.toContain("\n,,,,,,")
     expect(parseStudentsCsv(csv)).toHaveLength(2)
   })
 
   it("is idempotent for an already-guarded value", () => {
-    const once = stringifyStudentsCsv([
-      normalizeStudentRow({ username: "user", first_name: "=1+1" }),
-    ])
-    const twice = stringifyStudentsCsv(parseStudentsCsv(once))
+    const once = stringifyStudentsCsv(
+      [normalizeStudentRow({ username: "user", first_name: "=1+1" })],
+      COLUMNS,
+    )
+    const twice = stringifyStudentsCsv(parseStudentsCsv(once), COLUMNS)
     expect(twice).toBe(once)
+  })
+})
+
+// A teacher (or the CLI) may widen roster.csv with columns of their own. The
+// CLI's parseRoster/EncodeRoster round-trip them verbatim (RosterRow.Extra), so
+// a web rewrite must too, or every enroll/unenroll/edit silently deletes the
+// column for the whole class.
+describe("extra (non-canonical) columns", () => {
+  const WIDE_HEADER = `${HEADER},student_id,cohort`
+  const WIDE_CSV =
+    `${WIDE_HEADER}\n` +
+    "octo,Grace,Hopper,g@x.io,Section A,583231,student,S-001,fall\n" +
+    "mona,Mona,Lisa,m@x.io,Section B,583232,student,,spring\n"
+
+  it("parses extra cells into `extra` and reports the header order", () => {
+    const { rows, problems, columns } = parseRosterCsv(WIDE_CSV)
+    expect(problems).toEqual([])
+    expect(columns).toEqual([...COLUMNS, "student_id", "cohort"])
+    expect(rows[0]).toMatchObject({
+      username: "octo",
+      extra: { student_id: "S-001", cohort: "fall" },
+    })
+    expect(rows[1].extra).toEqual({ student_id: "", cohort: "spring" })
+  })
+
+  it("leaves `extra` absent on a canonical-only file", () => {
+    const csv = `${HEADER}\nocto,Grace,Hopper,g@x.io,Section A,583231,student\n`
+    expect(parseRosterCsv(csv).rows[0]).not.toHaveProperty("extra")
+  })
+
+  it("round-trips a wide file byte-for-byte", () => {
+    const { rows, columns } = parseRosterForRewrite(WIDE_CSV)
+    expect(stringifyStudentsCsv(rows, columns)).toBe(WIDE_CSV)
+  })
+
+  it("keeps extra headers in file order even before role on a pre-role file", () => {
+    // The CLI reads a 7th column that is not `role` as an extra (role = "")
+    // and writes role back in its canonical slot ahead of the extras.
+    const csv =
+      "username,first_name,last_name,email,section,github_id,note\n" +
+      "octo,Grace,Hopper,g@x.io,Section A,583231,hi\n"
+    const { rows, columns } = parseRosterForRewrite(csv)
+    expect(rows[0]).toMatchObject({ role: "", extra: { note: "hi" } })
+    expect(stringifyStudentsCsv(rows, columns)).toBe(
+      `${HEADER},note\nocto,Grace,Hopper,g@x.io,Section A,583231,,hi\n`,
+    )
+  })
+
+  it('writes "" in every extra column for a row that has none', () => {
+    const { rows, columns } = parseRosterForRewrite(WIDE_CSV)
+    const added = normalizeStudentRow({ username: "new", github_id: "7" })
+    const csv = stringifyStudentsCsv([...rows, added], columns)
+    expect(csv.split("\n")[3]).toBe("new,,,,,7,,,")
+    expect(parseStudentsCsv(csv)[2].extra).toEqual({
+      student_id: "",
+      cohort: "",
+    })
+  })
+
+  it("keeps the extra headers on an emptied roster", () => {
+    expect(stringifyStudentsCsv([], [...COLUMNS, "student_id"])).toBe(
+      `${HEADER},student_id\n`,
+    )
+    // And on a roster whose only row is new, so it carries no `extra` itself.
+    const { rows, columns } = parseRosterForRewrite(`${WIDE_HEADER}\n`)
+    expect(rows).toEqual([])
+    const csv = stringifyStudentsCsv(
+      [normalizeStudentRow({ username: "new", github_id: "7" })],
+      columns,
+    )
+    expect(csv).toBe(`${WIDE_HEADER}\nnew,,,,,7,,,\n`)
+  })
+
+  it("survives the spreads every writer uses to rebuild a row", () => {
+    const [row] = parseRosterForRewrite(WIDE_CSV).rows
+    const rebuilt = normalizeStudentRow({ ...row, first_name: "Renamed" })
+    expect(rebuilt.extra).toEqual(row.extra)
+  })
+
+  // Mirrors EncodeRoster: `defangCSVCell(row.Extra[name])` on write and
+  // `undefangCSVCell` in recordToRow on read, the same guard as the free-text
+  // canonical fields. Cells are not trimmed, also like the CLI.
+  it("defangs extra cells on write and undefangs them on read, without trimming", () => {
+    const rows = [
+      normalizeStudentRow({
+        username: "octo",
+        extra: { note: "=HYPERLINK(1)", padded: " x " },
+      }),
+    ]
+    const csv = stringifyStudentsCsv(rows, [...COLUMNS, "note", "padded"])
+    expect(csv.split("\n")[1]).toBe(`octo,,,,,,,'=HYPERLINK(1)," x "`)
+    expect(parseStudentsCsv(csv)[0].extra).toEqual({
+      note: "=HYPERLINK(1)",
+      padded: " x ",
+    })
+  })
+
+  it("does not let extra cells alone keep a row", () => {
+    const csv = `${HEADER},note\n,,,,,,,only-a-note\n`
+    expect(parseRosterCsv(csv).rows).toEqual([])
+  })
+
+  // The short-by-one tolerance counts the widened header, so a row missing its
+  // last extra cell reads as "" there and is written back one cell wider.
+  it('fills a missing trailing extra cell with "" under the tolerance', () => {
+    const csv = `${HEADER},note\nocto,Grace,Hopper,g@x.io,Section A,583231,student\n`
+    const { rows, problems, columns } = parseRosterCsv(csv)
+    expect(problems).toEqual([])
+    expect(rows[0].extra).toEqual({ note: "" })
+    expect(stringifyStudentsCsv(rows, columns)).toBe(
+      `${HEADER},note\nocto,Grace,Hopper,g@x.io,Section A,583231,student,\n`,
+    )
+  })
+
+  it("accepts an empty extra header name, as the CLI does", () => {
+    const csv = `${HEADER},\nocto,Grace,Hopper,g@x.io,Section A,583231,student,x\n`
+    const { rows, problems, columns } = parseRosterCsv(csv)
+    expect(problems).toEqual([])
+    expect(columns).toEqual([...COLUMNS, ""])
+    expect(rows[0].extra).toEqual({ "": "x" })
+    expect(stringifyStudentsCsv(rows, columns)).toBe(csv)
+  })
+
+  // Both tools rewrite roster.csv, so a header one accepts and the other
+  // refuses locks that classroom out of the refusing tool. The Go
+  // TestParseRoster_SharedHeaderRuleParity asserts the same cases.
+  describe("header rules — shared fixture parity", () => {
+    const fixtureUrl = new URL(
+      "../../../cli/shared/testdata/roster_header_cases.json",
+      import.meta.url,
+    )
+    const doc = JSON.parse(readFileSync(fileURLToPath(fixtureUrl), "utf8")) as {
+      cases: { why: string; extra_columns: string[]; accept: boolean }[]
+    }
+
+    it("has cases", () => {
+      expect(doc.cases.length).toBeGreaterThan(0)
+    })
+
+    for (const c of doc.cases) {
+      it(`${c.accept ? "accepts" : "rejects"}: ${c.why}`, () => {
+        const header = [...COLUMNS, ...c.extra_columns].join(",")
+        const record = [
+          "alice,A,A,a@x.edu,s,1,student",
+          ...c.extra_columns.map(() => "v"),
+        ].join(",")
+        const { problems } = parseRosterCsv(`${header}\n${record}\n`)
+        expect(problems.length === 0).toBe(c.accept)
+        if (!c.accept) {
+          expect(problems.every((p) => p.line === 1)).toBe(true)
+          expect(() => parseStudentsCsv(`${header}\n${record}\n`)).toThrow(
+            /line 1:/,
+          )
+        }
+      })
+    }
+  })
+
+  // Header problems are deferred messages the banner translates, keyed by the
+  // offending column name; the thrown form names the key so logs stay readable.
+  describe("header problems (line 1)", () => {
+    it("names a duplicated extra column", () => {
+      const csv = `${HEADER},note,note\nocto,,,,,1,,x,y\n`
+      expect(parseRosterCsv(csv).problems).toEqual([
+        {
+          line: 1,
+          message: {
+            key: "students.rosterProblemDuplicateColumn",
+            params: { name: "note" },
+          },
+        },
+      ])
+      expect(() => parseStudentsCsv(csv)).toThrow(
+        /line 1: students\.rosterProblemDuplicateColumn \(name=note\)/,
+      )
+    })
+
+    it("names an extra column that reuses a canonical name", () => {
+      const csv = `${HEADER},email\nocto,,,a@x.io,,1,,dup\n`
+      expect(parseRosterCsv(csv).problems).toEqual([
+        {
+          line: 1,
+          message: {
+            key: "students.rosterProblemReservedColumn",
+            params: { name: "email" },
+          },
+        },
+      ])
+    })
+
+    it("names an extra column that begins with a formula trigger", () => {
+      const csv = `${HEADER},=HYPERLINK(1)\nocto,,,,,1,,v\n`
+      expect(parseRosterCsv(csv).problems).toEqual([
+        {
+          line: 1,
+          message: {
+            key: "students.rosterProblemFormulaColumn",
+            params: { name: "=HYPERLINK(1)" },
+          },
+        },
+      ])
+    })
   })
 })
