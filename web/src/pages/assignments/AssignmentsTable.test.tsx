@@ -365,8 +365,6 @@ describe("AssignmentsTable submission denominator", () => {
   })
 
   it("treats a team assignment like a group, not per student", () => {
-    // A team assignment is a bare group count, like legacy group; it is never
-    // measured against the roster.
     scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
     orgRepos.mockReturnValue({
       data: [

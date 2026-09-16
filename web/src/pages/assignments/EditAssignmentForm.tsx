@@ -86,8 +86,7 @@ const EditAssignmentForm = ({
     logins: rosterLogins,
     enabled: isGroupFlavor || !studentsLoading,
   })
-  // The derivation keeps the two group flavors apart: a team repo is named
-  // after its group counter, a legacy group repo after its founder.
+  // Two flags: the domain helper picks the repo parser per group flavor.
   const acceptedCount = useMemo(
     () =>
       assignmentRepoNames({

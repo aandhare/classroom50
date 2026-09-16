@@ -3163,10 +3163,25 @@ describe("assignmentFunnelCounts", () => {
         repo("cs-hw1-group-2"),
         repo("cs-hw1-alice"), // founder-shaped stray; not a team
         repo("cs-hw1-group-x"), // not a counter
-        repo("cs-hw2-group-1"), // sibling assignment
+        repo("cs-hw2-group-1"), // another assignment's team
       ],
       "cs",
       ["hw1", "hw2"],
+    )
+    expect(counts.accepted).toBe(2)
+  })
+
+  it("keeps a legacy group assignment on the founder-named, sibling-guarded parse", () => {
+    const counts = assignmentFunnelCounts(
+      assignment({ mode: "group" }),
+      scores({}),
+      [
+        repo("cs-hw1-alice"),
+        repo("cs-hw1-group-1"),
+        repo("cs-hw1-bonus-bob"), // slug-extending sibling
+      ],
+      "cs",
+      ["hw1", "hw1-bonus"],
     )
     expect(counts.accepted).toBe(2)
   })

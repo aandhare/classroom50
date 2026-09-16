@@ -1607,7 +1607,7 @@
       "groupsSubmitted_other": "{{count}} groups submitted",
       "groupsAcceptedTitle": "Groups that accepted: group repositories that exist",
       "groupsVisibleTitle": "Group repositories you can see. More may exist: your team is granted access by the next score collection.",
-      "noGroupsYetTitle": "No groups yet. A group repository is created when its founder accepts.",
+      "noGroupsYetTitle": "No groups yet. A group repository is created when its first member accepts.",
       "noGroupsYet": "No groups yet",
       "noStudentsYet": "No students yet",
       "noStudentsYetTitle": "No students are enrolled yet, so there is nothing to count against. Add students on the Roster page.",
