@@ -46,12 +46,17 @@ const log = logger.scope("assignments:feedbackPr")
 export const FEEDBACK_PR_TITLE = "Feedback"
 
 // Mode label + pinned color, mirroring GitHub Classroom's Individual/Group
-// feedback labels. Unknown -> individual.
+// feedback labels. Both shared-repo modes (legacy "group" and current "team")
+// carry the Group label; unknown modes fall back to individual. Must match the
+// Go contract.FeedbackLabelForMode and the python ensure_feedback_pr.py
+// _LABELS, since the runner adopts the accept-time PR and a mismatch leaves a
+// team assignment tagged both Group and Individual.
 export function feedbackLabelForMode(mode: string): {
   name: string
   color: string
 } {
-  if (mode.trim().toLowerCase() === "group") {
+  const normalized = mode.trim().toLowerCase()
+  if (normalized === "group" || normalized === "team") {
     return { name: "Group Assignment", color: "5319E7" }
   }
   return { name: "Individual Assignment", color: "0E8A16" }
