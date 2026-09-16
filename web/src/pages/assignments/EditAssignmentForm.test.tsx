@@ -163,7 +163,7 @@ it.each([
         onSuccess={vi.fn()}
       />,
     )
-    // Both group flavours read the org repo list unscoped; only an individual
+    // Both group flavors read the org repo list unscoped; only an individual
     // assignment scopes the read to the student logins.
     expect(lastRepoNamesArgs).toMatchObject(expected)
     if (mode === "individual") {

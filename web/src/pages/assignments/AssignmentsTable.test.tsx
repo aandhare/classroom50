@@ -19,10 +19,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
     Link: ({ children }: { children?: ReactNode }) => (
       <a href="/mock">{children}</a>
     ),
-    useNavigate:
-      () =>
-      (...a: unknown[]) =>
-        navigate(...a),
+    useNavigate: () => navigate,
   }
 })
 
@@ -368,8 +365,8 @@ describe("AssignmentsTable submission denominator", () => {
   })
 
   it("treats a team assignment like a group, not per student", () => {
-    // Regression: a team assignment was measured against the roster
-    // (31 groups / 95 students). It is a bare group count, like legacy group.
+    // A team assignment is a bare group count, like legacy group; it is never
+    // measured against the roster.
     scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
     orgRepos.mockReturnValue({
       data: [
@@ -388,7 +385,6 @@ describe("AssignmentsTable submission denominator", () => {
         roster={roster(studentsOf(11))}
       />,
     )
-    // Both cells count the 3 group-<n> repos, never the 11 students.
     const accepted = screen.getByTitle("assignments.table.groupsAcceptedTitle")
     expect(accepted.textContent).toBe("3")
     expect(ratioText()).toContain("2 / 3")

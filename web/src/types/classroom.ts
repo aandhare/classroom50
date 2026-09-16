@@ -85,7 +85,7 @@ export function assertAssignmentMode(value: string): AssignmentMode {
 }
 
 // Both group flavors (legacy "group", current "team") share one repo per group,
-// so acceptance and submission are counted per group, not against the roster.
+// so anything counted per group applies to both.
 export function isGroupMode(mode: AssignmentMode): boolean {
   return mode === "group" || mode === "team"
 }

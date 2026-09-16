@@ -734,8 +734,9 @@ export function hasAccepted(username: string, accepted: Set<string>): boolean {
 
 // All existing assignment repo names for a bulk per-repo teacher action (e.g.
 // opening every Feedback PR — issue #347). Mode-aware: individual repos are
-// forward-constructed per accepted student (studentRepoName), group repos come
-// from existingGroupRepos (reverse-parsed, sibling-guarded). Deduped and
+// forward-constructed per accepted student (studentRepoName), legacy group
+// repos come from existingGroupRepos (reverse-parsed, sibling-guarded), team
+// repos from existingTeamRepos (shape-exact group-<n>). Deduped and
 // lowercased to match the org repo list. Empty when the inputs aren't ready.
 export function assignmentRepoNames(params: {
   isGroup: boolean
