@@ -659,6 +659,24 @@ describe("assignmentRepoNames", () => {
     expect(names).toEqual(["cs101-hw1-team-magma", "cs101-hw1-team-rocket"])
   })
 
+  it("uses team repo names (group-<n>) for a team assignment", () => {
+    const repos = [
+      repo("cs101-hw1-group-1"),
+      repo("cs101-hw1-group-2"),
+      repo("cs101-hw1-alice"), // an individual-shaped repo must not be counted
+      repo("cs101-hw2-group-1"), // sibling assignment
+    ]
+    const names = assignmentRepoNames({
+      isGroup: false,
+      isTeam: true,
+      repos,
+      classroom: "cs101",
+      assignment: "hw1",
+      students: roster,
+    }).toSorted()
+    expect(names).toEqual(["cs101-hw1-group-1", "cs101-hw1-group-2"])
+  })
+
   it("guards a group assignment against a slug-extending sibling", () => {
     const names = assignmentRepoNames({
       isGroup: true,
