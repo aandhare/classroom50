@@ -11,6 +11,7 @@ vi.mock("react-i18next", async (importOriginal) => {
   return { ...actual, useTranslation: () => ({ t: (key: string) => key }) }
 })
 
+const navigate = vi.fn()
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>()
   return {
@@ -18,7 +19,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
     Link: ({ children }: { children?: ReactNode }) => (
       <a href="/mock">{children}</a>
     ),
-    useNavigate: () => () => {},
+    useNavigate:
+      () =>
+      (...a: unknown[]) =>
+        navigate(...a),
   }
 })
 
@@ -165,6 +169,7 @@ const ratioText = () =>
 const bars = () => document.querySelectorAll("progress").length
 
 beforeEach(() => {
+  navigate.mockReset()
   scores.mockReset()
   scores.mockReturnValue({ data: { submissions: {}, detected: {} } })
   orgRepos.mockReset()
@@ -370,9 +375,11 @@ describe("AssignmentsTable submission denominator", () => {
     scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
     orgRepos.mockReturnValue({
       data: [
-        { name: "cs101-hw1-team1" },
-        { name: "cs101-hw1-team2" },
-        { name: "cs101-hw1-team3" },
+        { name: "cs101-hw1-group-1" },
+        { name: "cs101-hw1-group-2" },
+        { name: "cs101-hw1-group-3" },
+        { name: "cs101-hw1-alice" }, // founder-shaped stray, not a team
+        { name: "cs101-hw2-group-1" }, // another assignment's team
       ],
     })
     wrap(
@@ -383,13 +390,18 @@ describe("AssignmentsTable submission denominator", () => {
         roster={roster(studentsOf(11))}
       />,
     )
-    // Bare accepted count, and the submitted bar measures against the 3 group
-    // repos — never the 11 students.
-    expect(
-      screen.getByTitle("assignments.table.groupsAcceptedTitle").textContent,
-    ).toBe("3")
+    // Bare accepted count of the 3 group-<n> repos, and the submitted bar
+    // measures against those 3 — never the 11 students.
+    const accepted = screen.getByTitle("assignments.table.groupsAcceptedTitle")
+    expect(accepted.textContent).toBe("3")
     expect(ratioText()).toContain("2 / 3")
     expect(ratioText()).not.toContain("/ 11")
+    // Groups have no acceptance filter, so the cell opens the dashboard
+    // unfiltered rather than on the per-student "not accepted" cohort.
+    fireEvent.click(accepted.closest("td")!)
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: undefined }),
+    )
   })
 
   it("clamps the group ratio so a stale submission can't exceed the repo count", () => {

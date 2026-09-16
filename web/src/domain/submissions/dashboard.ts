@@ -1806,8 +1806,10 @@ export type FunnelRoster = {
 // detection existed has entries but no key.
 //
 // `accepted`: this assignment's existing repos, reverse-parsed from the org repo
-// list. Individual student repos and group repos share the
-// <classroom>-<slug>-<owner> name shape, so one parse serves both modes.
+// list. Individual student repos and legacy group repos share the
+// <classroom>-<slug>-<owner> name shape, so one parse serves both; team repos
+// take the shape-exact `group-<n>` parse the Submissions page uses, so a stray
+// founder-named repo never counts as a team.
 //
 // With a `roster`, an individual assignment's `accepted` and `submitted` count
 // only owners in `roster.counted`, so both stay within the denominator by
@@ -1838,9 +1840,11 @@ export function assignmentFunnelCounts(
   const detectedOnly = (detectedRows ?? []).filter(
     (row) => !gradedOwners.has(row.owner.toLowerCase()) && counts(row.owner),
   ).length
-  const repos = orgRepos
-    ? existingGroupRepos(orgRepos, classroom, assignment.slug, siblingSlugs)
-    : undefined
+  const repos = !orgRepos
+    ? undefined
+    : assignment.mode === "team"
+      ? existingTeamRepos(orgRepos, classroom, assignment.slug)
+      : existingGroupRepos(orgRepos, classroom, assignment.slug, siblingSlugs)
   return {
     submitted: gradedRows.length + detectedOnly,
     accepted: repos?.filter((repo) => counts(repo.owner)).length,

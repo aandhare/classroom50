@@ -3154,6 +3154,23 @@ describe("assignmentFunnelCounts", () => {
     })
   })
 
+  it("counts a team assignment's group-<n> repos only", () => {
+    const counts = assignmentFunnelCounts(
+      assignment({ mode: "team" }),
+      scores({}),
+      [
+        repo("cs-hw1-group-1"),
+        repo("cs-hw1-group-2"),
+        repo("cs-hw1-alice"), // founder-shaped stray; not a team
+        repo("cs-hw1-group-x"), // not a counter
+        repo("cs-hw2-group-1"), // sibling assignment
+      ],
+      "cs",
+      ["hw1", "hw2"],
+    )
+    expect(counts.accepted).toBe(2)
+  })
+
   describe("with a roster", () => {
     const roster = (counted: string[], excludedStaff: string[] = []) => ({
       counted: new Set(counted),

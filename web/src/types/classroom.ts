@@ -84,11 +84,8 @@ export function assertAssignmentMode(value: string): AssignmentMode {
   )
 }
 
-// Both group flavors ("group" = legacy, "team" = current) share one repository
-// per group, so acceptance and submission are counted per group, not per
-// student; only "individual" is per-student. Callers that special-case group
-// rendering (e.g. the assignments table's Accepted/Submitted cells) must use
-// this, so a team-mode assignment is not measured against the student roster.
+// Both group flavors (legacy "group", current "team") share one repo per group,
+// so acceptance and submission are counted per group, not against the roster.
 export function isGroupMode(mode: AssignmentMode): boolean {
   return mode === "group" || mode === "team"
 }

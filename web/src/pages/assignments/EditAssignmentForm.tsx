@@ -75,10 +75,8 @@ const EditAssignmentForm = ({
   const mode = defaultData?.mode ?? "individual"
   const isGroup = mode === "group"
   const isTeam = mode === "team"
-  // Both group flavors keep one repo per group, so acceptance is read from the
-  // org repo list, not per student. isGroupMode drives the roster gate; the
-  // repo derivation below still needs group and team apart, since a team repo
-  // is named after its group counter and a group repo after its founder.
+  // The repo derivation still needs the two group flavors apart: a team repo is
+  // named after its group counter, a legacy group repo after its founder.
   const isGroupLike = isGroupMode(mode)
   const rosterLogins = useMemo(
     () => (isGroupLike ? undefined : students.map((s) => s.username)),
