@@ -88,7 +88,8 @@ export type ModalProps = {
   // affordance or must block dismissal while submitting).
   hideCloseButton?: boolean
   // Block dismissal while a submit is in flight: disables the close X + backdrop
-  // close, vetoes Esc (see the onCancel guard below), and holds the dialog open
+  // close, vetoes Esc (see the onCancel guard below), reopens after a close the
+  // veto couldn't stop (see handleNativeClose), and holds the dialog open
   // against a controlled `open=false` transition (see the open-sync effect).
   closeDisabled?: boolean
   // Legacy escape hatches — prefer `title`, which wires labeling automatically.
@@ -161,16 +162,40 @@ export function Modal({
     if (dialog?.open) dialog.close()
   }
 
+  // Every close path is blocked while `closeDisabled` (controls disabled, Esc
+  // vetoed, open-sync held), but Chrome's CloseWatcher lets a second Esc with
+  // no user activation in between close the dialog anyway (#1005). Only a
+  // close that follows a vetoed `cancel` is that failed veto; a programmatic
+  // `dialog.close()` never fires `cancel`, and an imperative caller may close
+  // from a mutation's onSuccess while `isPending` is still true, so that close
+  // must still reach onClose. Reopen and swallow only the former.
+  const vetoedCancelRef = useRef(false)
+  const handleNativeClose = (
+    event: React.SyntheticEvent<HTMLDialogElement>,
+  ) => {
+    const vetoed = vetoedCancelRef.current
+    vetoedCancelRef.current = false
+    if (closeDisabled && vetoed) {
+      const dialog = event.currentTarget
+      if (!dialog.open) dialog.showModal()
+      return
+    }
+    onClose?.()
+  }
+
   return (
     <dialog
       ref={setRefs}
       className="modal"
-      onClose={() => onClose?.()}
+      onClose={handleNativeClose}
       onKeyDown={onKeyDown}
       onCancel={(event) => {
         // Esc triggers `cancel` before `close`. When dismissal is blocked
         // (e.g., a submit is in flight), veto it so the dialog stays open.
-        if (closeDisabled) event.preventDefault()
+        if (closeDisabled) {
+          event.preventDefault()
+          vetoedCancelRef.current = true
+        }
       }}
       role={role}
       aria-label={aria["aria-label"]}

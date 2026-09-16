@@ -99,3 +99,12 @@ export const releaseDateSeed = (now = new Date()) => {
 // (#999). Older Safari reports partial input as valid; the seed avoids that.
 export const isDeliberatelyCleared = (input: HTMLInputElement) =>
   input.value === "" && !input.validity?.badInput
+
+// Props for a controlled `type="number"` input whose model is read with
+// `valueAsNumber` (#1002). An emptied or half-typed field ("1e" in Chrome,
+// "12a" in Firefox) reads NaN; rendering that as "" leaves the DOM alone, where
+// a coerced 0 made React write "0" back (select-all+Backspace showed 0, typing
+// 5 showed 05). The wheel guard lives in the `Input` primitive.
+export const numberInputProps = (value: number | "") => ({
+  value: typeof value === "number" && !Number.isFinite(value) ? "" : value,
+})
