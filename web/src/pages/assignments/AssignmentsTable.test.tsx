@@ -11,6 +11,7 @@ vi.mock("react-i18next", async (importOriginal) => {
   return { ...actual, useTranslation: () => ({ t: (key: string) => key }) }
 })
 
+const navigate = vi.fn()
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>()
   return {
@@ -18,7 +19,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
     Link: ({ children }: { children?: ReactNode }) => (
       <a href="/mock">{children}</a>
     ),
-    useNavigate: () => () => {},
+    useNavigate: () => navigate,
   }
 })
 
@@ -165,6 +166,7 @@ const ratioText = () =>
 const bars = () => document.querySelectorAll("progress").length
 
 beforeEach(() => {
+  navigate.mockReset()
   scores.mockReset()
   scores.mockReturnValue({ data: { submissions: {}, detected: {} } })
   orgRepos.mockReset()
@@ -360,6 +362,37 @@ describe("AssignmentsTable submission denominator", () => {
       screen.getByTitle("assignments.table.groupsAcceptedTitle").textContent,
     ).toBe("3")
     expect(ratioText()).toContain("2 / 3")
+  })
+
+  it("treats a team assignment like a group, not per student", () => {
+    scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
+    orgRepos.mockReturnValue({
+      data: [
+        { name: "cs101-hw1-group-1" },
+        { name: "cs101-hw1-group-2" },
+        { name: "cs101-hw1-group-3" },
+        { name: "cs101-hw1-alice" }, // founder-shaped stray, not a team
+        { name: "cs101-hw2-group-1" }, // another assignment's team
+      ],
+    })
+    wrap(
+      <AssignmentsTable
+        org="acme"
+        classroom="cs101"
+        assignments={[assignment({ mode: "team" })]}
+        roster={roster(studentsOf(11))}
+      />,
+    )
+    const accepted = screen.getByTitle("assignments.table.groupsAcceptedTitle")
+    expect(accepted.textContent).toBe("3")
+    expect(ratioText()).toContain("2 / 3")
+    expect(ratioText()).not.toContain("/ 11")
+    // No per-student acceptance filter for groups: the cell opens the
+    // dashboard unfiltered.
+    fireEvent.click(accepted.closest("td")!)
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: undefined }),
+    )
   })
 
   it("clamps the group ratio so a stale submission can't exceed the repo count", () => {

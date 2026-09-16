@@ -15,6 +15,7 @@ import {
   type EditImpact,
 } from "@/domain/assignments"
 import type { Assignment } from "@/types/classroom"
+import { isGroupMode } from "@/types/classroom"
 import { GitHubAPIError } from "@/github-core/errors"
 import { useTrackPublishDeploy } from "@/hooks/useTrackPublishDeploy"
 import { useEditAssignment } from "@/hooks/mutations/useEditAssignment"
@@ -64,35 +65,39 @@ const EditAssignmentForm = ({
   // Deterministic acceptance count for this assignment, derived from the org
   // repo list + roster the same way the submissions page does (no per-student
   // fetch). Gates the provisioning half of the edit confirm: zero accepted → a
-  // provisioning change saves silently; one or more → confirm first. The repo
-  // read is the roster-scoped one the submissions page uses, so a large org is
-  // not walked for one form; both reads share their cache with other views.
+  // provisioning change saves silently; one or more → confirm first. An
+  // individual assignment takes the roster-scoped read so a large org is not
+  // walked for one form; group flavors need the full list. Both reads share
+  // their cache with other views.
   const { students, isLoading: studentsLoading } = useGetStudents(
     org,
     classroom,
   )
-  const isGroup = defaultData?.mode === "group"
+  const mode = defaultData?.mode ?? "individual"
+  const isGroupFlavor = isGroupMode(mode)
   const rosterLogins = useMemo(
-    () => (isGroup ? undefined : students.map((s) => s.username)),
-    [isGroup, students],
+    () => (isGroupFlavor ? undefined : students.map((s) => s.username)),
+    [isGroupFlavor, students],
   )
   const { data: orgRepos } = useAssignmentRepos({
     org,
     classroom,
     assignment,
     logins: rosterLogins,
-    enabled: isGroup || !studentsLoading,
+    enabled: isGroupFlavor || !studentsLoading,
   })
+  // Two flags: the domain helper picks the repo parser per group flavor.
   const acceptedCount = useMemo(
     () =>
       assignmentRepoNames({
-        isGroup,
+        isGroup: mode === "group",
+        isTeam: mode === "team",
         repos: orgRepos,
         classroom,
         assignment,
         students,
       }).length,
-    [isGroup, orgRepos, classroom, assignment, students],
+    [mode, orgRepos, classroom, assignment, students],
   )
 
   // An edit that changes what students can do or see (lock/unlock, or a

@@ -84,6 +84,12 @@ export function assertAssignmentMode(value: string): AssignmentMode {
   )
 }
 
+// Both group flavors (legacy "group", current "team") share one repo per group,
+// so anything counted per group applies to both.
+export function isGroupMode(mode: AssignmentMode): boolean {
+  return mode === "group" || mode === "team"
+}
+
 // Who forms the groups of a `team` assignment: the teacher (org owner creates
 // teams and memberships — fully enforceable) or the students (the first
 // student founds a team and adds roster teammates — drift is detectable, not

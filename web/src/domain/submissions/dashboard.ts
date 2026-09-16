@@ -733,10 +733,10 @@ export function hasAccepted(username: string, accepted: Set<string>): boolean {
 }
 
 // All existing assignment repo names for a bulk per-repo teacher action (e.g.
-// opening every Feedback PR — issue #347). Mode-aware: individual repos are
-// forward-constructed per accepted student (studentRepoName), group repos come
-// from existingGroupRepos (reverse-parsed, sibling-guarded). Deduped and
-// lowercased to match the org repo list. Empty when the inputs aren't ready.
+// opening every Feedback PR — issue #347). One parser per mode; individual
+// repos are forward-constructed per accepted student rather than parsed.
+// Deduped and lowercased to match the org repo list. Empty when the inputs
+// aren't ready.
 export function assignmentRepoNames(params: {
   isGroup: boolean
   isTeam?: boolean
@@ -1806,8 +1806,9 @@ export type FunnelRoster = {
 // detection existed has entries but no key.
 //
 // `accepted`: this assignment's existing repos, reverse-parsed from the org repo
-// list. Individual student repos and group repos share the
-// <classroom>-<slug>-<owner> name shape, so one parse serves both modes.
+// list: the `<classroom>-<slug>-<owner>` prefix for individual and legacy group
+// repos, the shape-exact `group-<n>` parse for team repos (a founder-named stray
+// never counts as a team).
 //
 // With a `roster`, an individual assignment's `accepted` and `submitted` count
 // only owners in `roster.counted`, so both stay within the denominator by
@@ -1838,9 +1839,11 @@ export function assignmentFunnelCounts(
   const detectedOnly = (detectedRows ?? []).filter(
     (row) => !gradedOwners.has(row.owner.toLowerCase()) && counts(row.owner),
   ).length
-  const repos = orgRepos
-    ? existingGroupRepos(orgRepos, classroom, assignment.slug, siblingSlugs)
-    : undefined
+  const repos = !orgRepos
+    ? undefined
+    : assignment.mode === "team"
+      ? existingTeamRepos(orgRepos, classroom, assignment.slug)
+      : existingGroupRepos(orgRepos, classroom, assignment.slug, siblingSlugs)
   return {
     submitted: gradedRows.length + detectedOnly,
     accepted: repos?.filter((repo) => counts(repo.owner)).length,

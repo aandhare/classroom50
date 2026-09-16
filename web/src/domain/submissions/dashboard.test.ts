@@ -659,6 +659,24 @@ describe("assignmentRepoNames", () => {
     expect(names).toEqual(["cs101-hw1-team-magma", "cs101-hw1-team-rocket"])
   })
 
+  it("uses team repo names (group-<n>) for a team assignment", () => {
+    const repos = [
+      repo("cs101-hw1-group-1"),
+      repo("cs101-hw1-group-2"),
+      repo("cs101-hw1-alice"), // an individual-shaped repo must not be counted
+      repo("cs101-hw2-group-1"), // sibling assignment
+    ]
+    const names = assignmentRepoNames({
+      isGroup: false,
+      isTeam: true,
+      repos,
+      classroom: "cs101",
+      assignment: "hw1",
+      students: roster,
+    }).toSorted()
+    expect(names).toEqual(["cs101-hw1-group-1", "cs101-hw1-group-2"])
+  })
+
   it("guards a group assignment against a slug-extending sibling", () => {
     const names = assignmentRepoNames({
       isGroup: true,
@@ -3134,6 +3152,38 @@ describe("assignmentFunnelCounts", () => {
       notCollected: false,
       hiddenStaffRepos: 0,
     })
+  })
+
+  it("counts a team assignment's group-<n> repos only", () => {
+    const counts = assignmentFunnelCounts(
+      assignment({ mode: "team" }),
+      scores({}),
+      [
+        repo("cs-hw1-group-1"),
+        repo("cs-hw1-group-2"),
+        repo("cs-hw1-alice"), // founder-shaped stray; not a team
+        repo("cs-hw1-group-x"), // not a counter
+        repo("cs-hw2-group-1"), // another assignment's team
+      ],
+      "cs",
+      ["hw1", "hw2"],
+    )
+    expect(counts.accepted).toBe(2)
+  })
+
+  it("keeps a legacy group assignment on the founder-named, sibling-guarded parse", () => {
+    const counts = assignmentFunnelCounts(
+      assignment({ mode: "group" }),
+      scores({}),
+      [
+        repo("cs-hw1-alice"),
+        repo("cs-hw1-group-1"),
+        repo("cs-hw1-bonus-bob"), // slug-extending sibling
+      ],
+      "cs",
+      ["hw1", "hw1-bonus"],
+    )
+    expect(counts.accepted).toBe(2)
   })
 
   describe("with a roster", () => {

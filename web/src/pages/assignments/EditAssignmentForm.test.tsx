@@ -19,14 +19,24 @@ vi.mock("@/hooks/useTrackPublishDeploy", () => ({
 // repos gates the provisioning-change confirmation. `acceptedRepoNames` lets a
 // test set that count without wiring GitHub reads.
 let acceptedRepoNames: string[] = []
+// The args the component last passed to each read; they pin the per-mode repo
+// wiring without standing up GitHub reads.
+let lastAssignmentReposArgs: { logins?: readonly string[] } | undefined
+let lastRepoNamesArgs: { isGroup?: boolean; isTeam?: boolean } | undefined
 vi.mock("@/hooks/useAssignmentRepos", () => ({
-  useAssignmentRepos: () => ({ data: [] }),
+  useAssignmentRepos: (args: { logins?: readonly string[] }) => {
+    lastAssignmentReposArgs = args
+    return { data: [] }
+  },
 }))
 vi.mock("@/hooks/useGetStudents", () => ({
   default: () => ({ students: [], isLoading: false }),
 }))
 vi.mock("@/domain/submissions/dashboard", () => ({
-  assignmentRepoNames: () => acceptedRepoNames,
+  assignmentRepoNames: (args: { isGroup?: boolean; isTeam?: boolean }) => {
+    lastRepoNamesArgs = args
+    return acceptedRepoNames
+  },
 }))
 vi.mock("react-i18next", async (importOriginal) => {
   const actual = await importOriginal<typeof import("react-i18next")>()
@@ -102,6 +112,8 @@ beforeEach(() => {
   mutateAsync.mockClear()
   acceptedRepoNames = []
   submittedOverrides = {}
+  lastAssignmentReposArgs = undefined
+  lastRepoNamesArgs = undefined
 })
 afterEach(cleanup)
 
@@ -129,6 +141,38 @@ it("passes grading form fields through the edit boundary", () => {
     expect.any(Object),
   )
 })
+
+it.each([
+  ["team", { isGroup: false, isTeam: true }],
+  ["group", { isGroup: true, isTeam: false }],
+  ["individual", { isGroup: false, isTeam: false }],
+] as const)(
+  "derives the accepted count for a %s assignment by its own repo shape",
+  (mode, expected) => {
+    render(
+      <EditAssignmentForm
+        org="acme"
+        classroom="cs101"
+        assignment="hw1"
+        defaultData={{
+          slug: "hw1",
+          name: "Homework",
+          mode,
+          autograder: "default",
+        }}
+        onSuccess={vi.fn()}
+      />,
+    )
+    // Both group flavors read the org repo list unscoped; only an individual
+    // assignment scopes the read to the student logins.
+    expect(lastRepoNamesArgs).toMatchObject(expected)
+    if (mode === "individual") {
+      expect(lastAssignmentReposArgs?.logins).toBeDefined()
+    } else {
+      expect(lastAssignmentReposArgs?.logins).toBeUndefined()
+    }
+  },
+)
 
 it("saves a provisioning change directly when no students have accepted", () => {
   // Stored auto assignment; the submit flips grading to manual. With zero
