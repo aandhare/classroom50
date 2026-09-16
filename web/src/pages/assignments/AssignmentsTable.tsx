@@ -30,6 +30,7 @@ import {
 } from "@/pages/assignments/AssignmentRowActions"
 import { ManageAssignmentModal } from "@/pages/assignments/ManageAssignmentModal"
 import type { Assignment } from "@/types/classroom"
+import { isGroupMode } from "@/types/classroom"
 import { ClickableTr } from "@/lib/motionComponents"
 import { blockEnter } from "@/lib/motion"
 import { motion } from "motion/react"
@@ -495,10 +496,9 @@ const AssignmentsTable = ({
                     navigate({
                       to: "/$org/$classroom/assignments/$assignment/submissions",
                       params: { org, classroom, assignment: assignment.slug },
-                      search:
-                        assignment.mode === "group"
-                          ? undefined
-                          : { status: "not-accepted" },
+                      search: isGroupMode(assignment.mode)
+                        ? undefined
+                        : { status: "not-accepted" },
                     })
                   }
                 >
@@ -509,7 +509,7 @@ const AssignmentsTable = ({
                       // Org repo list still loading — no acceptance signal yet.
                       return <span className="text-base-content/60">—</span>
                     }
-                    if (assignment.mode === "group") {
+                    if (isGroupMode(assignment.mode)) {
                       // A group assignment nobody has started has no repos and
                       // therefore no denominator to measure — a bare "0" would
                       // imply one. Muted empty state + tooltip instead.
@@ -589,7 +589,7 @@ const AssignmentsTable = ({
                         </span>
                       )
                     }
-                    if (assignment.mode === "group") {
+                    if (isGroupMode(assignment.mode)) {
                       // Groups submit per-repo, so the only meaningful
                       // denominator is the number of groups that accepted.
                       // Until the repo list loads, fall back to the bare count

@@ -362,6 +362,36 @@ describe("AssignmentsTable submission denominator", () => {
     expect(ratioText()).toContain("2 / 3")
   })
 
+  it("treats a team assignment like a group, not per student", () => {
+    // Regression: a team-mode ("Group") assignment was measured against the
+    // student roster, so its Accepted cell read "groups / students" with a
+    // fill bar (e.g. 31 groups / 95 students). It must be a bare group count,
+    // exactly like the legacy group mode above.
+    scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}] } } })
+    orgRepos.mockReturnValue({
+      data: [
+        { name: "cs101-hw1-team1" },
+        { name: "cs101-hw1-team2" },
+        { name: "cs101-hw1-team3" },
+      ],
+    })
+    wrap(
+      <AssignmentsTable
+        org="acme"
+        classroom="cs101"
+        assignments={[assignment({ mode: "team" })]}
+        roster={roster(studentsOf(11))}
+      />,
+    )
+    // Bare accepted count, and the submitted bar measures against the 3 group
+    // repos — never the 11 students.
+    expect(
+      screen.getByTitle("assignments.table.groupsAcceptedTitle").textContent,
+    ).toBe("3")
+    expect(ratioText()).toContain("2 / 3")
+    expect(ratioText()).not.toContain("/ 11")
+  })
+
   it("clamps the group ratio so a stale submission can't exceed the repo count", () => {
     scores.mockReturnValue({ data: { submissions: { hw1: [{}, {}, {}] } } })
     orgRepos.mockReturnValue({

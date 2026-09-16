@@ -15,6 +15,7 @@ import {
   type EditImpact,
 } from "@/domain/assignments"
 import type { Assignment } from "@/types/classroom"
+import { isGroupMode } from "@/types/classroom"
 import { GitHubAPIError } from "@/github-core/errors"
 import { useTrackPublishDeploy } from "@/hooks/useTrackPublishDeploy"
 import { useEditAssignment } from "@/hooks/mutations/useEditAssignment"
@@ -71,28 +72,36 @@ const EditAssignmentForm = ({
     org,
     classroom,
   )
-  const isGroup = defaultData?.mode === "group"
+  const mode = defaultData?.mode ?? "individual"
+  const isGroup = mode === "group"
+  const isTeam = mode === "team"
+  // Both group flavors keep one repo per group, so acceptance is read from the
+  // org repo list, not per student. isGroupMode drives the roster gate; the
+  // repo derivation below still needs group and team apart, since a team repo
+  // is named after its group counter and a group repo after its founder.
+  const isGroupLike = isGroupMode(mode)
   const rosterLogins = useMemo(
-    () => (isGroup ? undefined : students.map((s) => s.username)),
-    [isGroup, students],
+    () => (isGroupLike ? undefined : students.map((s) => s.username)),
+    [isGroupLike, students],
   )
   const { data: orgRepos } = useAssignmentRepos({
     org,
     classroom,
     assignment,
     logins: rosterLogins,
-    enabled: isGroup || !studentsLoading,
+    enabled: isGroupLike || !studentsLoading,
   })
   const acceptedCount = useMemo(
     () =>
       assignmentRepoNames({
         isGroup,
+        isTeam,
         repos: orgRepos,
         classroom,
         assignment,
         students,
       }).length,
-    [isGroup, orgRepos, classroom, assignment, students],
+    [isGroup, isTeam, orgRepos, classroom, assignment, students],
   )
 
   // An edit that changes what students can do or see (lock/unlock, or a
