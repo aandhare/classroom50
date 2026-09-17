@@ -13,12 +13,20 @@ import { mapWithConcurrency } from "@/util/concurrency"
 
 type GroupRepoRef = { owner: string; repoName: string }
 
+type GroupRepoMembers = {
+  logins: Set<string>
+  // Lowercased member logins per repo name. A repo whose read failed has no
+  // entry, so callers can tell "unknown" from "no members".
+  membersByRepo: Map<string, string[]>
+}
+
 // Eagerly (but bounded) fetch collaborators for the given group repos and return
-// the union of member logins (lowercased). Populates the shared
-// githubKeys.collaborators cache so the group rows' avatars and the Members
-// modal read the same data, and so the submissions dashboard can drop every
-// group member — not just founders — from the "no group" non-submitter list,
-// keeping the view accurate on load without opening each modal (#245).
+// the union of member logins (lowercased) plus the per-repo lists. Populates
+// the shared githubKeys.collaborators cache so the group rows' avatars and the
+// Members modal read the same data, and so the submissions dashboard can drop
+// every group member — not just founders — from the "no group" non-submitter
+// list and section-match a group by any member, keeping the view accurate on
+// load without opening each modal (#245, #1020).
 //
 // The reads run through mapWithConcurrency at REPO_READ_CONCURRENCY so a class
 // with many groups doesn't fan out one simultaneous request per repo (secondary
@@ -27,7 +35,7 @@ type GroupRepoRef = { owner: string; repoName: string }
 export function useGroupRepoMemberLogins(
   org: string,
   repos: GroupRepoRef[],
-): { logins: Set<string>; isPending: boolean } {
+): GroupRepoMembers & { isPending: boolean } {
   const client = useGitHubClient()
   const queryClient = useQueryClient()
 
@@ -40,8 +48,9 @@ export function useGroupRepoMemberLogins(
 
   const { data, isLoading } = useQuery({
     queryKey: [...githubKeys.all, "group-collaborators", org, repoKey] as const,
-    queryFn: async () => {
+    queryFn: async (): Promise<GroupRepoMembers> => {
       const logins = new Set<string>()
+      const membersByRepo = new Map<string, string[]>()
       await mapWithConcurrency(
         repoNames,
         REPO_READ_CONCURRENCY,
@@ -70,20 +79,27 @@ export function useGroupRepoMemberLogins(
               collaborators,
             )
             for (const c of collaborators) logins.add(c.login.toLowerCase())
+            membersByRepo.set(
+              repo,
+              collaborators.map((c) => c.login.toLowerCase()),
+            )
           } catch {
             // Leave this repo's members out of the union; other repos still count.
           }
         },
       )
-      return logins
+      return { logins, membersByRepo }
     },
     staleTime: 60 * 1000,
     enabled,
   })
 
-  const empty = useMemo(() => new Set<string>(), [])
+  const empty = useMemo<GroupRepoMembers>(
+    () => ({ logins: new Set(), membersByRepo: new Map() }),
+    [],
+  )
   return {
-    logins: data ?? empty,
+    ...(data ?? empty),
     // Pending only while an enabled fetch hasn't resolved yet. A disabled hook
     // (no group repos) is never pending — there's nothing to reconcile — so the
     // "no group" list can settle immediately.
