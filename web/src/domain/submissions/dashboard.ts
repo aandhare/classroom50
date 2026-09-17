@@ -1585,7 +1585,7 @@ export function filterDisplayList({
   thresholdFraction: number | null
   acceptedSet: Set<string>
   groupDisplayNames?: Map<string, string>
-  // A group's members for section matching, by owner (team: `group-<n>`,
+  // A group's members for section matching, keyed by owner (team: `group-<n>`,
   // legacy: the founder login). undefined = membership not yet known.
   groupMembersOf?: (owner: string) => string[] | undefined
 }): DisplayListInputs {

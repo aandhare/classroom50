@@ -92,6 +92,32 @@ describe("useGroupRepoMemberLogins", () => {
     await waitFor(() =>
       expect([...result.current.logins].sort()).toEqual(["carol"]),
     )
+    // The failed repo has no entry at all, so callers can tell "unknown"
+    // from "no members".
+    expect([...result.current.membersByRepo.keys()]).toEqual(["cs101-hw1-dave"])
+  })
+
+  it("returns each repo's lowercased members by repo name", async () => {
+    request.mockImplementation((url: string) =>
+      url.includes("cs101-hw1-alice")
+        ? Promise.resolve([user("Alice"), user("Bob")])
+        : Promise.resolve([]),
+    )
+    const { result } = renderHook(
+      () =>
+        useGroupRepoMemberLogins("acme", [
+          { owner: "alice", repoName: "cs101-hw1-alice" },
+          { owner: "dave", repoName: "cs101-hw1-dave" },
+        ]),
+      { wrapper: wrapper(makeClient()) },
+    )
+    await waitFor(() =>
+      expect(result.current.membersByRepo.get("cs101-hw1-alice")).toEqual([
+        "alice",
+        "bob",
+      ]),
+    )
+    expect(result.current.membersByRepo.get("cs101-hw1-dave")).toEqual([])
   })
 
   it("does not fetch when there are no group repos", () => {

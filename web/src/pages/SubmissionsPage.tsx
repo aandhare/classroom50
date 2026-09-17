@@ -307,11 +307,14 @@ const SubmissionsPageContent = () => {
   // repo name) plus each repo's collaborators. Team mode: LIVE team
   // membership (the authoritative link) — the collaborators fan-out is
   // disabled (empty repo list) so legacy behavior stays byte-identical.
-  const { logins: groupCollabLogins, isPending: groupCollabPending } =
-    useGroupRepoMemberLogins(
-      org ?? "",
-      isTeamAssignment ? EMPTY_GROUP_REPOS : groupRepoList,
-    )
+  const {
+    logins: groupCollabLogins,
+    membersByRepo: groupCollabByRepo,
+    isPending: groupCollabPending,
+  } = useGroupRepoMemberLogins(
+    org ?? "",
+    isTeamAssignment ? EMPTY_GROUP_REPOS : groupRepoList,
+  )
   const groupTeamsQuery = useGroupTeams(org, classroom, assignment, {
     enabled: isTeamAssignment,
   })
@@ -360,6 +363,21 @@ const SubmissionsPageContent = () => {
     }
     return map
   }, [isTeamAssignment, teamByOwner, teamMembersBySlug])
+  // Legacy group members by owner: the founder plus the repo's collaborators.
+  // A repo whose collaborators haven't loaded (or failed) has no entry, so the
+  // section filter keeps it visible like a still-loading team.
+  const legacyGroupMembers = useMemo(() => {
+    if (isTeamAssignment) return undefined
+    const map = new Map<string, string[]>()
+    for (const repo of groupRepoList) {
+      const members = groupCollabByRepo.get(repo.repoName)
+      if (members) {
+        const owner = repo.owner.toLowerCase()
+        map.set(owner, [owner, ...members])
+      }
+    }
+    return map
+  }, [isTeamAssignment, groupRepoList, groupCollabByRepo])
   const groupDisplayNames = useMemo(() => {
     if (!isTeamAssignment) return undefined
     const map = new Map<string, string>()
@@ -645,17 +663,18 @@ const SubmissionsPageContent = () => {
     typeof passThresholdPct === "number" && Number.isFinite(passThresholdPct)
   const thresholdFraction = passingEnabled ? passThresholdPct / 100 : null
 
+  // Group members for the section filter (see filterDisplayList), keyed by
+  // lowercased owner in both modes.
+  const groupMembersOf = useCallback(
+    (owner: string): string[] | undefined =>
+      (isTeamAssignment ? groupMemberLogins : legacyGroupMembers)?.get(
+        owner.toLowerCase(),
+      ),
+    [isTeamAssignment, groupMemberLogins, legacyGroupMembers],
+  )
   // Everything the display list depends on besides its row source. Shared by
   // the fan-out spine (snapshot rows) and the rendered table (live-merged rows)
   // so the two can only differ in rows, never in how they're filtered.
-  // Group members for the section filter (see filterDisplayList). Team: live
-  // members by `group-<n>`, undefined while loading. Legacy: the founder
-  // (owner); per-repo collaborators aren't resolved here, so match on them.
-  const groupMembersOf = useCallback(
-    (owner: string): string[] | undefined =>
-      isTeamAssignment ? groupMemberLogins?.get(owner.toLowerCase()) : [owner],
-    [isTeamAssignment, groupMemberLogins],
-  )
   const displayListArgs = useMemo(
     () => ({
       query,
@@ -682,9 +701,9 @@ const SubmissionsPageContent = () => {
   )
 
   // The fan-out spine: the snapshot's display list under the real filters, so
-  // the fanned page names exactly the students the table shows. Everything here
-  // is snapshot- or org-repo-derived, never live-derived, so it can't loop on
-  // the fan-out's own output.
+  // the fanned page names exactly the students the table shows. Nothing here
+  // derives from the fan-out's own output (group membership comes from the
+  // teams/collaborators reads), so it can't loop on itself.
   const spineInputs = useMemo(
     () =>
       filterDisplayList({
