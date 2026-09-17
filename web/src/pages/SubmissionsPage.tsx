@@ -648,6 +648,14 @@ const SubmissionsPageContent = () => {
   // Everything the display list depends on besides its row source. Shared by
   // the fan-out spine (snapshot rows) and the rendered table (live-merged rows)
   // so the two can only differ in rows, never in how they're filtered.
+  // Group members for the section filter (see filterDisplayList). Team: live
+  // members by `group-<n>`, undefined while loading. Legacy: the founder
+  // (owner); per-repo collaborators aren't resolved here, so match on them.
+  const groupMembersOf = useCallback(
+    (owner: string): string[] | undefined =>
+      isTeamAssignment ? groupMemberLogins?.get(owner.toLowerCase()) : [owner],
+    [isTeamAssignment, groupMemberLogins],
+  )
   const displayListArgs = useMemo(
     () => ({
       query,
@@ -658,6 +666,7 @@ const SubmissionsPageContent = () => {
       thresholdFraction,
       acceptedSet,
       groupDisplayNames,
+      groupMembersOf,
     }),
     [
       query,
@@ -668,6 +677,7 @@ const SubmissionsPageContent = () => {
       thresholdFraction,
       acceptedSet,
       groupDisplayNames,
+      groupMembersOf,
     ],
   )
 

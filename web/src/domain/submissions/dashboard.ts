@@ -1569,6 +1569,7 @@ export function filterDisplayList({
   thresholdFraction,
   acceptedSet,
   groupDisplayNames,
+  groupMembersOf,
 }: {
   rows: SubmissionRow[]
   // Roster students `rows` doesn't credit (see reconcileNonSubmitters).
@@ -1584,6 +1585,9 @@ export function filterDisplayList({
   thresholdFraction: number | null
   acceptedSet: Set<string>
   groupDisplayNames?: Map<string, string>
+  // A group's members for section matching, by owner (team: `group-<n>`,
+  // legacy: the founder login). undefined = membership not yet known.
+  groupMembersOf?: (owner: string) => string[] | undefined
 }): DisplayListInputs {
   const filteredRows = filterAndSortRows(rows, {
     query,
@@ -1602,6 +1606,19 @@ export function filterDisplayList({
     }
   }
   const q = query.trim().toLowerCase()
+  // Match a group by any member's section, like rowInSection does for a
+  // submitted row. Unknown membership stays visible (team still loading).
+  const groupInSection = (owner: string): boolean => {
+    if (filters.section === "all") return true
+    const members = groupMembersOf?.(owner)
+    if (!members) return true
+    return members.some(
+      (login) =>
+        sectionByUsername.get(login.trim().toLowerCase()) === filters.section,
+    )
+  }
+  // Keep array identity when nothing narrows the groups (memoizing callers).
+  const filterGroups = filters.section !== "all" || q !== ""
   return {
     rows: filteredRows,
     nonSubmitters: filterNonSubmitters(
@@ -1610,16 +1627,20 @@ export function filterDisplayList({
       filters,
       acceptedSet,
     ),
-    groupRepos: q
+    groupRepos: filterGroups
       ? groupRepos.filter((repo) => {
+          if (!groupInSection(repo.owner)) return false
+          if (!q) return true
           if (repo.owner.toLowerCase().includes(q)) return true
           const name = getName(repo.owner, students).toLowerCase()
           return name.length > 0 && name.includes(q)
         })
       : groupRepos,
-    teamsWithoutRepos: q
+    teamsWithoutRepos: filterGroups
       ? teamsWithoutRepos.filter((team) => {
           const owner = `${GROUP_REPO_SEGMENT}${team.n}`
+          if (!groupInSection(owner)) return false
+          if (!q) return true
           if (owner.includes(q)) return true
           const name = groupDisplayNames?.get(owner)?.toLowerCase() ?? ""
           return name.includes(q)

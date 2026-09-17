@@ -2255,6 +2255,45 @@ describe("filterDisplayList", () => {
     expect(out.teamsWithoutRepos).toBe(teams)
   })
 
+  it("section-filters unsubmitted group repos by their founder's section", () => {
+    // Legacy group: groupMembersOf yields [owner], so only the B1 founder's
+    // repo survives a B1 filter.
+    const out = filterDisplayList({
+      ...base,
+      filters: filters({ section: "B1" }),
+      sectionByUsername: new Map([
+        ["alice", "B1"],
+        ["cara", "B2"],
+      ]),
+      groupMembersOf: (owner: string) => [owner],
+    })
+    expect(out.groupRepos.map((r) => r.owner)).toEqual(["alice"])
+  })
+
+  it("section-filters teams by member section, keeping teams whose members aren't loaded yet", () => {
+    // group-1 has a B1 member (shown), group-2 is all B2 (hidden), group-3's
+    // members haven't loaded (undefined, kept visible).
+    const membersByOwner = new Map<string, string[]>([
+      ["group-1", ["alice"]],
+      ["group-2", ["cara"]],
+    ])
+    const out = filterDisplayList({
+      ...base,
+      teamsWithoutRepos: [
+        { n: 1, id: 1, slug: "cs101-hw1-group-1", name: "Group 1" },
+        { n: 2, id: 2, slug: "cs101-hw1-group-2", name: "Group 2" },
+        { n: 3, id: 3, slug: "cs101-hw1-group-3", name: "Group 3" },
+      ],
+      filters: filters({ section: "B1" }),
+      sectionByUsername: new Map([
+        ["alice", "B1"],
+        ["cara", "B2"],
+      ]),
+      groupMembersOf: (owner: string) => membersByOwner.get(owner),
+    })
+    expect(out.teamsWithoutRepos.map((team) => team.n)).toEqual([1, 3])
+  })
+
   it.each(["submitted", "on-time", "late"] as const)(
     "hides every no-submission item under %s",
     (submission) => {
