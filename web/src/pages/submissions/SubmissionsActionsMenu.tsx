@@ -19,13 +19,12 @@ import {
 } from "@/components/ui/icons"
 import { useTranslation } from "react-i18next"
 
-import { DropdownMenu } from "@/components/ui"
+import { Dropdown, DropdownMenu } from "@/components/ui"
 
 // Consolidates the workflow actions (Collect now / Regrade all / View workflow)
 // plus the CSV export and Metrics into one dropdown so the toolbar stays
 // compact and the roster surfaces higher. Share (accept link) is a standalone
 // button next to the search bar (its own prominent affordance), not in here.
-// daisyUI dropdowns are focus-driven; selecting an item blurs to close.
 // Disabled/loading gating mirrors the former inline buttons.
 export function SubmissionsActionsMenu({
   collecting,
@@ -146,7 +145,7 @@ export function SubmissionsActionsMenu({
         : t("submissions.regradeAll.title")
 
   return (
-    <div className="dropdown dropdown-end">
+    <Dropdown align="end">
       {/* The trigger spins only for the action it owns (Regrade all). A
           collect is indicated by the toolbar's Collect now button, so the
           menu stays open for business (exports, View run) meanwhile; its
@@ -413,7 +412,7 @@ export function SubmissionsActionsMenu({
           </>
         )}
       </DropdownMenu>
-    </div>
+    </Dropdown>
   )
 }
 
