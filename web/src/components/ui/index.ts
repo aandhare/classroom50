@@ -52,11 +52,19 @@ export type { HeadingProps, HeadingVariant } from "./Heading"
 export { Modal, ModalIcon, ModalFooterPortal } from "./Modal"
 export type { ModalProps, ModalSize, ModalIconTone } from "./Modal"
 
-export { Dropdown, DropdownMenu, closeDropdownMenu } from "./DropdownMenu"
+export {
+  Dropdown,
+  DropdownMenu,
+  MenuSeparator,
+  useDropdown,
+} from "./DropdownMenu"
 export type {
   DropdownProps,
   DropdownMenuProps,
   DropdownTriggerProps,
+  DropdownMenuItemProps,
+  DropdownMenuLinkItemProps,
+  DropdownMenuRouterLinkItemProps,
 } from "./DropdownMenu"
 export { Popover } from "./Popover"
 export type { PopoverProps } from "./Popover"

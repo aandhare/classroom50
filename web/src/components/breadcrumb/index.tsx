@@ -13,6 +13,7 @@ import useClassroomSummaries, {
   classroomDisplayName,
 } from "@/hooks/useClassroomSummaries"
 import useGetClassroomAssignments from "@/hooks/useGetClassAssignments"
+import { useDismissOnEscape } from "@/hooks/useDismissOnEscape"
 import { useDismissOnOutsidePointerDown } from "@/hooks/useDismissOnOutsidePointerDown"
 import { Link, useParams } from "@tanstack/react-router"
 import { useTranslation } from "react-i18next"
@@ -30,7 +31,8 @@ import { GitHubAPIError } from "@/github-core/errors"
 // Open state is explicit React state, not daisyUI's focus-driven `dropdown`:
 // a search input inside a blur-to-close popover fights its own focus handling
 // (see Combobox for the same constraint).
-const CrumbSwitcher = <T,>({
+// Exported for the browser test; pages use it through <Breadcrumb>.
+export const CrumbSwitcher = <T,>({
   name,
   title,
   searchPlaceholder,
@@ -73,20 +75,11 @@ const CrumbSwitcher = <T,>({
   const close = useCallback(() => setOpen(false), [])
   useDismissOnOutsidePointerDown(wrapperRef, open, close)
 
-  // Escape dismisses from anywhere (search field or a focused row) and hands
-  // focus back to the trigger. Document-level because a listener on the panel
-  // div itself would make it a non-interactive element with handlers.
-  useEffect(() => {
-    if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return
-      event.preventDefault()
-      close()
-      triggerRef.current?.focus()
-    }
-    document.addEventListener("keydown", onKeyDown)
-    return () => document.removeEventListener("keydown", onKeyDown)
-  }, [open, close])
+  const closeReturningFocus = useCallback(() => {
+    close()
+    triggerRef.current?.focus()
+  }, [close])
+  useDismissOnEscape(wrapperRef, open, closeReturningFocus)
 
   const needle = query.trim().toLowerCase()
   const visible = needle
@@ -119,7 +112,9 @@ const CrumbSwitcher = <T,>({
         {/* A titled popup with focusable content is a dialog; focus moves to
             the search field on open, Escape returns it. The panel is a
             top-layer popover, so the breadcrumbs' scroll container cannot
-            clip it. */}
+            clip it. tabIndex -1 keeps focus inside the wrapper when the
+            title or padding is clicked, so the root-scoped Escape still
+            fires (same rationale as DropdownMenu, #987). */}
         <Popover
           id={panelId}
           role="dialog"
@@ -127,6 +122,7 @@ const CrumbSwitcher = <T,>({
           open={open}
           anchorRef={wrapperRef}
           align="start"
+          tabIndex={-1}
           className="w-64 whitespace-normal"
         >
           <div className="border-b border-base-300 px-3 py-2 text-sm font-semibold text-base-content">

@@ -3,7 +3,7 @@ import { InlineSpinner } from "@/components/Spinner"
 import { CheckIcon, GlobeIcon, SyncIcon } from "@/components/ui/icons"
 import { useTranslation } from "react-i18next"
 
-import { closeDropdownMenu, Dropdown, DropdownMenu, cx } from "@/components/ui"
+import { Dropdown, DropdownMenu, cx, useDropdown } from "@/components/ui"
 import { useLanguage } from "@/hooks/useLanguage"
 import { useLanguageRegistry } from "@/hooks/useLanguageRegistry"
 import { BASE_LANG, languageLabel } from "@/i18n/customLocale"
@@ -14,7 +14,16 @@ import { BASE_LANG, languageLabel } from "@/i18n/customLocale"
 // in their own language. Native names (languageLabel(code, code)) keep each
 // entry legible regardless of the current UI language.
 export function LoginLanguageMenu() {
-  const { t } = useTranslation()
+  return (
+    <Dropdown align="end">
+      <LanguageMenu />
+    </Dropdown>
+  )
+}
+
+// Split from the root only so the rows can reach useDropdown() and close the
+// menu once an async switch has finished.
+function LanguageMenu() {
   const { lang, availableLangs, setLang } = useLanguage()
   const {
     offered: more,
@@ -26,6 +35,8 @@ export function LoginLanguageMenu() {
     refresh,
     installAndActivate,
   } = useLanguageRegistry()
+  const { t } = useTranslation()
+  const { close } = useDropdown()
 
   const [switchingCode, setSwitchingCode] = useState<string | null>(null)
   // Synchronous re-entry lock: `switchingCode` is async React state, so a fast
@@ -44,16 +55,13 @@ export function LoginLanguageMenu() {
 
   // Guarded switch: the ref-lock + spinner-code bookkeeping is identical for
   // both entry points; only the awaited work differs. `action` returns whether
-  // to close the menu (true on a successful switch/install). The menu is
-  // resolved from the focused item before awaiting, since focus may have moved
-  // by the time the work finishes.
+  // to close the menu (true on a successful switch/install).
   const runSwitch = async (code: string, action: () => Promise<boolean>) => {
     if (switchingRef.current || refreshing) return
     switchingRef.current = true
     setSwitchingCode(code)
-    const menu = document.activeElement?.closest('[role="menu"]') ?? null
     try {
-      if (await action()) closeDropdownMenu({ currentTarget: menu })
+      if (await action()) close({ returnFocus: true })
     } finally {
       setSwitchingCode(null)
       switchingRef.current = false
@@ -79,7 +87,7 @@ export function LoginLanguageMenu() {
     })
 
   return (
-    <Dropdown align="end">
+    <>
       <DropdownMenu.Trigger
         variant="ghost"
         size="sm"
@@ -189,7 +197,7 @@ export function LoginLanguageMenu() {
           </li>
         )}
       </DropdownMenu>
-    </Dropdown>
+    </>
   )
 }
 

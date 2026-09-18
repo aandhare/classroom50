@@ -5,7 +5,6 @@ import { describe, expect, it } from "vitest"
 import { ESLint } from "eslint"
 import {
   dropdownClassPattern,
-  dropdownClassTemplateSelector,
   dropdownMarkupMessage,
 } from "./dropdownMarkupRule"
 
@@ -79,7 +78,32 @@ describe("local/no-raw-dropdown", () => {
       }
     `
     expect(await rawDropdownErrors(source)).toHaveLength(1)
-    expect(dropdownClassTemplateSelector).toContain("TemplateElement")
+  })
+
+  it("flags a const recipe outside any className", async () => {
+    const source = `
+      const WRAPPER = "dropdown dropdown-end"
+      export function App() {
+        return <div className={WRAPPER}>x</div>
+      }
+    `
+    expect(await rawDropdownErrors(source)).toHaveLength(1)
+  })
+
+  it("does not flag prose or a test name that mentions a dropdown", async () => {
+    const source = `
+      export const note = { text: "the dropdown opens inward" }
+      it("dropdown closes on Escape", () => {})
+    `
+    expect(await rawDropdownErrors(source)).toHaveLength(0)
+  })
+
+  // The const match's boundary (see classTokenRule's `classSources`).
+  it("flags a bare string constant even when it reads as prose", async () => {
+    const source = `
+      export const label = "the dropdown is open"
+    `
+    expect(await rawDropdownErrors(source)).toHaveLength(1)
   })
 
   it("does not flag the shared primitives", async () => {

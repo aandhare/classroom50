@@ -3,11 +3,7 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { describe, expect, it } from "vitest"
 import { ESLint } from "eslint"
-import {
-  tooltipClassPattern,
-  tooltipClassTemplateSelector,
-  tooltipMarkupMessage,
-} from "./tooltipMarkupRule"
+import { tooltipClassPattern, tooltipMarkupMessage } from "./tooltipMarkupRule"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -88,7 +84,39 @@ describe("local/no-raw-tooltip", () => {
       }
     `
     expect(await rawTooltipErrors(source)).toHaveLength(1)
-    expect(tooltipClassTemplateSelector).toContain("TemplateElement")
+  })
+
+  // A recipe parked in a constant and passed as className={RECIPE} used to
+  // slip past a className-only match (the old sidebar and roster tooltips).
+  it("flags a const recipe and a cx() argument outside any className", async () => {
+    const source = `
+      import { cx } from "@/components/ui"
+      const RECIPE = "tooltip tooltip-warning cursor-help"
+      const other = \`tooltip \${"x"}\`
+      export const merged = cx("btn", "tooltip")
+      export function App() {
+        return <span className={RECIPE}>{other}</span>
+      }
+    `
+    expect(await rawTooltipErrors(source)).toHaveLength(3)
+  })
+
+  it("does not flag prose that merely mentions a tooltip", async () => {
+    const source = `
+      export const steps = [{ text: "focus a tooltip trigger and press Esc" }]
+      export function App() {
+        return <p title="shows the tooltip">{steps[0].text}</p>
+      }
+    `
+    expect(await rawTooltipErrors(source)).toHaveLength(0)
+  })
+
+  // The const match's boundary (see classTokenRule's `classSources`).
+  it("flags a bare string constant even when it reads as prose", async () => {
+    const source = `
+      export const label = "the tooltip is open"
+    `
+    expect(await rawTooltipErrors(source)).toHaveLength(1)
   })
 
   it("does not flag the shared Tooltip primitive or its bubble class", async () => {
